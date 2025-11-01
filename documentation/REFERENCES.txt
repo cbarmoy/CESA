@@ -1,0 +1,59 @@
+Campbell, I.G. (2009). EEG recording and analysis for sleep research. Sleep Medicine Reviews, 13(6), 465–474. doi:10.1016/j.smrv.2009.01.004
+Notes: Band definitions commonly used in sleep EEG: low-delta (0.3–1 Hz), delta (1–4 Hz), theta (4–8 Hz), alpha (8–12 Hz), sigma (12–15 Hz), beta (15–30 Hz). Source: PubMed Central.
+EEG Analysis Studio - References and Inspirations
+
+GitHub Repositories:
+- YASA (Sleep staging and sleep analysis in Python)
+  https://github.com/raphaelvallat/yasa
+
+- MNE-Python (EEG/MEG I/O, preprocessing, and analysis)
+  https://github.com/mne-tools/mne-python
+  https://mne.tools/stable/
+
+- SleepEEGpy (High-level sleep EEG pipeline integrating MNE, YASA, PyPREP, specparam)
+  https://github.com/NirLab-TAU/sleepeegpy
+
+- scikit-learn (metrics used for comparisons)
+  https://scikit-learn.org/stable/
+
+- SciPy (signal processing)
+  https://scipy.org/
+
+- Matplotlib (visualization)
+  https://matplotlib.org/
+
+- Pandas (data handling)
+  https://pandas.pydata.org/
+
+Papers and DOIs:
+- SleepEEGpy paper: Falach, R. et al. "SleepEEGpy: a Python-based software integration package to organize preprocessing, analysis, and visualization of sleep EEG data." Computers in Biology and Medicine 192 (2025): 110232.
+  https://doi.org/10.1016/j.compbiomed.2025.110232
+
+- Preprint referenced by the project (sleep analysis):
+  https://doi.org/10.1101/2023.12.17.572046
+
+Notes:
+- Our auto-scoring integrates ideas and defaults inspired by YASA and SleepEEGpy (resampling, stable band-pass ranges, and staging workflows).
+- Comparison metrics (accuracy, balanced accuracy, Cohen’s kappa, per-stage precision/recall/F1) rely on scikit-learn.
+
+Spectral analysis (FFT/PSD):
+- Welch method (density): scipy.signal.welch (Hann window, 50% overlap). See SciPy docs.
+- FFT magnitude approach adapted from Analyse_spectrale.py (2025): rFFT with DC removal, band powers (Delta/Theta/Alpha/Beta/Gamma), peak and spectral centroid.
+  Source interne: `Analyse_spectrale.py` (adaptée dans `spectral_analysis.py` via `compute_stage_psd_fft_for_array`).
+
+Sleep staging wrappers / inspiration:
+- SleepChecker (wrapper YASA pour détection de stades et annotation MNE). Référence pour l’ergonomie du scoring manuel.
+  [`https://github.com/nabilalibou/SleepChecker`](https://github.com/nabilalibou/SleepChecker)
+
+Références (français):
+- Documentation YASA – SleepStaging (utilisation, paramètres et canaux recommandés)
+  https://yasa-sleep.org/generated/yasa.SleepStaging.html
+
+- YASA – Foire aux questions (FAQ) sur les performances, limites et données
+  https://yasa-sleep.org/faq.html
+
+- Pipeline SleepEEGpy (intégration MNE, YASA, PyPREP, specparam) – bonnes pratiques de prétraitement et staging
+  https://github.com/NirLab-TAU/sleepeegpy
+
+- Validation YASA (étude eLife) – performances attendues et facteurs influençant l’exactitude
+  https://elifesciences.org/articles/70092
