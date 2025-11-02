@@ -93,7 +93,24 @@ from CESA.filters import (apply_filter as cesa_apply_filter,
                          detect_signal_type as cesa_detect_signal_type,
                          get_filter_presets as cesa_get_filter_presets)
 from CESA.scoring_io import import_excel_scoring as cesa_import_excel_scoring, import_edf_hypnogram as cesa_import_edf_hypnogram
-from CESA.theme_manager import theme_manager
+from ui.shortcuts_dialog import ShortcutsDialog
+from ui.filter_config_dialog import FilterConfigDialog
+from ui.report_dialog import ReportDialog
+# Nouveaux imports pour l'optimisation
+try:
+    from CESA.event_system import event_bus, Events, EventData
+    from CESA.performance_monitor import perf_monitor, measure_time
+    EVENTS_AVAILABLE = True
+except ImportError:
+    EVENTS_AVAILABLE = False
+    logging.warning("Event system not available")
+try:
+    from CESA.performance_dashboard import PerformanceDashboard
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
+
 import time
 
 # Configuration des warnings
@@ -117,6 +134,17 @@ try:
     logging.getLogger().addHandler(rotating_handler)
 except Exception as _e:
     logging.warning(f"Impossible d'initialiser le RotatingFileHandler: {_e}")
+
+try:
+    from CESA.memory_manager import memory_manager, cached_analysis
+    from CESA.data_optimizer import data_optimizer, optimize_data
+    OPTIMIZATION_AVAILABLE = True
+except ImportError:
+    OPTIMIZATION_AVAILABLE = False
+    logging.warning("Memory optimization not available")
+
+
+from CESA.cache_manager import cache_result
 
 # =============================================================================
 # CLASSE PRINCIPALE - EEG ANALYSIS STUDIO
@@ -162,12 +190,27 @@ class EEGAnalysisStudio:
         self.raw: Optional[mne.io.Raw] = None
         self.derivations: Dict[str, np.ndarray] = {}
         self.selected_channels: List[str] = []
-        
+
+        self._setup_event_system()
+
+
+        # Initialiser le gestionnaire de rapports
+        self.report_dialog = ReportDialog(self)
+
+        # Initialiser le gestionnaire de configuration des filtres
+        self.filter_config_dialog = FilterConfigDialog(self)
+
         # Paramètres temporels
         self.current_time: float = 0.0
         self.duration: float = 30.0  # Durée d'affichage (1 époque)
         self.sfreq: float = 200.0
-        
+
+        self._plot_update_pending_id = None
+        self._last_plot_update = 0
+        self._min_plot_interval = 0.05  # 50ms minimum entre les mises à jour
+        self._original_update_plot = self.update_plot
+
+
         # Paramètres de traitement
         self.autoscale_enabled: bool = False
         self.autoscale_window_duration: float = 30.0  # Durée de la fenêtre d'autoscale en secondes
@@ -291,6 +334,7 @@ class EEGAnalysisStudio:
         self._create_modern_menu()
         self._create_modern_widgets()
         self._setup_keyboard_shortcuts()
+
         
         # Initialisation de l'assistant utilisateur
         self._setup_user_assistant()
@@ -330,7 +374,65 @@ class EEGAnalysisStudio:
             self.root.focus_force()
         except Exception:
             pass
+
+        if EVENTS_AVAILABLE:
+            self._setup_event_system()
+
+        if OPTIMIZATION_AVAILABLE:
+            # Enregistrer des objets volumineux
+            if hasattr(self, 'raw') and self.raw:
+                memory_manager.register_large_object(self.raw)
+
+        # Initialiser le dashboard
+        if DASHBOARD_AVAILABLE:
+            self.performance_dashboard = PerformanceDashboard(self)
         
+        # Marquer l'heure de démarrage
+        self._start_time = time.time()
+
+
+    def show_performance_dashboard(self):
+        """Affiche le dashboard de performance"""
+        if DASHBOARD_AVAILABLE:
+            self.performance_dashboard.show_dashboard()
+        else:
+            messagebox.showwarning("Attention", "Dashboard de performance non disponible")
+
+    def _setup_event_system(self):
+        """Configure le système d'événements"""
+        try:
+            # S'abonner aux événements pertinents
+            event_bus.subscribe(Events.DATA_LOADED, self._on_data_loaded)
+            event_bus.subscribe(Events.TIME_CHANGED, self._on_time_changed)
+            event_bus.subscribe(Events.FILTER_CHANGED, self._on_filter_changed)
+            event_bus.subscribe(Events.CHANNELS_SELECTED, self._on_channels_selected)
+            logging.info("EVENT: Event system initialized")
+        except Exception as e:
+            logging.error(f"EVENT: Failed to setup event system: {e}")
+        
+    def _on_data_loaded(self, data):
+        """Gestionnaire pour le chargement de données"""
+        logging.info(f"EVENT: Data loaded - {data.filename}")
+    
+    def _on_time_changed(self, data):
+        """Gestionnaire pour le changement de temps"""
+        if hasattr(self, '_schedule_plot_update'):
+            self._schedule_plot_update()
+        
+    def _on_filter_changed(self, data):
+        """Gestionnaire pour le changement de filtre"""
+        logging.info(f"EVENT: Filter changed - enabled: {data.enabled}")
+        if hasattr(self, '_schedule_plot_update'):
+            self._schedule_plot_update()
+        
+    def _on_channels_selected(self, data):
+        """Gestionnaire pour la sélection de canaux"""
+        logging.info(f"EVENT: Channels selected - {len(data.channels)} channels")
+        if hasattr(self, '_schedule_plot_update'):
+            self._schedule_plot_update()
+
+
+       
     def _get_plot_width_px(self) -> int:
         try:
             if hasattr(self, 'canvas') and self.canvas is not None:
@@ -513,45 +615,56 @@ class EEGAnalysisStudio:
             logging.error(f"[BIND] Erreur navigation ZQSD: {e}")
     
     def _navigate_simple_epoch_previous(self):
-        """Navigation simple vers l'époque précédente (30s en arrière)."""
-        epoch_duration = 30.0  # Durée d'une époque fixe
-        
-        # Reculer d'une époque
+        """Navigation simple vers l'époque précédente - VERSION AVEC ÉVÉNEMENTS"""
+        # Votre code existant
+        epoch_duration = 30.0
         self.current_time = max(0, self.current_time - epoch_duration)
         
-        # Mettre à jour les sliders si ils existent
-        if hasattr(self, 'time_var'):
-            self.time_var.set(self.current_time)
-        if hasattr(self, 'bottom_time_var'):
-            self.bottom_time_var.set(self.current_time)
+        if hasattr(self, 'timevar'):
+            self.timevar.set(self.current_time)
+        if hasattr(self, 'bottomtimevar'):
+            self.bottomtimevar.set(self.current_time)
+            
+        # NOUVEAU : Émettre l'événement
+        if EVENTS_AVAILABLE:
+            try:
+                event_data = EventData.TimeChanged(
+                    current_time=self.current_time,
+                    duration=getattr(self, 'duration', 10.0)
+                )
+                event_bus.emit(Events.TIME_CHANGED, event_data, throttle=0.05)
+            except Exception as e:
+                logging.error(f"EVENT: Error emitting time_changed - {e}")
         
-        # Mettre à jour l'affichage
         self.update_plot()
-        
-        print(f"⬅️ Navigation simple: époque précédente {self.current_time:.1f}s")
-        logging.info(f"Simple navigation: previous epoch {self.current_time:.1f}s")
     
     def _navigate_simple_epoch_next(self):
-        """Navigation simple vers l'époque suivante (30s en avant)."""
-        epoch_duration = 30.0  # Durée d'une époque fixe
-        
+        """Navigation simple vers l'époque suivante - VERSION AVEC ÉVÉNEMENTS"""
+        # Votre code existant
+        epoch_duration = 30.0
         if self.raw:
             max_time = len(self.raw.times) / self.sfreq - self.duration
             self.current_time = min(max_time, self.current_time + epoch_duration)
         else:
             self.current_time += epoch_duration
+            
+        if hasattr(self, 'timevar'):
+            self.timevar.set(self.current_time)
+        if hasattr(self, 'bottomtimevar'):
+            self.bottomtimevar.set(self.current_time)
         
-        # Mettre à jour les sliders si ils existent
-        if hasattr(self, 'time_var'):
-            self.time_var.set(self.current_time)
-        if hasattr(self, 'bottom_time_var'):
-            self.bottom_time_var.set(self.current_time)
+        # NOUVEAU : Émettre l'événement
+        if EVENTS_AVAILABLE:
+            try:
+                event_data = EventData.TimeChanged(
+                    current_time=self.current_time,
+                    duration=getattr(self, 'duration', 10.0)
+                )
+                event_bus.emit(Events.TIME_CHANGED, event_data, throttle=0.05)
+            except Exception as e:
+                logging.error(f"EVENT: Error emitting time_changed - {e}")
         
-        # Mettre à jour l'affichage
         self.update_plot()
-        
-        print(f"➡️ Navigation simple: époque suivante {self.current_time:.1f}s")
-        logging.info(f"Simple navigation: next epoch {self.current_time:.1f}s")
     
     def _create_modern_menu(self) -> None:
         """
@@ -572,6 +685,12 @@ class EEGAnalysisStudio:
             'activebackground': '#e9ecef',
             'activeforeground': '#212529'
         }
+
+        debug_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Debug", menu=debug_menu)
+        debug_menu.add_command(label="Dashboard Performance", command=self.show_performance_dashboard)
+        debug_menu.add_command(label="Rapport de Bug", command=lambda: messagebox.showinfo("Bug Report", "Fonctionnalité en cours d'implémentation"))
+
         
         # Créer une classe pour gérer les menus scrollables
         class ScrollableMenu:
@@ -611,6 +730,7 @@ class EEGAnalysisStudio:
                     self.main_menu.add_cascade(**kwargs)
                 self.item_count += 1
         
+
         # Créer une fonction helper pour créer des menus avec scrollbar
         def create_scrollable_menu(parent, max_items=20, **kwargs):
             """Crée un menu avec possibilité de scroll si trop d'éléments."""
@@ -720,49 +840,13 @@ class EEGAnalysisStudio:
     # =====================================================================
     
     def _export_data(self):
-        """Exporte les données actuelles."""
-        if not self.raw or not self.selected_channels:
-            messagebox.showwarning("Attention", "Aucun fichier chargé ou canaux sélectionnés")
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            title="Exporter les données",
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv"), ("JSON", "*.json"), ("TXT", "*.txt")]
-        )
-        
-        if file_path:
-            try:
-                # Export des données sélectionnées
-                data_to_export = {}
-                for channel in self.selected_channels:
-                    if channel in self.derivations:
-                        data_to_export[channel] = self.derivations[channel].tolist()
-                
-                if file_path.endswith('.json'):
-                    import json
-                    with open(file_path, 'w') as f:
-                        json.dump(data_to_export, f, indent=2)
-                elif file_path.endswith('.csv'):
-                    import pandas as pd
-                    df = pd.DataFrame(data_to_export)
-                    df.to_csv(file_path, index=False)
-                else:  # TXT
-                    with open(file_path, 'w') as f:
-                        f.write("Données EEG Exportées\n")
-                        f.write("=" * 30 + "\n\n")
-                        for channel, data in data_to_export.items():
-                            f.write(f"Canal: {channel}\n")
-                            f.write(f"Échantillons: {len(data)}\n")
-                            f.write(f"Min: {min(data):.6f} µV\n")
-                            f.write(f"Max: {max(data):.6f} µV\n\n")
-                
-                messagebox.showinfo("Succès", f"Données exportées vers {file_path}")
-                logging.info(f"Données exportées vers {file_path}")
-                
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Erreur lors de l'export: {str(e)}")
-                logging.error(f"Erreur export: {e}")
+        """Exporte les données - VERSION OPTIMISÉE MODULAIRE"""
+        try:
+            self.report_dialog.export_data()
+        except Exception as e:
+            logging.error(f"EXPORT: Erreur - {str(e)}")
+            messagebox.showerror("Erreur", f"Erreur lors de l'export : {str(e)}")
+
 
     def _export_edf_segment(self):
         """Ouvre un dialogue pour exporter un segment EDF (ex: 10s)."""
@@ -878,67 +962,23 @@ class EEGAnalysisStudio:
                 pass
 
     def _export_report(self):
-        """Génère un rapport complet."""
-        if not self.raw:
-            messagebox.showwarning("Attention", "Aucun fichier chargé")
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            title="Exporter le rapport",
-            defaultextension=".txt",
-            filetypes=[("TXT", "*.txt"), ("JSON", "*.json")]
-        )
-        
-        if file_path:
-            try:
-                # Génération du rapport
-                report = self._generate_report()
-                
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                
-                messagebox.showinfo("Succès", f"Rapport généré: {file_path}")
-                logging.info(f"Rapport généré: {file_path}")
-                
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Erreur lors de la génération: {str(e)}")
-                logging.error(f"Erreur rapport: {e}")
-    
+        """Génère un rapport complet - VERSION OPTIMISÉE MODULAIRE"""
+        try:
+            self.report_dialog.generate_report()
+        except Exception as e:
+            logging.error(f"EXPORT_REPORT: Erreur - {str(e)}")
+            messagebox.showerror("Erreur", f"Erreur lors de l'export : {str(e)}")
+
     def _generate_report(self):
-        """Génère un rapport textuel des données."""
-        if not self.raw:
-            return "Aucun fichier chargé"
-        
-        report = []
-        report.append("CESA (EEG Studio Analysis) - Rapport d'Analyse")
-        report.append("=" * 50)
-        report.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report.append(f"Fichier: {getattr(self.raw.info, 'filename', 'Inconnu')}")
-        report.append(f"Canaux: {len(self.raw.ch_names)}")
-        report.append(f"Fréquence: {self.sfreq} Hz")
-        report.append(f"Durée: {len(self.raw.times)/self.sfreq:.1f}s")
-        report.append("")
-        
-        if self.selected_channels:
-            report.append("Canaux Sélectionnés:")
-            for i, channel in enumerate(self.selected_channels, 1):
-                report.append(f"  {i}. {channel}")
-            report.append("")
-            
-            report.append("Statistiques par Canal:")
-            for channel in self.selected_channels:
-                if channel in self.derivations:
-                    data = self.derivations[channel]
-                    report.append(f"\n{channel}:")
-                    report.append(f"  Échantillons: {len(data)}")
-                    report.append(f"  Min: {np.min(data):.6f} µV")
-                    report.append(f"  Max: {np.max(data):.6f} µV")
-                    report.append(f"  Moyenne: {np.mean(data):.6f} µV")
-                    report.append(f"  Écart-type: {np.std(data):.6f} µV")
-                    report.append(f"  RMS: {np.sqrt(np.mean(data**2)):.6f} µV")
-        
-        return "\n".join(report)
-    
+        """Génère un rapport complet - VERSION OPTIMISÉE MODULAIRE"""
+        try:
+            return self.report_dialog.generate_analysis_report()
+        except Exception as e:
+            logging.error(f"REPORT: Erreur - {str(e)}")
+            return f"Erreur lors de la génération : {str(e)}"
+
+
+
     def _show_preferences(self):
         """Affiche les préférences."""
         messagebox.showinfo("Préférences", "Fonctionnalité en développement")
@@ -1425,268 +1465,13 @@ class EEGAnalysisStudio:
         self.update_plot()
     
     def show_filter_config(self):
-        """Affiche la nouvelle interface simplifiée de configuration des filtres"""
-        if not self.raw:
-            messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
-            return
-        
-        # Fenêtre de configuration des filtres
-        filter_window = tk.Toplevel(self.root)
-        filter_window.title("Configuration des Filtres - CESA")
-        filter_window.geometry("900x700")
-        filter_window.transient(self.root)
-        filter_window.grab_set()
+        """Affiche la configuration des filtres - VERSION OPTIMISÉE MODULAIRE"""
         try:
-            from CESA.theme_manager import theme_manager as _tm
-            _tm.apply_theme_to_root(filter_window)
-        except Exception:
-            pass
+            self.filter_config_dialog.show_filter_config()
+        except Exception as e:
+            logging.error(f"FILTER_CONFIG: Erreur - {str(e)}")
+            messagebox.showerror("Erreur", f"Erreur lors de l'affichage de la configuration : {str(e)}")
 
-        # Frame principal
-        main_frame = ttk.Frame(filter_window, padding=20, style='Custom.TFrame')
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Titre principal
-        title_label = ttk.Label(main_frame, text="Configuration des Filtres",
-                               font=("Arial", 16, "bold"), style='Custom.TLabel')
-        title_label.pack(pady=(0, 20))
-
-        # Frame pour les contrôles globaux
-        global_frame = ttk.LabelFrame(main_frame, text="Paramètres Globaux", padding=15, style='Custom.TLabelframe')
-        global_frame.pack(fill=tk.X, pady=(0, 15))
-
-        # Contrôles globaux
-        global_controls = ttk.Frame(global_frame, style='Custom.TFrame')
-        global_controls.pack(fill=tk.X)
-
-        # Activer/désactiver filtres
-        ttk.Label(global_controls, text="Filtres:", style='Custom.TLabel').pack(side=tk.LEFT, padx=(0, 10))
-        global_filter_var = tk.BooleanVar(value=self.filter_enabled)
-        def _on_global_filter_changed(*_):
-            try:
-                self.filter_enabled = bool(global_filter_var.get())
-                logging.debug(f"UI: global_filter checkbox -> {self.filter_enabled}")
-                if hasattr(self, 'psg_plotter') and self.psg_plotter is not None:
-                    self.psg_plotter.set_global_filter_enabled(self.filter_enabled)
-                self.update_plot()
-            except Exception:
-                pass
-        ttk.Checkbutton(global_controls, text="Activé",
-                       variable=global_filter_var, command=_on_global_filter_changed).pack(side=tk.LEFT, padx=(0, 20))
-
-        # Correction de ligne de base
-        ttk.Label(global_controls, text="Correction ligne de base:", style='Custom.TLabel').pack(side=tk.LEFT, padx=(0, 10))
-        baseline_var = tk.BooleanVar(value=True)
-        def _on_baseline_changed(*_):
-            try:
-                val = bool(baseline_var.get())
-                logging.debug(f"UI: baseline checkbox -> {val}")
-                if hasattr(self, 'psg_plotter') and self.psg_plotter is not None:
-                    self.psg_plotter.set_baseline_enabled(val)
-                self.update_plot()
-            except Exception:
-                pass
-        ttk.Checkbutton(global_controls, text="Activé",
-                       variable=baseline_var, command=_on_baseline_changed).pack(side=tk.LEFT, padx=(0, 20))
-
-        # Frame pour les presets de signaux
-        presets_frame = ttk.LabelFrame(main_frame, text="Préréglages par Type de Signal", padding=15, style='Custom.TLabelframe')
-        presets_frame.pack(fill=tk.X, pady=(0, 15))
-
-        # Presets organisés par catégories
-        presets = {
-            "EEG": {"low": 0.3, "high": 70.0, "amplitude": 100.0, "channels": []},
-            "ECG": {"low": 0.3, "high": 70.0, "amplitude": 100.0, "channels": []},
-            "EMG": {"low": 10.0, "high": 0.0, "amplitude": 25.0, "channels": []},  # Passe-haut seulement, amplitude réduite
-            "EOG": {"low": 0.3, "high": 35.0, "amplitude": 50.0, "channels": []},  # Amplitude réduite
-            "SAS EEG": {"low": 0.5, "high": 35.0, "amplitude": 100.0, "channels": []},
-            "SAS EMG": {"low": 25.0, "high": 0.0, "amplitude": 25.0, "channels": []}
-        }
-
-        # Associer les canaux aux presets en utilisant la reconnaissance automatique
-        for channel in self.derivations.keys():
-            # Utiliser la fonction de détection automatique
-            signal_type = cesa_detect_signal_type(channel)
-
-            # Mapper le type détecté vers les presets
-            if signal_type == 'sas_eeg':
-                presets["SAS EEG"]["channels"].append(channel)
-            elif signal_type == 'eeg':
-                presets["EEG"]["channels"].append(channel)
-            elif signal_type == 'ecg':
-                presets["ECG"]["channels"].append(channel)
-            elif signal_type == 'sas_emg':
-                presets["SAS EMG"]["channels"].append(channel)
-            elif signal_type == 'emg':
-                presets["EMG"]["channels"].append(channel)
-            elif signal_type == 'eog':
-                presets["EOG"]["channels"].append(channel)
-            else:
-                # Canal non reconnu - utiliser les paramètres par défaut
-                presets["EEG"]["channels"].append(channel)
-
-        # Créer les contrôles pour chaque preset
-        for preset_name, preset_data in presets.items():
-            if not preset_data["channels"]:
-                continue
-
-            preset_frame = ttk.Frame(presets_frame, style='Custom.TFrame')
-            preset_frame.pack(fill=tk.X, pady=5)
-
-            # Nom du preset
-            ttk.Label(preset_frame, text=f"{preset_name}:",
-                     font=("Arial", 10, "bold"), style='Custom.TLabel').pack(side=tk.LEFT, padx=(0, 10))
-
-            # Canaux associés
-            channels_text = ", ".join(preset_data["channels"][:3])
-            if len(preset_data["channels"]) > 3:
-                channels_text += f" (+{len(preset_data['channels']) - 3} autres)"
-            ttk.Label(preset_frame, text=channels_text, style='Custom.TLabel').pack(side=tk.LEFT, padx=(0, 20))
-
-            # Bouton appliquer preset
-            def apply_preset(p=preset_name, data=preset_data):
-                for channel in data["channels"]:
-                    self.channel_filter_params[channel] = {
-                        'enabled': True,
-                        'low': data["low"],
-                        'high': data["high"],
-                        'amplitude': data["amplitude"]
-                    }
-                self.update_plot()
-
-            ttk.Button(preset_frame, text="Appliquer",
-                      command=apply_preset, style='Custom.TButton').pack(side=tk.RIGHT)
-
-        # Frame pour les canaux individuels avec scrollbar
-        channels_frame = ttk.LabelFrame(main_frame, text="Configuration Individuelle", padding=15, style='Custom.TLabelframe')
-        channels_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-
-        # Canvas et scrollbar pour les canaux
-        canvas = tk.Canvas(channels_frame)
-        scrollbar = ttk.Scrollbar(channels_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas, style='Custom.TFrame')
-
-        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        # Variables pour chaque canal
-        channel_vars = {}
-
-        # Créer les contrôles pour chaque canal
-        for channel in sorted(self.derivations.keys()):
-            channel_frame = ttk.Frame(scrollable_frame, relief="solid", borderwidth=1, style='Custom.TFrame')
-            channel_frame.pack(fill=tk.X, pady=2, padx=5)
-
-            # Variables pour ce canal
-            enabled_var = tk.BooleanVar()
-            low_var = tk.DoubleVar()
-            high_var = tk.DoubleVar()
-            amplitude_var = tk.DoubleVar()
-            
-            # Valeurs actuelles ou par défaut
-            if channel in self.channel_filter_params:
-                params = self.channel_filter_params[channel]
-                enabled_var.set(params.get('enabled', True))
-                low_var.set(params.get('low', 0.5))
-                high_var.set(params.get('high', 30.0))
-                amplitude_var.set(params.get('amplitude', 100.0))
-            else:
-                # Utiliser la reconnaissance automatique pour les paramètres par défaut
-                signal_type = cesa_detect_signal_type(channel)
-                default_params = cesa_get_filter_presets(signal_type)
-
-                low_var.set(default_params['low'])
-                high_var.set(default_params['high'])
-                amplitude_var.set(default_params['amplitude'])
-                enabled_var.set(default_params['enabled'])
-
-            channel_vars[channel] = {
-                'enabled': enabled_var,
-                'low': low_var,
-                'high': high_var,
-                'amplitude': amplitude_var
-            }
-            
-            # Layout du canal
-            header_frame = ttk.Frame(channel_frame)
-            header_frame.pack(fill=tk.X, pady=5)
-
-            # Nom du canal et checkbox
-            ttk.Checkbutton(header_frame, text=channel, variable=enabled_var,
-                           font=("Arial", 9, "bold")).pack(side=tk.LEFT)
-
-            # Contrôles en ligne
-            controls_frame = ttk.Frame(channel_frame)
-            controls_frame.pack(fill=tk.X, pady=2)
-
-            # Fréquences
-            freq_frame = ttk.Frame(controls_frame)
-            freq_frame.pack(side=tk.LEFT)
-
-            ttk.Label(freq_frame, text="Filtre:").pack(side=tk.LEFT, padx=(10, 5))
-            low_entry = ttk.Entry(freq_frame, textvariable=low_var, width=6)
-            low_entry.pack(side=tk.LEFT, padx=(0, 2))
-            ttk.Label(freq_frame, text="-").pack(side=tk.LEFT, padx=2)
-            high_entry = ttk.Entry(freq_frame, textvariable=high_var, width=6)
-            high_entry.pack(side=tk.LEFT)
-            
-            # Amplitude
-            amp_frame = ttk.Frame(controls_frame)
-            amp_frame.pack(side=tk.LEFT, padx=(20, 0))
-
-            ttk.Label(amp_frame, text="Échelle (%):").pack(side=tk.LEFT, padx=(0, 5))
-            amplitude_entry = ttk.Entry(amp_frame, textvariable=amplitude_var, width=6)
-            amplitude_entry.pack(side=tk.LEFT)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Frame des boutons
-        button_frame = ttk.Frame(filter_window)
-        button_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        def apply_all():
-            """Applique la configuration"""
-            # Sauvegarder tous les paramètres
-            for channel, vars in channel_vars.items():
-                self.channel_filter_params[channel] = {
-                    'enabled': vars['enabled'].get(),
-                    'low': vars['low'].get(),
-                    'high': vars['high'].get(),
-                    'amplitude': vars['amplitude'].get()
-                }
-            
-            # Paramètres globaux
-            self.filter_enabled = global_filter_var.get()
-            
-            messagebox.showinfo("Succès", "Configuration des filtres appliquée!")
-            filter_window.destroy()
-            self.update_plot()
-        
-        def reset_defaults():
-            """Remet les paramètres par défaut"""
-            for channel, vars in channel_vars.items():
-                # Utiliser la reconnaissance automatique pour les paramètres par défaut
-                signal_type = cesa_detect_signal_type(channel)
-                default_params = cesa_get_filter_presets(signal_type)
-
-                vars['low'].set(default_params['low'])
-                vars['high'].set(default_params['high'])
-                vars['amplitude'].set(default_params['amplitude'])
-                vars['enabled'].set(default_params['enabled'])
-        
-        def close_window():
-            """Ferme la fenêtre"""
-            filter_window.destroy()
-        
-        # Boutons
-        ttk.Button(button_frame, text="Appliquer", command=apply_all,
-                  style="Accent.TButton").pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Par défaut", command=reset_defaults).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Annuler", command=close_window).pack(side=tk.RIGHT)
-        ttk.Button(button_frame, text="Fermer", command=close_window).pack(side=tk.RIGHT, padx=5)
-    
     def show_multi_graph_view(self, embed_parent: Optional[ttk.Frame] = None):
         """Affiche la vue PSG multi-subplots.
         - Si embed_parent est fourni, intègre la figure dans ce conteneur (vue principale)
@@ -2419,9 +2204,59 @@ class EEGAnalysisStudio:
             counts_text.insert(tk.END, f"{lbl:<7}  {counts_manual[i]:>6}    {counts_auto[i]:>6}\n")
         counts_text.configure(state='disabled')
     
-    def _update_plot(self, *args):
-        """Met à jour le graphique (alias pour update_plot)."""
-        self.update_plot()
+    if EVENTS_AVAILABLE:
+        @measure_time("update_plot")
+        def update_plot(self):
+            """Version optimisée avec mesure de performance et événements"""
+            import time
+            current_time = time.time()
+            
+            if hasattr(self, '_plot_update_pending_id') and self._plot_update_pending_id:
+                self.root.after_cancel(self._plot_update_pending_id)
+            
+            if not hasattr(self, '_last_plot_update'):
+                self._last_plot_update = 0
+            if not hasattr(self, '_min_plot_interval'):
+                self._min_plot_interval = 0.05
+                
+            time_since_last = current_time - self._last_plot_update
+            delay = max(0, int((self._min_plot_interval - time_since_last) * 1000))
+            
+            self._plot_update_pending_id = self.root.after(delay, self._do_actual_plot_update)
+
+            if OPTIMIZATION_AVAILABLE:
+                @cached_analysis()
+                @optimize_data
+                def _prepare_plot_data(self, channels, time_range):
+                    """Prépare les données pour le tracé avec optimisation"""
+                    if not self.raw:
+                        return {}
+                    
+                    # Générer la clé de cache
+                    cache_key = f"plot_{hash(tuple(channels))}_{time_range[0]}_{time_range[1]}"
+                    
+                    # Vérifier le cache
+                    cached_data = memory_manager.get_plot_data(cache_key)
+                    if cached_data:
+                        return cached_data
+                    
+                    # Préparer les données optimisées
+                    raw_data = {ch: self.derivations[ch] for ch in channels if ch in self.derivations}
+                    optimized_data = data_optimizer.prepare_channel_data(
+                        raw_data, channels, time_range, self.sfreq
+                    )
+                    
+                    # Mettre en cache
+                    memory_manager.cache_plot_data(cache_key, optimized_data)
+                    
+                    return optimized_data
+
+    else:
+        # Version fallback si les événements ne sont pas disponibles
+        def update_plot(self):
+            # Votre code update_plot existant sans modifications
+            pass
+
     
     def _show_channel_stats(self):
         """Affiche les statistiques des canaux."""
@@ -5935,313 +5770,24 @@ Licence : MIT
             messagebox.showinfo("Guide d'Utilisation", "Assistant utilisateur non disponible.")
     
     def _show_shortcuts(self):
-        """Affiche les raccourcis clavier dans une interface moderne."""
+        """Affiche les raccourcis - VERSION OPTIMISÉE MODULAIRE"""
         try:
-            print("🔍 CHECKPOINT SHORTCUTS: Affichage des raccourcis")
-            logging.info("[SHORTCUTS] Displaying shortcuts")
-            
-            # Créer la fenêtre des raccourcis
-            shortcuts_window = tk.Toplevel(self.root)
-            shortcuts_window.title("Raccourcis Clavier - EEG Analysis Studio")
-            shortcuts_window.geometry("700x800")
-            shortcuts_window.transient(self.root)
-            shortcuts_window.grab_set()
-            
-            # Frame principal avec scrollbar
-            main_frame = ttk.Frame(shortcuts_window)
-            main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-            
-            # Titre
-            title_label = ttk.Label(main_frame, text="⌨️ Raccourcis Clavier", 
-                                  font=('Segoe UI', 18, 'bold'))
-            title_label.pack(pady=(0, 20))
-            
-            # Canvas et scrollbar pour le contenu
-            canvas = tk.Canvas(main_frame)
-            scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-            
-            scrollable_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-            )
-            
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            
-            # Définir les catégories de raccourcis
-            shortcuts_categories = {
-                "📁 Fichier": [
-                    ("Ctrl+O", "Ouvrir fichier EDF"),
-                    ("Ctrl+S", "Exporter données"),
-                    ("Ctrl+Shift+S", "Exporter segment EDF"),
-                    ("Ctrl+Shift+R", "Générer rapport complet"),
-                    ("Ctrl+Q", "Quitter l'application")
-                ],
-                "🧭 Navigation Temporelle": [
-                    ("Z", "Époque précédente"),
-                    ("Q", "Époque précédente (alternatif)"),
-                    ("S", "Époque suivante"),
-                    ("D", "Époque suivante (alternatif)"),
-                    ("←", "Navigation temporelle (gauche)"),
-                    ("→", "Navigation temporelle (droite)"),
-                    ("Ctrl+←", "Navigation rapide (gauche)"),
-                    ("Ctrl+→", "Navigation rapide (droite)"),
-                    ("Home", "Aller au début"),
-                    ("End", "Aller à la fin")
-                ],
-                "📊 Amplitude et Zoom": [
-                    ("↑", "Augmenter amplitude"),
-                    ("↓", "Diminuer amplitude"),
-                    ("Ctrl+↑", "Augmenter amplitude (grand pas)"),
-                    ("Ctrl+↓", "Diminuer amplitude (grand pas)"),
-                    ("+", "Zoom avant"),
-                    ("-", "Zoom arrière"),
-                    ("Ctrl+0", "Réinitialiser zoom")
-                ],
-                "🎯 Scoring de Sommeil": [
-                    ("Ctrl+Y", "Scoring automatique (YASA)"),
-                    ("Ctrl+Shift+M", "Importer scoring manuel (Excel)"),
-                    ("Ctrl+C", "Comparer scoring auto vs manuel"),
-                    ("1", "Marquer comme Éveil (W)"),
-                    ("2", "Marquer comme N1"),
-                    ("3", "Marquer comme N2"),
-                    ("4", "Marquer comme N3"),
-                    ("5", "Marquer comme REM (R)")
-                ],
-                "⚙️ Interface et Affichage": [
-                    ("Ctrl+A", "Activer/Désactiver autoscale"),
-                    ("Ctrl+F", "Activer/Désactiver filtre"),
-                    ("Ctrl+T", "Basculer thème sombre/clair"),
-                    ("Ctrl+1", "Sélectionner canaux"),
-                    ("Ctrl+P", "Basculer panneau commandes"),
-                    ("F2", "Basculer panneau commandes (alternatif)"),
-                    ("F5", "Actualiser graphique"),
-                    ("Ctrl+R", "Actualiser graphique (alternatif)")
-                ],
-                "📈 Analyse et Outils": [
-                    ("Ctrl+Shift+T", "Analyse temporelle"),
-                    ("Ctrl+Shift+K", "Système de marqueurs"),
-                    ("Ctrl+Shift+L", "Outils de mesure"),
-                    ("Ctrl+Shift+F", "Configuration filtres avancée"),
-                    ("Ctrl+Shift+P", "Analyse spectrale (PSD)"),
-                    ("Ctrl+Shift+W", "Analyse TFR (Time-Frequency)")
-                ],
-                "🐛 Debug et Support": [
-                    ("Ctrl+Shift+B", "Générer rapport de bug"),
-                    ("Ctrl+Shift+D", "Afficher informations debug"),
-                    ("Ctrl+Shift+I", "Informations système")
-                ],
-                "❓ Aide et Navigation": [
-                    ("F1", "Assistant de bienvenue"),
-                    ("F3", "Rechercher dans les données"),
-                    ("F4", "Afficher statistiques canaux"),
-                    ("Escape", "Fermer les dialogues"),
-                    ("Ctrl+?", "Afficher cette aide (raccourcis)")
-                ]
-            }
-            
-            # Créer les sections pour chaque catégorie
-            for category, shortcuts in shortcuts_categories.items():
-                # Frame pour la catégorie
-                category_frame = ttk.LabelFrame(scrollable_frame, text=category, padding=10)
-                category_frame.pack(fill=tk.X, pady=(0, 15))
-                
-                # Créer un frame interne pour les raccourcis
-                shortcuts_frame = ttk.Frame(category_frame)
-                shortcuts_frame.pack(fill=tk.X)
-                
-                # Ajouter chaque raccourci
-                for i, (shortcut, description) in enumerate(shortcuts):
-                    # Frame pour chaque raccourci
-                    shortcut_frame = ttk.Frame(shortcuts_frame)
-                    shortcut_frame.pack(fill=tk.X, pady=2)
-                    
-                    # Raccourci (en gras)
-                    shortcut_label = ttk.Label(shortcut_frame, text=shortcut, 
-                                             font=('Consolas', 10, 'bold'), 
-                                             foreground='#0066CC')
-                    shortcut_label.pack(side=tk.LEFT, padx=(0, 15))
-                    
-                    # Description
-                    desc_label = ttk.Label(shortcut_frame, text=description, 
-                                         font=('Segoe UI', 9))
-                    desc_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            
-            # Ajouter une section d'informations supplémentaires
-            info_frame = ttk.LabelFrame(scrollable_frame, text="ℹ️ Informations", padding=10)
-            info_frame.pack(fill=tk.X, pady=(10, 0))
-            
-            info_text = """
-• Les raccourcis ZQSD fonctionnent uniquement quand la fenêtre principale a le focus
-• Les flèches directionnelles peuvent temporairement désactiver ZQSD (utilisez les raccourcis avec Ctrl pour réactiver)
-• Certains raccourcis peuvent varier selon le contexte (dialogue ouvert, etc.)
-• Utilisez Escape pour fermer la plupart des fenêtres et dialogues
-• Les raccourcis sont également disponibles dans les menus contextuels
-            """
-            
-            info_label = ttk.Label(info_frame, text=info_text.strip(), 
-                                 font=('Segoe UI', 8), justify=tk.LEFT)
-            info_label.pack(anchor='w')
-            
-            # Boutons de contrôle
-            button_frame = ttk.Frame(scrollable_frame)
-            button_frame.pack(fill=tk.X, pady=(20, 0))
-            
-            def print_shortcuts():
-                """Imprime les raccourcis dans la console."""
-                try:
-                    print("\n" + "="*60)
-                    print("📋 RACCOURCIS CLAVIER - EEG ANALYSIS STUDIO")
-                    print("="*60)
-                    
-                    for category, shortcuts in shortcuts_categories.items():
-                        print(f"\n{category}")
-                        print("-" * len(category))
-                        for shortcut, description in shortcuts:
-                            print(f"  {shortcut:<20} - {description}")
-                    
-                    print("\n" + "="*60)
-                    print("✅ CHECKPOINT SHORTCUTS: Raccourcis imprimés dans la console")
-                    logging.info("[SHORTCUTS] Shortcuts printed to console")
-                    
-                except Exception as e:
-                    print(f"❌ CHECKPOINT SHORTCUTS: Erreur impression: {e}")
-                    logging.error(f"[SHORTCUTS] Failed to print shortcuts: {e}")
-            
-            def copy_shortcuts():
-                """Copie les raccourcis dans le presse-papiers."""
-                try:
-                    shortcuts_text = "RACCOURCIS CLAVIER - EEG ANALYSIS STUDIO\n"
-                    shortcuts_text += "="*50 + "\n\n"
-                    
-                    for category, shortcuts in shortcuts_categories.items():
-                        shortcuts_text += f"{category}\n"
-                        shortcuts_text += "-" * len(category) + "\n"
-                        for shortcut, description in shortcuts:
-                            shortcuts_text += f"{shortcut:<20} - {description}\n"
-                        shortcuts_text += "\n"
-                    
-                    # Copier dans le presse-papiers (Windows)
-                    try:
-                        shortcuts_window.clipboard_clear()
-                        shortcuts_window.clipboard_append(shortcuts_text)
-                        shortcuts_window.update()
-                        messagebox.showinfo("Succès", "Raccourcis copiés dans le presse-papiers !")
-                        print("✅ CHECKPOINT SHORTCUTS: Raccourcis copiés dans le presse-papiers")
-                        logging.info("[SHORTCUTS] Shortcuts copied to clipboard")
-                    except Exception:
-                        messagebox.showwarning("Attention", "Impossible de copier dans le presse-papiers")
-                        
-                except Exception as e:
-                    print(f"❌ CHECKPOINT SHORTCUTS: Erreur copie: {e}")
-                    logging.error(f"[SHORTCUTS] Failed to copy shortcuts: {e}")
-                    messagebox.showerror("Erreur", f"Erreur lors de la copie : {str(e)}")
-            
-            ttk.Button(button_frame, text="📋 Imprimer dans la Console", 
-                      command=print_shortcuts).pack(side=tk.LEFT, padx=(0, 10))
-            ttk.Button(button_frame, text="📋 Copier dans le Presse-papiers", 
-                      command=copy_shortcuts).pack(side=tk.LEFT, padx=(0, 10))
-            ttk.Button(button_frame, text="Fermer", 
-                      command=shortcuts_window.destroy).pack(side=tk.RIGHT)
-            
-            # Configuration du canvas et scrollbar
-            canvas.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
-            
-            # Lier la molette de la souris au scroll
-            def _on_mousewheel(event):
-                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            
-            def _unbind_mousewheel(event):
-                canvas.unbind_all("<MouseWheel>")
-            shortcuts_window.bind("<Destroy>", _unbind_mousewheel)
-            
-            # Raccourci pour fermer la fenêtre
-            shortcuts_window.bind("<Escape>", lambda e: shortcuts_window.destroy())
-            shortcuts_window.bind("<Control-?>", lambda e: shortcuts_window.destroy())
-            
-            # Focus sur la fenêtre
-            shortcuts_window.focus_set()
-            
-            print("✅ CHECKPOINT SHORTCUTS: Interface raccourcis affichée")
-            logging.info("[SHORTCUTS] Shortcuts interface displayed")
-            
+            shortcuts_dialog = ShortcutsDialog(self.root)
+            shortcuts_dialog.show_shortcuts()
         except Exception as e:
-            print(f"❌ CHECKPOINT SHORTCUTS: Erreur affichage raccourcis: {e}")
-            logging.error(f"[SHORTCUTS] Failed to show shortcuts: {e}")
+            print(f"❌ CHECKPOINT SHORTCUTS: Erreur - {e}")
+            logging.error(f"[SHORTCUTS] Erreur - {str(e)}")
             messagebox.showerror("Erreur", f"Erreur lors de l'affichage des raccourcis : {str(e)}")
-    
+
+
     def _report_bug(self):
-        """Signaler un bug - crée un fichier de rapport avec logs et checkpoints."""
+        """Signaler un bug - VERSION OPTIMISÉE MODULAIRE"""
         try:
-            # Créer le nom de fichier avec timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            bug_report_filename = f"bug_report_{timestamp}.txt"
-            
-            # Créer le contenu du rapport
-            report_content = self._generate_bug_report()
-            
-            # Écrire le fichier
-            with open(bug_report_filename, 'w', encoding='utf-8') as f:
-                f.write(report_content)
-            
-            # Afficher le message de succès avec le chemin du fichier
-            import os
-            full_path = os.path.abspath(bug_report_filename)
-            
-            # Demander si l'utilisateur veut ouvrir le fichier
-            open_file = messagebox.askyesno(
-                "Rapport de Bug Créé", 
-                f"Rapport de bug créé avec succès !\n\n"
-                f"Fichier : {bug_report_filename}\n"
-                f"Emplacement : {full_path}\n\n"
-                f"Le fichier contient :\n"
-                f"• Informations système\n"
-                f"• État de l'application\n"
-                f"• Logs et checkpoints récents\n"
-                f"• Configuration actuelle\n"
-                f"• Erreurs récentes\n\n"
-                f"Voulez-vous ouvrir le fichier maintenant ?"
-            )
-            
-            if open_file:
-                try:
-                    # Ouvrir le fichier avec l'application par défaut
-                    import subprocess
-                    import platform
-                    
-                    system = platform.system()
-                    if system == "Windows":
-                        os.startfile(full_path)
-                    elif system == "Darwin":  # macOS
-                        subprocess.run(["open", full_path])
-                    else:  # Linux
-                        subprocess.run(["xdg-open", full_path])
-                        
-                except Exception as e:
-                    print(f"❌ RAPPORT BUG: Impossible d'ouvrir le fichier: {e}")
-                    messagebox.showwarning("Attention", f"Le fichier a été créé mais n'a pas pu être ouvert automatiquement.\nEmplacement: {full_path}")
-            
-            messagebox.showinfo(
-                "Instructions",
-                "Veuillez joindre ce fichier à votre signalement de bug avec :\n"
-                "• Une description détaillée du problème\n"
-                "• Les étapes pour reproduire le bug\n"
-                "• Le fichier EDF si applicable\n"
-                "• Une capture d'écran si possible"
-            )
-            
-            print(f"🐛 RAPPORT BUG: Fichier créé - {full_path}")
-            logging.info(f"[BUG_REPORT] Bug report created: {full_path}")
-            
+            self.report_dialog.report_bug()
         except Exception as e:
-            error_msg = f"Erreur lors de la création du rapport de bug : {str(e)}"
-            print(f"❌ RAPPORT BUG: {error_msg}")
-            logging.error(f"[BUG_REPORT] Failed to create bug report: {e}")
-            messagebox.showerror("Erreur", error_msg)
-    
+            logging.error(f"BUGREPORT: Erreur - {str(e)}")
+            messagebox.showerror("Erreur", f"Erreur lors de la génération du rapport : {str(e)}")
+
     def _generate_bug_report(self):
         """Génère le contenu du rapport de bug avec toutes les informations pertinentes."""
         try:
@@ -9641,13 +9187,28 @@ Date: 2025-09-09
             logging.info(f"[NAV] prev_target={target_time:.3f}")
             logging.info(f"[NAV] target={target_time:.1f}")
             self._jump_to_time(target_time)
+            
+            # ========== AJOUTEZ CET ÉVÉNEMENT ICI ==========
+            if EVENTS_AVAILABLE:
+                try:
+                    event_data = EventData.TimeChanged(
+                        current_time=self.current_time,
+                        duration=getattr(self, 'duration', 10.0)
+                    )
+                    event_bus.emit(Events.TIME_CHANGED, event_data, throttle=0.05)
+                    logging.debug(f"EVENT: Time changed to {self.current_time:.1f}s")
+                except Exception as e:
+                    logging.error(f"EVENT: Error emitting time_changed - {e}")
+            # ===============================================
+            
             print(f"⬅️ CHECKPOINT NAV 1: Navigation vers score précédent: {target_time:.1f}s")
             logging.info(f"[NAV] Go précédent -> {target_time:.1f}")
             
             # Navigation simple sans changer la durée
             # self._center_view_on_epoch(target_time, epoch_duration)  # Désactivé pour garder la durée actuelle
         else:
-            print("⚠️ CHECKPOINT NAV 1: Aucun score précédent disponible")
+            print("⚠️ CHECKPOINT NAV 1: Aucun scoring chargé")
+
     
     def _navigate_to_next_score(self, event=None):
         """Navigue vers le score suivant (S ou D)."""
@@ -9699,6 +9260,17 @@ Date: 2025-09-09
             logging.info(f"[NAV] target={target_time:.1f}")
             self._jump_to_time(target_time)
             print(f"➡️ CHECKPOINT NAV 2: Navigation vers score suivant: {target_time:.1f}s")
+            if EVENTS_AVAILABLE:
+                try:
+                    event_data = EventData.TimeChanged(
+                        current_time=self.current_time,
+                        duration=getattr(self, 'duration', 10.0)
+                    )
+                    event_bus.emit(Events.TIME_CHANGED, event_data, throttle=0.05)
+                    logging.debug(f"EVENT: Time changed to {self.current_time:.1f}s")
+                except Exception as e:
+                    logging.error(f"EVENT: Error emitting time_changed - {e}")
+            
             logging.info(f"[NAV] Go suivant -> {target_time:.1f}")
             
             # Navigation simple sans changer la durée
@@ -10771,15 +10343,25 @@ Date: 2025-09-09
             print(f"🔍 CHECKPOINT DESELECT: Erreur: {e}")
 
     def _quick_select_channels(self, channels_to_select):
-        """Sélection rapide de canaux spécifiques."""
-        # Désélectionner tous d'abord
+        """Sélection rapide de canaux spécifiques - VERSION AVEC ÉVÉNEMENTS"""
+        # Votre code existant
         for var in self.channel_vars.values():
             var.set(False)
         
-        # Sélectionner les canaux demandés
         for channel in channels_to_select:
             if channel in self.channel_vars:
                 self.channel_vars[channel].set(True)
+        
+        # Émettre l'événement si disponible
+        if EVENTS_AVAILABLE:
+            try:
+                event_data = EventData.ChannelsSelected(channels=channels_to_select)
+                event_bus.emit(Events.CHANNELS_SELECTED, event_data)
+                logging.debug(f"EVENT: Channels selected - {len(channels_to_select)} channels")
+            except Exception as e:
+                logging.error(f"EVENT: Error emitting channels_selected - {e}")
+
+
 
     def _show_batch_config(self):
         """Affiche la configuration actuelle du traitement en lot."""
@@ -12564,7 +12146,7 @@ Date: 2025-09-09
         self.root.bind('<Control-a>', lambda e: self.toggle_autoscale())
         self.root.bind('<Control-f>', lambda e: self.toggle_filter())
     
-    def load_edf_file(self):
+    def load_edf_file(self, filename):
         """Charge un fichier EDF avec barre de chargement stylée"""
         dialog = OpenDatasetDialog(self.root)
         selection = dialog.show()
@@ -12980,12 +12562,37 @@ Date: 2025-09-09
             )
             logging.info(f"[OPEN] Popup succès affiché: {os.path.basename(file_path)} | mode={mode_msg}")
             
+            # À la fin, si le chargement a réussi :
+            if hasattr(self, 'raw') and self.raw is not None and EVENTS_AVAILABLE:
+                try:
+                    filename = getattr(self, 'current_file_path', 'Unknown')
+                    event_data = EventData.DataLoaded(
+                        filename=filename,
+                        channels=self.raw.ch_names,
+                        sfreq=self.sfreq
+                    )
+                    event_bus.emit(Events.DATA_LOADED, event_data)
+                    logging.info(f"EVENT: Data loaded - {filename}")
+                except Exception as e:
+                    logging.error(f"EVENT: Error emitting data_loaded - {e}")
+
+
         except Exception as e:
             # Cacher la barre de chargement en cas d'erreur
             self._hide_loading_bar()
             
             print(f"❌ Erreur lors du chargement: {e}")
             messagebox.showerror("Erreur", f"Erreur lors du chargement: {str(e)}", parent=self.root)
+
+        # Émettre l'événement une fois le fichier chargé
+        if self.raw:
+            event_data = EventData.DataLoaded(
+                filename=filename,
+                channels=self.raw.ch_names,
+                sfreq=self.sfreq
+            )
+            event_bus.emit(Events.DATA_LOADED, event_data)
+
     
     def _extract_absolute_time(self):
         """Extrait le temps absolu de début d'enregistrement depuis les métadonnées EDF."""
@@ -13204,9 +12811,29 @@ Date: 2025-09-09
             self.current_time = min(max_time, self.current_time + self.duration)
             self.time_var.set(self.current_time)
         self.update_plot()
+
+    def update_plot(self):
+        """Version optimisée avec debouncing de update_plot"""
+        import time
+        
+        current_time = time.time()
+        
+        # Annuler la mise à jour précédente si elle existe
+        if self._plot_update_pending_id:
+            self.root.after_cancel(self._plot_update_pending_id)
+        
+        # Calculer le délai
+        time_since_last = current_time - self._last_plot_update
+        delay = max(0, int((self._min_plot_interval - time_since_last) * 1000))
+        
+        # Programmer la mise à jour
+        self._plot_update_pending_id = self.root.after(delay, self._do_actual_plot_update)
     
-    def update_plot(self, *args):
+    def _do_actual_plot_update(self):
         """Met à jour l'affichage principal en rafraîchissant la vue PSG intégrée."""
+        import time
+        self._plot_update_pending_id = None
+        self._last_plot_update = time.time()
         if not getattr(self, 'raw', None):
             return
         try:
