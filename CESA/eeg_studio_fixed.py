@@ -59,44 +59,98 @@ Architecture modulaire:
 # IMPORTS ET CONFIGURATION
 # =============================================================================
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, font
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter
-import mne
-import numpy as np
+# ----------------------- OPTIMISATION IMPORTS PYTHON -----------------------
+
+# Imports standards séparés, triés et groupés par fonction
 import os
 import sys
 import json
 import csv
+import re
+import time
+import logging
+import warnings
 from pathlib import Path
 from datetime import datetime, timedelta
-import pandas as pd
-import warnings
 from typing import Dict, List, Optional, Tuple, Any
-import logging
-import re
 from itertools import groupby
 
-from core.bridge import DataBridge
+# Import scientifiques et de visualisation
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.colors import LogNorm
+import mne
+from mne.time_frequency import tfr_array_morlet
+from scipy.signal import welch
+
+# Imports tkinter (éléments graphiques)
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, font
+
+# Imports internes regroupés par module logique/usage
+try:
+    from core.data_bridge import DataBridge
+except ImportError:
+    # Fallback - désactiver navigation rapide si module absent
+    DataBridge = None
+    logging.warning("core.data_bridge non trouvé - navigation rapide désactivée")
+
+from CESA.menu_builder import MenuBuilder
+from CESA.file_dialogs import EEGFileManager
+
 from ui.startup_mode import ModeSelector
 from ui.open_dataset_dialog import OpenDatasetDialog
-from CESA.spectral_analysis import compute_psd_fft, compute_band_powers, compute_peak_and_centroid, EEG_BANDS
-from scipy.signal import welch
-from mne.time_frequency import tfr_array_morlet
-from matplotlib.colors import LogNorm
-from CESA.spectral_analysis import compute_stage_psd_welch_for_array, compute_stage_psd_fft_for_array
-from CESA.filters import (apply_filter as cesa_apply_filter,
-                         apply_baseline_correction as cesa_apply_baseline_correction,
-                         detect_signal_type as cesa_detect_signal_type,
-                         get_filter_presets as cesa_get_filter_presets)
-from CESA.scoring_io import import_excel_scoring as cesa_import_excel_scoring, import_edf_hypnogram as cesa_import_edf_hypnogram
 from ui.shortcuts_dialog import ShortcutsDialog
 from ui.filter_config_dialog import FilterConfigDialog
 from ui.report_dialog import ReportDialog
-# Nouveaux imports pour l'optimisation
+from ui.channel_selector import ChannelSelector
+from ui.main_interface import MainInterfaceManager
+from CESA.core_manager import CoreManager
+from CESA.theme_manager import theme_manager
+
+
+
+
+# Modules CESA spécifiques (fonctionnalités analytiques) regroupés en tuples
+from CESA.spectral_analysis import (
+    compute_psd_fft,
+    compute_band_powers,
+    compute_peak_and_centroid,
+    compute_stage_psd_welch_for_array,
+    compute_stage_psd_fft_for_array,
+    EEG_BANDS,
+)
+
+# Imports pour les filtres EEG centralisés
+from CESA.filters import (
+    apply_filter as cesa_apply_filter,
+    apply_baseline_correction as cesa_apply_baseline_correction,
+    detect_signal_type as cesa_detect_signal_type,
+    get_filter_presets as cesa_get_filter_presets,
+)
+
+# Imports pour le scoring de sommeil
+from CESA.scoring_manager import (
+    open_scoring_import_hub,
+    open_manual_scoring_editor,
+    save_active_scoring,
+    get_active_scoring_df,
+    export_periods_and_metrics_csv,
+    analyze_sleep_periods,
+)
+
+
+# Imports pour l'import et la synchronisation du scoring
+from CESA.scoring_io import (
+    import_excel_scoring as cesa_import_excel_scoring,
+    import_edf_hypnogram as cesa_import_edf_hypnogram,
+)
+
+# Imports optionnels sécurisés avec gestion d’erreur claire
 try:
     from CESA.event_system import event_bus, Events, EventData
     from CESA.performance_monitor import perf_monitor, measure_time
@@ -104,37 +158,36 @@ try:
 except ImportError:
     EVENTS_AVAILABLE = False
     logging.warning("Event system not available")
+
 try:
     from CESA.performance_dashboard import PerformanceDashboard
     DASHBOARD_AVAILABLE = True
 except ImportError:
     DASHBOARD_AVAILABLE = False
 
-
-import time
-
-# Configuration des warnings
+# Gestion des warnings pour garder la sortie propre
 warnings.filterwarnings('ignore')
 
-# Configuration du logging
+# Configuration centralisée du logging (niveau, format, handlers)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 
-# Ajout d'un RotatingFileHandler pour les checkpoints persistants
+# Ajout optionnel d’un RotatingFileHandler pour log volumineux
 try:
     from logging.handlers import RotatingFileHandler
-    rotating_handler = RotatingFileHandler('eeg_studio.log', maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+    rotating_handler = RotatingFileHandler(
+        'eeg_studio.log', maxBytes=2_000_000, backupCount=3, encoding='utf-8'
+    )
     rotating_handler.setLevel(logging.INFO)
     rotating_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
     logging.getLogger().addHandler(rotating_handler)
-except Exception as _e:
-    logging.warning(f"Impossible d'initialiser le RotatingFileHandler: {_e}")
+except Exception as e:
+    logging.warning(f"Impossible d'initialiser RotatingFileHandler: {e}")
 
+# Imports supplémentaires optionnels liés à l’optimisation mémoire
 try:
     from CESA.memory_manager import memory_manager, cached_analysis
     from CESA.data_optimizer import data_optimizer, optimize_data
@@ -143,7 +196,7 @@ except ImportError:
     OPTIMIZATION_AVAILABLE = False
     logging.warning("Memory optimization not available")
 
-
+# Import d’un cache manager (ex : stockage résultats calculs lourds)
 from CESA.cache_manager import cache_result
 
 # =============================================================================
@@ -171,34 +224,75 @@ class EEGAnalysisStudio:
         filter_high (float): Fréquence de coupure haute (Hz)
     """
     
-    def __init__(self, root: tk.Tk, data_bridge: Optional[DataBridge] = None) -> None:
-        """
-        Initialise l'application EEG Analysis Studio.
-        
-        Args:
-            root: Fenêtre principale Tkinter
-        """
-        # =====================================================================
-        # INITIALISATION DES VARIABLES PRINCIPALES
-        # =====================================================================
-        
+    def __init__(self, root, data_bridge=None) -> None:
+       
         self.root = root
         self.data_bridge = data_bridge
+        
+        self.start_time = time.time()
+        self.telemetry_path = Path("logs/telemetry.csv")
+
+        # Gestionnaires principaux
+        self.data_bridge = DataBridge
+        self.file_manager = EEGFileManager(self)
+        self.data_mode = "precomputed" if DataBridge else "raw"
+        self.last_bridge_result = None
+        
+        # Variables d'interface
+        self.sleep_stages = {...}
+        self.interface_mode = tk.StringVar(value="modern")
+        self.spacing_var = tk.StringVar(value="50")
+        self.amplitude_var = tk.StringVar(value="100")
+        self.autoscale_var = tk.BooleanVar(value=False)
+        
+        # État du panneau de commandes
+        self.control_panel_collapsed = False
+        self.original_control_width = 300
+
+        # Durée d'époque pour le scoring de sommeil (30s par défaut)
+        self.scoring_epoch_duration = 30.0
+
+        # Gestionnaire de thèmes (remplace l'ancien système de palettes)
+        self.theme_manager = theme_manager
+
+        
+        # ✅ 1. D'ABORD configurer l'interface
+        self._setup_modern_interface()
+        self.create_modern_menu()
+        self._create_modern_widgets()
+        self._setup_keyboard_shortcuts()
+
+        # ✅ 2. ENSUITE créer les managers (APRÈS l'interface)
+        self.interface_manager = MainInterfaceManager(self)
+        self.core_manager = CoreManager(self)
+        
+        # ✅ 3. Puis les systèmes auxiliaires
+        self._setup_user_assistant()
+        self._console_checkpoints = []
+        self._setup_checkpoint_capture()
+        self.temporal_markers = []
+
+        # Initialisation de base
+        self._start_time = time.time()
+        self._telemetry_path = Path("logs") / "telemetry.csv"
+
+        # Gestionnaires principaux
+        self.data_bridge = data_bridge
+        self.file_manager = EEGFileManager(self)
         self.data_mode = "precomputed" if data_bridge else "raw"
         self._last_bridge_result = None
-        self._telemetry_path = Path("logs") / "telemetry.csv"
+        
+        # Données EEG
         self.raw: Optional[mne.io.Raw] = None
         self.derivations: Dict[str, np.ndarray] = {}
         self.selected_channels: List[str] = []
 
+        # Système d'événements et gestionnaires de dialogue
         self._setup_event_system()
-
-
-        # Initialiser le gestionnaire de rapports
         self.report_dialog = ReportDialog(self)
-
-        # Initialiser le gestionnaire de configuration des filtres
+        self.shortcuts_dialog = ShortcutsDialog(self)
         self.filter_config_dialog = FilterConfigDialog(self)
+        self.open_dataset_dialog = OpenDatasetDialog(self)
 
         # Paramètres temporels
         self.current_time: float = 0.0
@@ -282,9 +376,6 @@ class EEGAnalysisStudio:
         self._psg_cached_hypnogram: Optional[Tuple[List[str], float]] = None
         self._psg_cached_scoring_rows: int = 0
         
-        # Gestionnaire de thèmes (remplace l'ancien système de palettes)
-        from CESA.theme_manager import theme_manager
-        self.theme_manager = theme_manager
 
         # Références aux lignes EEG pour mise à jour des couleurs
         self.eeg_lines = []
@@ -315,48 +406,17 @@ class EEGAnalysisStudio:
             'R': 'REM',
             'U': 'Inconnu'
         }
-        
-        # Variables d'interface
-        self.interface_mode = tk.StringVar(value="modern")
-        self.spacing_var = tk.StringVar(value="50")
-        self.amplitude_var = tk.StringVar(value="100")
-        self.autoscale_var = tk.BooleanVar(value=False)
-        
-        # État du panneau de commandes
-        self.control_panel_collapsed = False
-        self.original_control_width = 300  # Ajustée pour compacité sans masquer les boutons
-        
-        # Durée d'époque pour le scoring de sommeil (30s par défaut)
-        self.scoring_epoch_duration = 30.0
-        
-        # Configuration de l'interface
-        self._setup_modern_interface()
-        self._create_modern_menu()
-        self._create_modern_widgets()
-        self._setup_keyboard_shortcuts()
 
-        
-        # Initialisation de l'assistant utilisateur
-        self._setup_user_assistant()
-        
-        # Initialisation du système de capture des checkpoints pour les rapports de bug
-        self.console_checkpoints = []
-        self._setup_checkpoint_capture()
-        
-        # Initialisation du thème
-        self.dark_theme_enabled = False
-        
-        # Initialisation du système de marqueurs
-        self.temporal_markers = []  # Liste des marqueurs temporels
-        
-        # Mise à jour de l'affichage de la version
-        self._update_version_display()
-        
-        # Log de l'initialisation
-        logging.info("CCESA (Complex EEG Studio Analysis) v1.0 initialisé avec succès")
-        logging.info("Application initialized successfully")
 
-        # Optimisation rendu: exécuteur en arrière-plan + debouncing
+        # Configuration de la fenêtre
+        try:
+            self.root.attributes('-topmost', False)
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+        
+        # Optimisation du rendu
         try:
             import concurrent.futures as _fut
             self._plot_executor = _fut.ThreadPoolExecutor(max_workers=max(1, min(4, (os.cpu_count() or 2) - 1)))
@@ -367,29 +427,40 @@ class EEGAnalysisStudio:
         self._active_plot_future = None
         self._active_plot_token = None
         
-        # S'assurer que la fenêtre principale n'est pas en topmost (fix splash screen)
-        try:
-            self.root.attributes('-topmost', False)
-            self.root.lift()
-            self.root.focus_force()
-        except Exception:
-            pass
+        # Enregistrement des objets volumineux si disponible
+        if OPTIMIZATION_AVAILABLE and hasattr(self, 'raw') and self.raw:
+            memory_manager.register_large_object(self.raw)
 
-        if EVENTS_AVAILABLE:
-            self._setup_event_system()
-
-        if OPTIMIZATION_AVAILABLE:
-            # Enregistrer des objets volumineux
-            if hasattr(self, 'raw') and self.raw:
-                memory_manager.register_large_object(self.raw)
-
-        # Initialiser le dashboard
+        # Initialisation du dashboard si disponible
         if DASHBOARD_AVAILABLE:
             self.performance_dashboard = PerformanceDashboard(self)
         
-        # Marquer l'heure de démarrage
-        self._start_time = time.time()
+        # Liaison des méthodes de scoring
+        self.open_scoring_import_hub = open_scoring_import_hub.__get__(self)
+        self.open_manual_scoring_editor = open_manual_scoring_editor.__get__(self)
+        self.save_active_scoring = save_active_scoring.__get__(self)
+        self.get_active_scoring_df = get_active_scoring_df.__get__(self)
+        self.export_periods_and_metrics_csv = export_periods_and_metrics_csv.__get__(self)
+        self.analyze_sleep_periods = analyze_sleep_periods.__get__(self)
+        
+        # Mise à jour de l'affichage et logging
+        self._update_version_display()
+        logging.info("CCESA (Complex EEG Studio Analysis) v1.0 initialisé avec succès")
+        logging.info("Application initialized successfully")
 
+
+    def _init_modular_interface(self):
+        """Initialise l'interface modulaire en complément de l'existante"""
+        try:
+            # Créer la mise en page modulaire
+            self.interface_manager.create_main_layout()
+            
+            # Connecter aux optimisations existantes
+            self.core_manager.initialize_all_modules()
+            
+            logging.info("Modular interface initialized")
+        except Exception as e:
+            logging.error(f"Modular interface error: {e}")
 
     def show_performance_dashboard(self):
         """Affiche le dashboard de performance"""
@@ -397,7 +468,20 @@ class EEGAnalysisStudio:
             self.performance_dashboard.show_dashboard()
         else:
             messagebox.showwarning("Attention", "Dashboard de performance non disponible")
+    def showshortcuts(self):
+        """Affiche les raccourcis clavier - Redirige vers le module UI"""
+        # Cette méthode existait avant dans ce fichier
+        # Maintenant elle appelle le module externe
+        self.shortcuts_dialog.show()
 
+    def show_filter_config(self):
+        """Affiche la configuration des filtres - Redirige vers le module UI"""
+        self.filter_config_dialog.show()
+
+    def show_channel_options(self):
+        """Affiche le sélecteur de canaux - Redirige vers le module UI"""
+        selector = ChannelSelector(self)
+        selector.show()
     def _setup_event_system(self):
         """Configure le système d'événements"""
         try:
@@ -514,7 +598,7 @@ class EEGAnalysisStudio:
             pass  # Pas d'icône disponible
         
         logging.info("Interface configurée avec succès")
-    
+
     def _setup_modern_theme(self) -> None:
         """Configure le thème moderne de l'interface."""
         style = ttk.Style()
@@ -528,7 +612,7 @@ class EEGAnalysisStudio:
         style.configure('Modern.TButton', 
                        background='#007bff', 
                        foreground='white',
-                       font=('Segoe UI', 9, 'bold'))
+                       font=('Helvetica', 9, 'bold'))
         style.map('Modern.TButton',
                  background=[('active', '#0056b3'), ('pressed', '#004085')])
         
@@ -541,23 +625,23 @@ class EEGAnalysisStudio:
         style.configure('Group.TLabelframe', 
                        background='#f8f9fa', 
                        foreground='#495057',
-                       font=('Segoe UI', 9, 'bold'))
+                       font=('Helvetica', 9, 'bold'))
         style.configure('Group.TLabelframe.Label', 
                        background='#f8f9fa', 
                        foreground='#495057',
-                       font=('Segoe UI', 9, 'bold'))
+                       font=('Helvetica', 9, 'bold'))
         
         # Configuration du label de version
         style.configure('Version.TLabel', 
                        background='#f8f9fa', 
                        foreground='#007bff',
-                       font=('Segoe UI', 8, 'bold'))
+                       font=('Helvetica', 8, 'bold'))
         
         # Configuration du label de statut
         style.configure('Status.TLabel', 
                        background='#f8f9fa', 
                        foreground='#28a745',
-                       font=('Segoe UI', 9))
+                       font=('Helvetica', 9))
     
     def _setup_modern_matplotlib(self) -> None:
         """Configure matplotlib pour l'interface moderne."""
@@ -571,7 +655,7 @@ class EEGAnalysisStudio:
             'grid.alpha': 0.3,
             'grid.color': '#dee2e6',
             'font.size': 10,
-            'font.family': 'Segoe UI',
+            'font.family': 'Helvetica',
             'axes.titlesize': 12,
             'axes.labelsize': 10,
             'xtick.labelsize': 9,
@@ -666,175 +750,17 @@ class EEGAnalysisStudio:
         
         self.update_plot()
     
-    def _create_modern_menu(self) -> None:
-        """
-        Crée le menu moderne de l'application.
-        
-        Configure une barre de menu professionnelle avec tous les outils
-        nécessaires pour l'analyse EEG.
-        """
-        menubar = tk.Menu(self.root, bg='#f8f9fa', fg='#212529')
-        self.root.config(menu=menubar)
-        
-        # Configuration pour les menus avec scrollbars
-        menu_config = {
-            'tearoff': 0, 
-            'bg': '#f8f9fa', 
-            'fg': '#212529',
-            'font': ('Segoe UI', 9),
-            'activebackground': '#e9ecef',
-            'activeforeground': '#212529'
-        }
+    def create_modern_menu(self):
+        """Crée le menu moderne - VERSION MODULAIRE"""
+        try:
+            from CESA.menu_builder import MenuBuilder
+            self.menu_builder = MenuBuilder(self)
+            self.menu_builder.create_modern_menu()
+        except Exception as e:
+            logging.error(f"Erreur création menu modulaire: {e}")
+            # Fallback vers ancien système si erreur
+            # self._create_legacy_menu()
 
-        debug_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Debug", menu=debug_menu)
-        debug_menu.add_command(label="Dashboard Performance", command=self.show_performance_dashboard)
-        debug_menu.add_command(label="Rapport de Bug", command=lambda: messagebox.showinfo("Bug Report", "Fonctionnalité en cours d'implémentation"))
-
-        
-        # Créer une classe pour gérer les menus scrollables
-        class ScrollableMenu:
-            def __init__(self, parent, max_items=20, **kwargs):
-                self.parent = parent
-                self.max_items = max_items
-                self.main_menu = tk.Menu(parent, **{**menu_config, **kwargs})
-                self.current_submenu = None
-                self.item_count = 0
-                self.submenu_count = 0
-                
-            def add_command(self, **kwargs):
-                if self.item_count >= self.max_items:
-                    # Créer un nouveau sous-menu "Plus..." si nécessaire
-                    if self.current_submenu is None:
-                        self.submenu_count += 1
-                        submenu_label = "📋 Plus d'options..." if self.submenu_count == 1 else f"📋 Plus d'options... ({self.submenu_count})"
-                        self.current_submenu = tk.Menu(self.main_menu, **menu_config)
-                        self.main_menu.add_cascade(label=submenu_label, menu=self.current_submenu)
-                    
-                    self.current_submenu.add_command(**kwargs)
-                else:
-                    self.main_menu.add_command(**kwargs)
-                
-                self.item_count += 1
-            
-            def add_separator(self):
-                if self.current_submenu and self.item_count > self.max_items:
-                    self.current_submenu.add_separator()
-                else:
-                    self.main_menu.add_separator()
-            
-            def add_cascade(self, **kwargs):
-                if self.current_submenu and self.item_count > self.max_items:
-                    self.current_submenu.add_cascade(**kwargs)
-                else:
-                    self.main_menu.add_cascade(**kwargs)
-                self.item_count += 1
-        
-
-        # Créer une fonction helper pour créer des menus avec scrollbar
-        def create_scrollable_menu(parent, max_items=20, **kwargs):
-            """Crée un menu avec possibilité de scroll si trop d'éléments."""
-            scrollable = ScrollableMenu(parent, max_items=max_items, **kwargs)
-            return scrollable
-        
-        # Menu Fichier
-        file_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="📁 Fichier", menu=file_menu.main_menu)
-        file_menu.add_command(label="📂 Ouvrir EDF", command=self.load_edf_file, accelerator="Ctrl+O")
-        file_menu.add_separator()
-        file_menu.add_command(label="💾 Exporter Données", command=self._export_data, accelerator="Ctrl+S")
-        file_menu.add_command(label="✂️ Exporter segment EDF...", command=self._export_edf_segment)
-        file_menu.add_command(label="📊 Exporter Rapport", command=self._export_report)
-        file_menu.add_separator()
-        file_menu.add_command(label="⚙️ Préférences", command=self._show_preferences)
-        file_menu.add_separator()
-        file_menu.add_command(label="🤖 Automatisation FFT en Lot", command=self._show_batch_fft_automation, accelerator="Ctrl+B")
-        file_menu.add_separator()
-        file_menu.add_command(label="❌ Quitter", command=self._quit_application, accelerator="Ctrl+Q")
-        
-        # Menu Affichage
-        view_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="👁️ Affichage", menu=view_menu.main_menu)
-        view_menu.add_command(label="📋 Sélectionner Canaux", command=self._show_channel_selector, accelerator="Ctrl+1")
-        view_menu.add_separator()
-        view_menu.add_command(label="📏 Activer Autoscale", command=self._toggle_autoscale, accelerator="Ctrl+A")
-        view_menu.add_command(label="🔧 Configuration Filtres", command=self.show_filter_config, accelerator="Ctrl+F")
-        view_menu.add_separator()
-        view_menu.add_command(label="📊 Vue Multi-Graphiques", command=self.show_multi_graph_view, accelerator="Ctrl+M")
-        view_menu.add_separator()
-        view_menu.add_command(label="🎨 Thème Sombre", command=self._toggle_dark_theme)
-        view_menu.add_separator()
-        view_menu.add_command(label="📋 Bascule Panneau Commandes", command=self._toggle_control_panel, accelerator="F2")
-        view_menu.add_command(label="🔄 Actualiser", command=self._refresh_plot, accelerator="F5")
-        
-        # Menu Aide
-        help_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="❓ Aide", menu=help_menu.main_menu)
-        help_menu.add_command(label="🎯 Assistant de première utilisation", command=self._show_welcome_assistant)
-        help_menu.add_command(label="🔍 Explorateur de fonctionnalités", command=self._show_feature_explorer)
-        help_menu.add_command(label="📚 Guide de référence complet", command=self._open_reference_guide)
-        help_menu.add_separator()
-        help_menu.add_command(label="📖 Documentation complète", command=self._open_documentation)
-        help_menu.add_command(label="🧮 Guide entropie renormée", command=self._open_entropy_docs)
-        help_menu.add_separator()
-        help_menu.add_command(label="🔧 Diagnostic système", command=self._run_diagnostic)
-        help_menu.add_command(label="📞 Support technique", command=self._open_support)
-        
-        # Menu Analyse (avec scroll si plus de 8 éléments)
-        analysis_menu = create_scrollable_menu(menubar, max_items=8)
-        menubar.add_cascade(label="📊 Analyse", menu=analysis_menu.main_menu)
-        analysis_menu.add_command(label="📈 Statistiques", command=self._show_channel_stats)
-        analysis_menu.add_command(label="🔍 Diagnostic", command=self._show_diagnostics)
-        analysis_menu.add_separator()
-        analysis_menu.add_command(label="📉 Analyse Spectrale", command=self._show_spectral_analysis)
-        analysis_menu.add_command(label="📊 PSD par stade (FFT – Analyse_spectrale)", command=self._show_stage_psd_fft)
-        analysis_menu.add_command(label="🌈 Spectrogramme ondelettes (avant/après)", command=self._show_wavelet_spectrogram_before_after)
-        analysis_menu.add_command(label="🧮 Entropie Renormée (Issartel)", command=self._show_renormalized_entropy)
-        analysis_menu.add_command(label="🧮 Analyse périodes (SleepEEGpy)", command=self._analyze_sleep_periods)
-        analysis_menu.add_command(label="🌊 Analyse Temporelle", command=self._show_temporal_analysis)
-        analysis_menu.add_separator()
-        analysis_menu.add_command(label="📈 Graphiques Spaghetti (EDF…)", command=self._generate_spaghetti_from_edf)
-        analysis_menu.add_command(label="🤖 Automatisation FFT en Lot", command=self._show_batch_fft_automation)
-        analysis_menu.add_command(label="📊 Analyse Avancée", command=self._show_advanced_analysis)
-        analysis_menu.add_command(label="🔬 Analyse Micro-états", command=self._show_microstates_analysis)
-        analysis_menu.add_command(label="🧠 Connectivité Cérébrale", command=self._show_connectivity_analysis)
-        analysis_menu.add_command(label="⚡ Détection d'Artefacts", command=self._show_artifact_detection)
-        analysis_menu.add_command(label="🎯 Analyse de Sources", command=self._show_source_analysis)
-        
-        # Menu Scoring de Sommeil
-        sleep_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="🛏️ Sommeil", menu=sleep_menu.main_menu)
-        sleep_menu.add_command(label="⚙️ Scoring automatique (YASA)", command=self._run_yasa_scoring, accelerator="Ctrl+Y")
-        sleep_menu.add_separator()
-        sleep_menu.add_command(label="📥 Importer Scoring (Excel/EDF)", command=self._open_scoring_import_hub, accelerator="Ctrl+Shift+M")
-        sleep_menu.add_command(label="🔀 Comparer Auto vs Manuel", command=self._compare_scoring, accelerator="Ctrl+C")
-        sleep_menu.add_command(label="💾 Sauvegarder Scoring (CSV)", command=self._save_active_scoring)
-        sleep_menu.add_command(label="📈 Informations Scoring", command=self._show_sleep_scoring_info)
-        sleep_menu.add_command(label="✍️ Scorer manuellement (éditeur)", command=self._open_manual_scoring_editor, accelerator="Ctrl+Shift+S")
-        sleep_menu.add_command(label="⚙️ Ajuster Durée Époque", command=self._adjust_epoch_duration)
-        
-        # Menu Outils
-        tools_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="🛠️ Outils", menu=tools_menu.main_menu)
-        tools_menu.add_command(label="🎯 Marqueurs", command=self._show_markers)
-        tools_menu.add_command(label="📏 Mesures", command=self._show_measurements)
-        tools_menu.add_command(label="⏩ Aller au temps...", command=self._open_goto_time_dialog, accelerator="Ctrl+G")
-        tools_menu.add_separator()
-        tools_menu.add_command(label="🔧 Configuration Avancée", command=self._show_advanced_config)
-        
-        # Menu Aide
-        help_menu = create_scrollable_menu(menubar)
-        menubar.add_cascade(label="❓ Aide", menu=help_menu.main_menu)
-        help_menu.add_command(label="📖 Assistant de bienvenue", command=self._show_user_guide, accelerator="F1")
-        help_menu.add_command(label="⌨️ Raccourcis Clavier", command=self._show_shortcuts)
-        help_menu.add_separator()
-        help_menu.add_command(label="🐛 Signaler un Bug", command=self._report_bug)
-        help_menu.add_command(label="💡 Suggestions", command=self._suggest_feature)
-        help_menu.add_separator()
-        help_menu.add_command(label="ℹ️ À propos", command=self._show_about)
-        
-        logging.info("Menu créé avec succès")
-    
     # =====================================================================
     # MÉTHODES DE MENU MANQUANTES
     # =====================================================================
@@ -977,6 +903,45 @@ class EEGAnalysisStudio:
             logging.error(f"REPORT: Erreur - {str(e)}")
             return f"Erreur lors de la génération : {str(e)}"
 
+    # def __init__(self, root):
+    #     self.root = root
+    #     # self.file_opener = FileOpener(root)
+
+    #     # Redéfinir la méthode _on_file_loaded pour récupérer les données
+    #     self.file_opener._on_file_loaded = self.on_file_loaded
+    def open_file_dialog(self):
+        """Délègue au gestionnaire de fichiers"""
+        self.file_manager.load_edf_file()
+
+    def load_selected_edf(self, selection):
+        """Charge le fichier EDF sélectionné avec ses options"""
+        filepath = selection['filepath']
+        mode = selection['mode']
+        ms_path = selection['ms_path']
+        precompute_action = selection['precompute_action']
+        
+        # Afficher la barre de progression
+        self.file_dialog.show_loading_bar("Chargement EEG", "Ouverture du fichier EDF...")
+        
+        try:
+            # Utiliser votre méthode de chargement existante
+            # (cherchez dans votre fichier la méthode qui charge réellement l'EDF)
+            self.load_edf_with_params(filepath, mode, ms_path, precompute_action)
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur lors du chargement : {e}")
+            logging.error(f"Erreur chargement EDF: {e}")
+        finally:
+            self.file_dialog.hide_loading_bar()
+
+
+
+    def on_file_loaded(self, raw, sfreq):
+        # Traitement après fichier chargé
+        self.raw = raw
+        self.sfreq = sfreq
+        print(f"Fichier chargé avec {len(raw.ch_names)} canaux à {sfreq} Hz")
+        # Mettre à jour l'interface après chargement
 
 
     def _show_preferences(self):
@@ -1817,7 +1782,7 @@ class EEGAnalysisStudio:
             self.scoring_epoch_duration = 30.0
             
             # Mettre à jour la barre de statut
-            self._update_status_bar()
+            self.update_status_bar()
             
             try:
                 if hasattr(self, 'progress_var'):
@@ -2142,7 +2107,7 @@ class EEGAnalysisStudio:
         # Top metrics frame
         top = ttk.Frame(win)
         top.pack(fill=tk.X, padx=12, pady=8)
-        ttk.Label(top, text=f"Époques comparées: {n_epochs}", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(top, text=f"Époques comparées: {n_epochs}", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Label(top, text=f"Accuracy: {accuracy*100:.1f}%").pack(side=tk.LEFT, padx=(0, 20))
         ttk.Label(top, text=f"Kappa: {kappa:.3f}").pack(side=tk.LEFT, padx=(0, 20))
         ttk.Label(top, text=f"Macro-F1: {macro_f1:.3f}").pack(side=tk.LEFT)
@@ -2158,7 +2123,7 @@ class EEGAnalysisStudio:
         # Left: confusion matrix table
         left = ttk.Frame(content)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(left, text="Matrice de confusion (lignes=manuel, colonnes=auto)", font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+        ttk.Label(left, text="Matrice de confusion (lignes=manuel, colonnes=auto)", font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 6))
         # Render cm as text
         cm_text = tk.Text(left, height=12, wrap=tk.NONE)
         cm_text.pack(fill=tk.BOTH, expand=True)
@@ -2168,7 +2133,7 @@ class EEGAnalysisStudio:
         # Right: F1 bar chart
         right = ttk.Frame(content)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(right, text="Scores par stade (Précision, Rappel, F1)", font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
+        ttk.Label(right, text="Scores par stade (Précision, Rappel, F1)", font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(0, 6))
 
         try:
             import matplotlib.pyplot as plt
@@ -2195,7 +2160,7 @@ class EEGAnalysisStudio:
         # Bottom: simple per-stage counts (manual vs auto)
         bottom = ttk.Frame(win)
         bottom.pack(fill=tk.X, padx=12, pady=8)
-        ttk.Label(bottom, text="Comptage par stade (Manuel vs Auto)", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        ttk.Label(bottom, text="Comptage par stade (Manuel vs Auto)", font=('Helvetica', 10, 'bold')).pack(anchor='w')
         counts_text = tk.Text(bottom, height=6, wrap=tk.NONE)
         counts_text.pack(fill=tk.X, expand=False)
         counts_text.insert('1.0', "Stade    Manuel    Auto\n")
@@ -2343,7 +2308,7 @@ class EEGAnalysisStudio:
                 
                 label = tk.Label(tooltip, text=text, justify='left', 
                                background='#ffffe0', relief='solid', borderwidth=1,
-                               font=('Segoe UI', 9), wraplength=300)
+                               font=('Helvetica', 9), wraplength=300)
                 label.pack()
                 
                 widget.tooltip = tooltip
@@ -2573,7 +2538,7 @@ class EEGAnalysisStudio:
         theme_combo['values'] = list(self.theme_manager.get_available_themes().values())
         theme_combo.pack(side=tk.RIGHT, padx=(6,0), pady=4)
         theme_combo.bind('<<ComboboxSelected>>', lambda e: self._change_theme_by_display_name(theme_var.get()))
-        toolbar_label = ttk.Label(toolbar, text=f"Canal: {candidate} | Welch 4s 50% | µV²/Hz", font=('Segoe UI', 9))
+        toolbar_label = ttk.Label(toolbar, text=f"Canal: {candidate} | Welch 4s 50% | µV²/Hz", font=('Helvetica', 9))
         toolbar_label.pack(side=tk.LEFT, padx=8)
         
         # Tooltip pour le titre de la barre d'outils
@@ -3061,7 +3026,7 @@ class EEGAnalysisStudio:
                 
                 label = tk.Label(tooltip, text=text, justify='left', 
                                background='#ffffe0', relief='solid', borderwidth=1,
-                               font=('Segoe UI', 9), wraplength=300)
+                               font=('Helvetica', 9), wraplength=300)
                 label.pack()
                 
                 widget.tooltip = tooltip
@@ -3197,7 +3162,7 @@ class EEGAnalysisStudio:
                 
                 label = tk.Label(tooltip, text=text, justify='left', 
                                background='#ffffe0', relief='solid', borderwidth=1,
-                               font=('Segoe UI', 9), wraplength=300)
+                               font=('Helvetica', 9), wraplength=300)
                 label.pack()
                 
                 widget.tooltip = tooltip
@@ -3242,7 +3207,7 @@ class EEGAnalysisStudio:
         theme_combo['values'] = list(self.theme_manager.get_available_themes().values())
         theme_combo.pack(side=tk.RIGHT, padx=(6,0), pady=4)
         theme_combo.bind('<<ComboboxSelected>>', lambda e: self._change_theme_by_display_name(theme_var.get()))
-        toolbar_label = ttk.Label(toolbar, text=f"Canal: {candidate} | FFT magnitude | DC retirée", font=('Segoe UI', 9))
+        toolbar_label = ttk.Label(toolbar, text=f"Canal: {candidate} | FFT magnitude | DC retirée", font=('Helvetica', 9))
         toolbar_label.pack(side=tk.LEFT, padx=8)
 
         main = ttk.Frame(top)
@@ -3942,7 +3907,7 @@ class EEGAnalysisStudio:
                 
                 label = tk.Label(tooltip, text=text, justify='left', 
                                background='#ffffe0', relief='solid', borderwidth=1,
-                               font=('Segoe UI', 9), wraplength=300)
+                               font=('Helvetica', 9), wraplength=300)
                 label.pack()
                 
                 widget.tooltip = tooltip
@@ -4158,7 +4123,7 @@ class EEGAnalysisStudio:
                     
                     label = tk.Label(tooltip, text=text, justify='left', 
                                    background='#ffffe0', relief='solid', borderwidth=1,
-                                   font=('Segoe UI', 9), wraplength=300)
+                                   font=('Helvetica', 9), wraplength=300)
                     label.pack()
                     
                     widget.tooltip = tooltip
@@ -4197,7 +4162,7 @@ class EEGAnalysisStudio:
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="📊 Analyse Temporelle des Données EEG", 
-                                  font=('Segoe UI', 16, 'bold'))
+                                  font=('Helvetica', 16, 'bold'))
             title_label.pack(pady=(0, 20))
             
             # Informations générales
@@ -4342,7 +4307,7 @@ Puissance totale: {stats['total_power']:.3f} µV²
                     
                     label = tk.Label(tooltip, text=text, justify='left', 
                                    background='#ffffe0', relief='solid', borderwidth=1,
-                                   font=('Segoe UI', 9), wraplength=300)
+                                   font=('Helvetica', 9), wraplength=300)
                     label.pack()
                     
                     widget.tooltip = tooltip
@@ -4387,7 +4352,7 @@ Puissance totale: {stats['total_power']:.3f} µV²
 
             # Titre
             title_label = ttk.Label(scrollable_frame, text="🧮 Analyse d'Entropie Renormée (Issartel)", 
-                                  font=('Segoe UI', 16, 'bold'))
+                                  font=('Helvetica', 16, 'bold'))
             title_label.pack(pady=(0, 20))
 
             # Informations générales
@@ -4938,7 +4903,7 @@ Licence : MIT
                     
                     label = tk.Label(tooltip, text=text, justify='left', 
                                    background='#ffffe0', relief='solid', borderwidth=1,
-                                   font=('Segoe UI', 9), wraplength=300)
+                                   font=('Helvetica', 9), wraplength=300)
                     label.pack()
                     
                     widget.tooltip = tooltip
@@ -4963,7 +4928,7 @@ Licence : MIT
             main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
             
             title_label = ttk.Label(main_frame, text="📍 Marqueurs Temporels", 
-                                  font=('Segoe UI', 16, 'bold'))
+                                  font=('Helvetica', 16, 'bold'))
             title_label.pack(pady=(0, 20))
             
             # Frame pour ajouter un marqueur
@@ -5122,7 +5087,7 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(main_frame, text="📏 Outils de Mesure EEG", 
-                                  font=('Segoe UI', 16, 'bold'))
+                                  font=('Helvetica', 16, 'bold'))
             title_label.pack(pady=(0, 20))
             
             # Frame pour les mesures de base
@@ -5407,360 +5372,256 @@ Licence : MIT
         """Affiche la configuration avancée."""
         self._show_filter_config()
     
-    def _show_filter_config(self):
-        """Affiche la configuration avancée du filtre."""
-        filter_window = tk.Toplevel(self.root)
-        filter_window.title("Configuration Avancée - Filtre et Autoscale (par canal)")
-        filter_window.geometry("800x700")
-        filter_window.resizable(True, True)
-        filter_window.transient(self.root)
-        filter_window.grab_set()
+    # def _show_filter_config(self):
+    #     """Affiche la configuration avancée du filtre."""
+    #     filter_window = tk.Toplevel(self.root)
+    #     filter_window.title("Configuration Avancée - Filtre et Autoscale (par canal)")
+    #     filter_window.geometry("800x700")
+    #     filter_window.resizable(True, True)
+    #     filter_window.transient(self.root)
+    #     filter_window.grab_set()
         
-        # Centrer la fenêtre
-        filter_window.update_idletasks()
-        x = (filter_window.winfo_screenwidth() // 2) - (800 // 2)
-        y = (filter_window.winfo_screenheight() // 2) - (700 // 2)
-        filter_window.geometry(f"800x700+{x}+{y}")
+    #     # Centrer la fenêtre
+    #     filter_window.update_idletasks()
+    #     x = (filter_window.winfo_screenwidth() // 2) - (800 // 2)
+    #     y = (filter_window.winfo_screenheight() // 2) - (700 // 2)
+    #     filter_window.geometry(f"800x700+{x}+{y}")
         
-        # Style moderne
-        style = ttk.Style()
-        style.theme_use('clam')
+    #     # Style moderne
+    #     style = ttk.Style()
+    #     style.theme_use('clam')
         
-        # Frame principal
-        main_frame = ttk.Frame(filter_window, padding="20")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    #     # Frame principal
+    #     main_frame = ttk.Frame(filter_window, padding="20")
+    #     main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Titre
-        title_label = ttk.Label(main_frame, text="🔧 Configuration Avancée - Filtre et Autoscale", 
-                               font=('Segoe UI', 14, 'bold'))
-        title_label.pack(pady=(0, 20))
+    #     # Titre
+    #     title_label = ttk.Label(main_frame, text="🔧 Configuration Avancée - Filtre et Autoscale", 
+    #                            font=('Helvetica', 14, 'bold'))
+    #     title_label.pack(pady=(0, 20))
         
-        # Configuration des fréquences
-        freq_frame = ttk.LabelFrame(main_frame, text="📊 Fréquences de Coupure", padding="10")
-        freq_frame.pack(fill=tk.X, pady=(0, 15))
+    #     # Configuration des fréquences
+    #     freq_frame = ttk.LabelFrame(main_frame, text="📊 Fréquences de Coupure", padding="10")
+    #     freq_frame.pack(fill=tk.X, pady=(0, 15))
         
-        # Fréquence basse
-        ttk.Label(freq_frame, text="Fréquence basse (Hz):").pack(anchor=tk.W)
-        low_frame = ttk.Frame(freq_frame)
-        low_frame.pack(fill=tk.X, pady=(5, 10))
+    #     # Fréquence basse
+    #     ttk.Label(freq_frame, text="Fréquence basse (Hz):").pack(anchor=tk.W)
+    #     low_frame = ttk.Frame(freq_frame)
+    #     low_frame.pack(fill=tk.X, pady=(5, 10))
         
-        self.filter_low_var = tk.DoubleVar(value=self.filter_low)
-        low_scale = ttk.Scale(low_frame, from_=0.1, to=10.0, variable=self.filter_low_var, 
-                             orient=tk.HORIZONTAL)
-        low_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    #     self.filter_low_var = tk.DoubleVar(value=self.filter_low)
+    #     low_scale = ttk.Scale(low_frame, from_=0.1, to=10.0, variable=self.filter_low_var, 
+    #                          orient=tk.HORIZONTAL)
+    #     low_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        low_entry = ttk.Entry(low_frame, textvariable=self.filter_low_var, width=8)
-        low_entry.pack(side=tk.RIGHT)
+    #     low_entry = ttk.Entry(low_frame, textvariable=self.filter_low_var, width=8)
+    #     low_entry.pack(side=tk.RIGHT)
         
-        # Fréquence haute
-        ttk.Label(freq_frame, text="Fréquence haute (Hz):").pack(anchor=tk.W)
-        high_frame = ttk.Frame(freq_frame)
-        high_frame.pack(fill=tk.X, pady=(5, 0))
+    #     # Fréquence haute
+    #     ttk.Label(freq_frame, text="Fréquence haute (Hz):").pack(anchor=tk.W)
+    #     high_frame = ttk.Frame(freq_frame)
+    #     high_frame.pack(fill=tk.X, pady=(5, 0))
         
-        self.filter_high_var = tk.DoubleVar(value=self.filter_high)
-        high_scale = ttk.Scale(high_frame, from_=10.0, to=100.0, variable=self.filter_high_var, 
-                              orient=tk.HORIZONTAL)
-        high_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    #     self.filter_high_var = tk.DoubleVar(value=self.filter_high)
+    #     high_scale = ttk.Scale(high_frame, from_=10.0, to=100.0, variable=self.filter_high_var, 
+    #                           orient=tk.HORIZONTAL)
+    #     high_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        high_entry = ttk.Entry(high_frame, textvariable=self.filter_high_var, width=8)
-        high_entry.pack(side=tk.RIGHT)
+    #     high_entry = ttk.Entry(high_frame, textvariable=self.filter_high_var, width=8)
+    #     high_entry.pack(side=tk.RIGHT)
         
-        # Configuration du type de filtre (global)
-        # Configuration par canal (présélections)
-        per_channel_frame = ttk.LabelFrame(main_frame, text="Paramètres par canal (présélections rapides)", padding="10")
-        per_channel_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+    #     # Configuration du type de filtre (global)
+    #     # Configuration par canal (présélections)
+    #     per_channel_frame = ttk.LabelFrame(main_frame, text="Paramètres par canal (présélections rapides)", padding="10")
+    #     per_channel_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
 
-        # Frame avec scrollbar pour le tableau
-        tree_frame = ttk.Frame(per_channel_frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
+    #     # Frame avec scrollbar pour le tableau
+    #     tree_frame = ttk.Frame(per_channel_frame)
+    #     tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ("Canal", "Bas (Hz)", "Haut (Hz)", "Actif", "Amplitude")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=120, anchor=tk.CENTER)
+    #     columns = ("Canal", "Bas (Hz)", "Haut (Hz)", "Actif", "Amplitude")
+    #     tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
+    #     for col in columns:
+    #         tree.heading(col, text=col)
+    #         tree.column(col, width=120, anchor=tk.CENTER)
         
-        # Scrollbar pour le tableau
-        tree_scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=tree_scrollbar.set)
+    #     # Scrollbar pour le tableau
+    #     tree_scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    #     tree.configure(yscrollcommand=tree_scrollbar.set)
         
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    #     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    #     tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Remplir avec presets pour F3-M2, F4-M1, C3-M2, C4-M1, O1-M2, O2-M1
-        def load_presets_into_tree():
-            tree.delete(*tree.get_children())
-            present_channels = set(self.derivations.keys()) if hasattr(self, 'derivations') else set()
-            for ch, (lo, hi) in self.default_derivation_presets.items():
-                enabled = True if ch in present_channels else False
-                # Amplitude par défaut (récupérer depuis channel_filter_params si existe)
-                amp = 100.0
-                if ch in self.channel_filter_params:
-                    amp = float(self.channel_filter_params[ch].get('amplitude', 100.0))
-                # Charger overrides s'ils existent
-                if ch in self.channel_filter_params:
-                    params = self.channel_filter_params[ch]
-                    lo = params.get('low', lo)
-                    hi = params.get('high', hi)
-                    enabled = bool(params.get('enabled', enabled))
-                tree.insert('', tk.END, values=(ch, f"{lo}", f"{hi}", "Oui" if enabled else "Non", f"{amp}"))
+    #     # Remplir avec presets pour F3-M2, F4-M1, C3-M2, C4-M1, O1-M2, O2-M1
+    #     def load_presets_into_tree():
+    #         tree.delete(*tree.get_children())
+    #         present_channels = set(self.derivations.keys()) if hasattr(self, 'derivations') else set()
+    #         for ch, (lo, hi) in self.default_derivation_presets.items():
+    #             enabled = True if ch in present_channels else False
+    #             # Amplitude par défaut (récupérer depuis channel_filter_params si existe)
+    #             amp = 100.0
+    #             if ch in self.channel_filter_params:
+    #                 amp = float(self.channel_filter_params[ch].get('amplitude', 100.0))
+    #             # Charger overrides s'ils existent
+    #             if ch in self.channel_filter_params:
+    #                 params = self.channel_filter_params[ch]
+    #                 lo = params.get('low', lo)
+    #                 hi = params.get('high', hi)
+    #                 enabled = bool(params.get('enabled', enabled))
+    #             tree.insert('', tk.END, values=(ch, f"{lo}", f"{hi}", "Oui" if enabled else "Non", f"{amp}"))
 
-        load_presets_into_tree()
+    #     load_presets_into_tree()
 
-        # Aide pour édition: double-clic pour modifier une cellule (simple implémentation)
-        def on_tree_double_click(event):
-            item_id = tree.identify_row(event.y)
-            col = tree.identify_column(event.x)
-            if not item_id or not col:
-                return
-            col_index = int(col.replace('#','')) - 1
-            if col_index == 0:
-                return  # canal non éditable
-            x, y, width, height = tree.bbox(item_id, col)
-            value = tree.set(item_id, columns[col_index])
-            entry = ttk.Entry(tree)
-            entry.insert(0, value)
-            entry.place(x=x, y=y, width=width, height=height)
+    #     # Aide pour édition: double-clic pour modifier une cellule (simple implémentation)
+    #     def on_tree_double_click(event):
+    #         item_id = tree.identify_row(event.y)
+    #         col = tree.identify_column(event.x)
+    #         if not item_id or not col:
+    #             return
+    #         col_index = int(col.replace('#','')) - 1
+    #         if col_index == 0:
+    #             return  # canal non éditable
+    #         x, y, width, height = tree.bbox(item_id, col)
+    #         value = tree.set(item_id, columns[col_index])
+    #         entry = ttk.Entry(tree)
+    #         entry.insert(0, value)
+    #         entry.place(x=x, y=y, width=width, height=height)
 
-            def save_edit(event=None):
-                new_val = entry.get()
-                entry.destroy()
-                # Validation bas/haut/amplitude/enabled
-                if col_index in (1,2,4):  # bas, haut, amplitude
-                    try:
-                        float(new_val)
-                    except:
-                        return
-                if col_index == 3:
-                    new_val = "Oui" if new_val.strip().lower() in ("oui","yes","true","1") else "Non"
-                tree.set(item_id, columns[col_index], new_val)
+    #         def save_edit(event=None):
+    #             new_val = entry.get()
+    #             entry.destroy()
+    #             # Validation bas/haut/amplitude/enabled
+    #             if col_index in (1,2,4):  # bas, haut, amplitude
+    #                 try:
+    #                     float(new_val)
+    #                 except:
+    #                     return
+    #             if col_index == 3:
+    #                 new_val = "Oui" if new_val.strip().lower() in ("oui","yes","true","1") else "Non"
+    #             tree.set(item_id, columns[col_index], new_val)
 
-            entry.bind('<Return>', save_edit)
-            entry.bind('<FocusOut>', save_edit)
-            entry.focus_set()
+    #         entry.bind('<Return>', save_edit)
+    #         entry.bind('<FocusOut>', save_edit)
+    #         entry.focus_set()
 
-        tree.bind('<Double-1>', on_tree_double_click)
-        type_frame = ttk.LabelFrame(main_frame, text="⚙️ Type de Filtre", padding="10")
-        type_frame.pack(fill=tk.X, pady=(0, 15))
+    #     tree.bind('<Double-1>', on_tree_double_click)
+    #     type_frame = ttk.LabelFrame(main_frame, text="⚙️ Type de Filtre", padding="10")
+    #     type_frame.pack(fill=tk.X, pady=(0, 15))
         
-        self.filter_type_var = tk.StringVar(value=self.filter_type)
-        ttk.Radiobutton(type_frame, text="Butterworth (recommandé)", variable=self.filter_type_var, 
-                       value="butterworth").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Chebyshev Type I", variable=self.filter_type_var, 
-                       value="cheby1").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Chebyshev Type II", variable=self.filter_type_var, 
-                       value="cheby2").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Elliptique", variable=self.filter_type_var, 
-                       value="ellip").pack(anchor=tk.W, pady=2)
+    #     self.filter_type_var = tk.StringVar(value=self.filter_type)
+    #     ttk.Radiobutton(type_frame, text="Butterworth (recommandé)", variable=self.filter_type_var, 
+    #                    value="butterworth").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(type_frame, text="Chebyshev Type I", variable=self.filter_type_var, 
+    #                    value="cheby1").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(type_frame, text="Chebyshev Type II", variable=self.filter_type_var, 
+    #                    value="cheby2").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(type_frame, text="Elliptique", variable=self.filter_type_var, 
+    #                    value="ellip").pack(anchor=tk.W, pady=2)
         
-        # Configuration de l'ordre
-        order_frame = ttk.LabelFrame(main_frame, text="📈 Ordre du Filtre", padding="10")
-        order_frame.pack(fill=tk.X, pady=(0, 15))
+    #     # Configuration de l'ordre
+    #     order_frame = ttk.LabelFrame(main_frame, text="📈 Ordre du Filtre", padding="10")
+    #     order_frame.pack(fill=tk.X, pady=(0, 15))
         
-        self.filter_order_var = tk.IntVar(value=self.filter_order)
-        order_scale = ttk.Scale(order_frame, from_=1, to=10, variable=self.filter_order_var, 
-                               orient=tk.HORIZONTAL)
-        order_scale.pack(fill=tk.X, pady=(5, 10))
+    #     self.filter_order_var = tk.IntVar(value=self.filter_order)
+    #     order_scale = ttk.Scale(order_frame, from_=1, to=10, variable=self.filter_order_var, 
+    #                            orient=tk.HORIZONTAL)
+    #     order_scale.pack(fill=tk.X, pady=(5, 10))
         
-        order_info = ttk.Label(order_frame, text="Ordre plus élevé = pente plus raide, mais plus de calculs")
-        order_info.pack(anchor=tk.W)
+    #     order_info = ttk.Label(order_frame, text="Ordre plus élevé = pente plus raide, mais plus de calculs")
+    #     order_info.pack(anchor=tk.W)
         
-        # Configuration de la fenêtre
-        window_frame = ttk.LabelFrame(main_frame, text="🪟 Fenêtre de Filtrage", padding="10")
-        window_frame.pack(fill=tk.X, pady=(0, 15))
+    #     # Configuration de la fenêtre
+    #     window_frame = ttk.LabelFrame(main_frame, text="🪟 Fenêtre de Filtrage", padding="10")
+    #     window_frame.pack(fill=tk.X, pady=(0, 15))
         
-        self.filter_window_var = tk.StringVar(value=self.filter_window)
-        ttk.Radiobutton(window_frame, text="Hamming (recommandé)", variable=self.filter_window_var, 
-                       value="hamming").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(window_frame, text="Hanning", variable=self.filter_window_var, 
-                       value="hanning").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(window_frame, text="Blackman", variable=self.filter_window_var, 
-                       value="blackman").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(window_frame, text="Kaiser", variable=self.filter_window_var, 
-                       value="kaiser").pack(anchor=tk.W, pady=2)
+    #     self.filter_window_var = tk.StringVar(value=self.filter_window)
+    #     ttk.Radiobutton(window_frame, text="Hamming (recommandé)", variable=self.filter_window_var, 
+    #                    value="hamming").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(window_frame, text="Hanning", variable=self.filter_window_var, 
+    #                    value="hanning").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(window_frame, text="Blackman", variable=self.filter_window_var, 
+    #                    value="blackman").pack(anchor=tk.W, pady=2)
+    #     ttk.Radiobutton(window_frame, text="Kaiser", variable=self.filter_window_var, 
+    #                    value="kaiser").pack(anchor=tk.W, pady=2)
         
-        # Configuration de l'autoscale
-        autoscale_frame = ttk.LabelFrame(main_frame, text="📏 Configuration Autoscale", padding="10")
-        autoscale_frame.pack(fill=tk.X, pady=(0, 20))
+    #     # Configuration de l'autoscale
+    #     autoscale_frame = ttk.LabelFrame(main_frame, text="📏 Configuration Autoscale", padding="10")
+    #     autoscale_frame.pack(fill=tk.X, pady=(0, 20))
         
-        ttk.Label(autoscale_frame, text="Durée de la fenêtre d'autoscale (secondes):").pack(anchor=tk.W)
-        autoscale_duration_frame = ttk.Frame(autoscale_frame)
-        autoscale_duration_frame.pack(fill=tk.X, pady=(5, 0))
+    #     ttk.Label(autoscale_frame, text="Durée de la fenêtre d'autoscale (secondes):").pack(anchor=tk.W)
+    #     autoscale_duration_frame = ttk.Frame(autoscale_frame)
+    #     autoscale_duration_frame.pack(fill=tk.X, pady=(5, 0))
         
-        self.autoscale_duration_var = tk.DoubleVar(value=self.autoscale_window_duration)
-        autoscale_scale = ttk.Scale(autoscale_duration_frame, from_=5, to=120, 
-                                   variable=self.autoscale_duration_var, orient=tk.HORIZONTAL)
-        autoscale_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    #     self.autoscale_duration_var = tk.DoubleVar(value=self.autoscale_window_duration)
+    #     autoscale_scale = ttk.Scale(autoscale_duration_frame, from_=5, to=120, 
+    #                                variable=self.autoscale_duration_var, orient=tk.HORIZONTAL)
+    #     autoscale_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         
-        autoscale_entry = ttk.Entry(autoscale_duration_frame, textvariable=self.autoscale_duration_var, width=8)
-        autoscale_entry.pack(side=tk.RIGHT)
+    #     autoscale_entry = ttk.Entry(autoscale_duration_frame, textvariable=self.autoscale_duration_var, width=8)
+    #     autoscale_entry.pack(side=tk.RIGHT)
         
-        autoscale_info = ttk.Label(autoscale_frame, text="Fenêtre plus courte = adaptation plus rapide, plus longue = plus stable")
-        autoscale_info.pack(anchor=tk.W, pady=(5, 0))
+    #     autoscale_info = ttk.Label(autoscale_frame, text="Fenêtre plus courte = adaptation plus rapide, plus longue = plus stable")
+    #     autoscale_info.pack(anchor=tk.W, pady=(5, 0))
         
-        # Boutons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
+    #     # Boutons
+    #     button_frame = ttk.Frame(main_frame)
+    #     button_frame.pack(fill=tk.X, pady=(10, 0))
         
-        def apply_filter_config():
-            """Applique la configuration du filtre et de l'autoscale."""
-            self.filter_low = self.filter_low_var.get()
-            self.filter_high = self.filter_high_var.get()
-            self.filter_type = self.filter_type_var.get()
-            self.filter_order = self.filter_order_var.get()
-            self.filter_window = self.filter_window_var.get()
+    #     def apply_filter_config():
+    #         """Applique la configuration du filtre et de l'autoscale."""
+    #         self.filter_low = self.filter_low_var.get()
+    #         self.filter_high = self.filter_high_var.get()
+    #         self.filter_type = self.filter_type_var.get()
+    #         self.filter_order = self.filter_order_var.get()
+    #         self.filter_window = self.filter_window_var.get()
             
-            # Sauvegarder paramètres par canal depuis le tableau
-            updated: Dict[str, Dict[str, float]] = {}
-            for item in tree.get_children():
-                ch, lo, hi, enabled, amp = tree.item(item, 'values')
-                try:
-                    lo_f = float(lo)
-                    hi_f = float(hi)
-                    amp_f = float(amp)
-                except:
-                    continue
-                updated[ch] = {
-                    'low': lo_f,
-                    'high': hi_f,
-                    'enabled': True if str(enabled).lower() in ("oui","yes","true","1") else False,
-                    'amplitude': amp_f
-                }
-            self.channel_filter_params.update(updated)
-            self.autoscale_window_duration = self.autoscale_duration_var.get()
+    #         # Sauvegarder paramètres par canal depuis le tableau
+    #         updated: Dict[str, Dict[str, float]] = {}
+    #         for item in tree.get_children():
+    #             ch, lo, hi, enabled, amp = tree.item(item, 'values')
+    #             try:
+    #                 lo_f = float(lo)
+    #                 hi_f = float(hi)
+    #                 amp_f = float(amp)
+    #             except:
+    #                 continue
+    #             updated[ch] = {
+    #                 'low': lo_f,
+    #                 'high': hi_f,
+    #                 'enabled': True if str(enabled).lower() in ("oui","yes","true","1") else False,
+    #                 'amplitude': amp_f
+    #             }
+    #         self.channel_filter_params.update(updated)
+    #         self.autoscale_window_duration = self.autoscale_duration_var.get()
             
-            # Mettre à jour l'affichage
-            if self.raw and self.selected_channels:
-                self.update_plot()
+    #         # Mettre à jour l'affichage
+    #         if self.raw and self.selected_channels:
+    #             self.update_plot()
             
-            messagebox.showinfo("Configuration", "Configuration appliquée avec succès!")
-            logging.info(f"Filtre configuré: {self.filter_type}, ordre {self.filter_order}, "
-                        f"freq {self.filter_low}-{self.filter_high} Hz, fenêtre {self.filter_window}")
-            logging.info(f"Autoscale configuré: fenêtre de {self.autoscale_window_duration}s")
+    #         messagebox.showinfo("Configuration", "Configuration appliquée avec succès!")
+    #         logging.info(f"Filtre configuré: {self.filter_type}, ordre {self.filter_order}, "
+    #                     f"freq {self.filter_low}-{self.filter_high} Hz, fenêtre {self.filter_window}")
+    #         logging.info(f"Autoscale configuré: fenêtre de {self.autoscale_window_duration}s")
         
-        def reset_filter_config():
-            """Remet la configuration par défaut."""
-            print("🔍 CHECKPOINT FILTER RESET: Réinitialisation configuration filtre")
-            logging.info("[FILTER] Resetting filter configuration to defaults")
-            self.filter_low_var.set(0.5)
-            self.filter_high_var.set(30.0)
-            self.filter_type_var.set("butterworth")
-            self.filter_order_var.set(4)
-            self.filter_window_var.set("hamming")
-            self.channel_filter_params.clear()
-            load_presets_into_tree()
-            self.autoscale_duration_var.set(30.0)
+    #     def reset_filter_config():
+    #         """Remet la configuration par défaut."""
+    #         print("🔍 CHECKPOINT FILTER RESET: Réinitialisation configuration filtre")
+    #         logging.info("[FILTER] Resetting filter configuration to defaults")
+    #         self.filter_low_var.set(0.5)
+    #         self.filter_high_var.set(30.0)
+    #         self.filter_type_var.set("butterworth")
+    #         self.filter_order_var.set(4)
+    #         self.filter_window_var.set("hamming")
+    #         self.channel_filter_params.clear()
+    #         load_presets_into_tree()
+    #         self.autoscale_duration_var.set(30.0)
         
-        ttk.Button(button_frame, text="Réinitialiser", command=reset_filter_config).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(button_frame, text="Appliquer", command=apply_filter_config).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(button_frame, text="Annuler", command=filter_window.destroy).pack(side=tk.RIGHT, padx=(10, 0))
+    #     ttk.Button(button_frame, text="Réinitialiser", command=reset_filter_config).pack(side=tk.LEFT, padx=(0, 10))
+    #     ttk.Button(button_frame, text="Appliquer", command=apply_filter_config).pack(side=tk.LEFT, padx=(0, 10))
+    #     ttk.Button(button_frame, text="Annuler", command=filter_window.destroy).pack(side=tk.RIGHT, padx=(10, 0))
         
-        # Focus sur la fenêtre
-        filter_window.focus_set()
-    
-    def _show_loading_bar(self, title="Chargement en cours...", message="Veuillez patienter"):
-        """Affiche une barre de chargement stylée."""
-        self.loading_window = tk.Toplevel(self.root)
-        self.loading_window.title(title)
-        self.loading_window.geometry("400x200")
-        self.loading_window.resizable(False, False)
-        self.loading_window.transient(self.root)
-        self.loading_window.grab_set()
-        
-        # Centrer la fenêtre
-        self.loading_window.update_idletasks()
-        x = (self.loading_window.winfo_screenwidth() // 2) - (400 // 2)
-        y = (self.loading_window.winfo_screenheight() // 2) - (200 // 2)
-        self.loading_window.geometry(f"400x200+{x}+{y}")
-        
-        # Style moderne
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # Frame principal
-        main_frame = ttk.Frame(self.loading_window, padding="30")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Icône de chargement (simulée avec du texte)
-        icon_label = ttk.Label(main_frame, text="EEG", font=('Segoe UI', 24))
-        icon_label.pack(pady=(0, 10))
-        
-        # Titre
-        title_label = ttk.Label(main_frame, text=title, font=('Segoe UI', 12, 'bold'))
-        title_label.pack(pady=(0, 5))
-        
-        # Message
-        message_label = ttk.Label(main_frame, text=message, font=('Segoe UI', 10))
-        message_label.pack(pady=(0, 20))
-        
-        # Barre de progression
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, 
-                                          maximum=100, length=300, mode='determinate')
-        self.progress_bar.pack(pady=(0, 10))
-        
-        # Label de progression
-        self.progress_label = ttk.Label(main_frame, text="0%", font=('Segoe UI', 9))
-        self.progress_label.pack()
-        
-        # Animation de chargement
-        self._animate_loading()
-        
-        # Mettre à jour la fenêtre
-        self.loading_window.update()
-    
-    def _animate_loading(self):
-        """Anime la barre de chargement."""
-        if hasattr(self, 'loading_window') and self.loading_window and self.loading_window.winfo_exists():
-            current_value = self.progress_var.get()
-            if current_value < 100:
-                # Progression non-linéaire pour un effet plus naturel
-                if current_value < 20:
-                    increment = 2
-                elif current_value < 50:
-                    increment = 1.5
-                elif current_value < 80:
-                    increment = 1
-                else:
-                    increment = 0.5
-                
-                new_value = min(current_value + increment, 100)
-                self.progress_var.set(new_value)
-                self.progress_label.config(text=f"{int(new_value)}%")
-                
-                # Continuer l'animation
-                self.root.after(50, self._animate_loading)
-            else:
-                # Animation terminée
-                self.progress_label.config(text="Terminé!")
-    
-    def _hide_loading_bar(self):
-        """Cache la barre de chargement."""
-        try:
-            if hasattr(self, 'loading_window') and self.loading_window.winfo_exists():
-                try:
-                    self.loading_window.grab_release()
-                except Exception:
-                    pass
-                self.loading_window.destroy()
-                self.loading_window = None
-                try:
-                    self.root.update_idletasks()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    
-    def _update_loading_message(self, message):
-        """Met à jour le message de chargement."""
-        if hasattr(self, 'loading_window') and self.loading_window.winfo_exists():
-            # Trouver et mettre à jour le label de message
-            for widget in self.loading_window.winfo_children():
-                if isinstance(widget, ttk.Frame):
-                    for child in widget.winfo_children():
-                        if isinstance(child, ttk.Label) and child.cget('text') != "EEG" and not child.cget('text').endswith('%'):
-                            child.config(text=message)
-                            break
+    #     # Focus sur la fenêtre
+    #     filter_window.focus_set()
     
     def _show_user_guide(self):
         """Affiche le guide d'utilisation (fenêtre de bienvenue)."""
@@ -6206,158 +6067,7 @@ Licence : MIT
         
         messagebox.showinfo("Scoring de sommeil", info_text)
 
-    def _open_scoring_import_hub(self):
-        """Sous-fenêtre centralisée pour importer un scoring (Excel/CSV ou EDF Hypnogram)."""
-        if not self.raw:
-            messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
-            return
-        hub = tk.Toplevel(self.root)
-        hub.title("Importer Scoring (Excel/EDF)")
-        hub.geometry("420x200")
-        hub.transient(self.root)
-        hub.grab_set()
-        frame = ttk.Frame(hub, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="Choisissez la source de scoring à importer:", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
-        ttk.Button(frame, text="Importer Excel/CSV", command=lambda: (hub.destroy(), self._import_manual_scoring_excel())).pack(fill=tk.X, pady=(12,6))
-        ttk.Button(frame, text="Charger Hypnogram EDF (Sleep-EDFx)", command=lambda: (hub.destroy(), self._load_hypnogram_edfplus())).pack(fill=tk.X)
-    
-    def _open_manual_scoring_editor(self):
-        """Éditeur simple pour scorer manuellement les époques visibles ou par saisie.
-        Inspiré par l'ergonomie de wrappers comme SleepChecker [voir REFERENCES].
-        """
-        if not self.raw:
-            messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
-            return
-        win = tk.Toplevel(self.root)
-        win.title("Éditeur de Scoring Manuel")
-        win.geometry("1100x900")
-        win.transient(self.root)
-        win.grab_set()
-
-        # Haut: outils
-        top = ttk.Frame(win)
-        top.pack(fill=tk.X)
-        ttk.Label(top, text=f"Durée époque (s):").pack(side=tk.LEFT)
-        epoch_var = tk.DoubleVar(value=float(getattr(self, 'scoring_epoch_duration', 30.0)))
-        ttk.Entry(top, textvariable=epoch_var, width=6).pack(side=tk.LEFT, padx=(4,10))
-        ttk.Button(top, text="+ Époques sur fenêtre", command=lambda: add_epochs_on_window()).pack(side=tk.LEFT)
-        ttk.Button(top, text="Exporter CSV", command=lambda: export_csv()).pack(side=tk.RIGHT)
-        ttk.Button(top, text="Annoter Raw", command=lambda: annotate_raw()).pack(side=tk.RIGHT, padx=(0,6))
-
-        # Table
-        cols = ("time", "stage")
-        tree = ttk.Treeview(win, columns=cols, show="headings")
-        for c in cols:
-            tree.heading(c, text=c)
-            tree.column(c, width=120, anchor=tk.CENTER)
-        tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-        # Pré-remplir depuis manuel ou auto si dispo
-        df_init = None
-        if getattr(self, 'manual_scoring_data', None) is not None and len(self.manual_scoring_data) > 0:
-            df_init = self.manual_scoring_data
-        elif getattr(self, 'sleep_scoring_data', None) is not None and len(self.sleep_scoring_data) > 0:
-            df_init = self.sleep_scoring_data
-        if df_init is not None:
-            try:
-                for _, row in df_init.iterrows():
-                    tree.insert('', tk.END, values=(float(row['time']), str(row['stage'])))
-            except Exception:
-                pass
-
-        # Bas: formulaire d'édition
-        form = ttk.Frame(win)
-        form.pack(fill=tk.X, padx=8, pady=(0,8))
-        ttk.Label(form, text="time (s)").grid(row=0, column=0, sticky='w')
-        time_var = tk.DoubleVar(value=float(getattr(self, 'current_time', 0.0)))
-        ttk.Entry(form, textvariable=time_var, width=10).grid(row=0, column=1, sticky='w', padx=(4,10))
-        ttk.Label(form, text="stage").grid(row=0, column=2, sticky='w')
-        stage_var = tk.StringVar(value='W')
-        ttk.Combobox(form, textvariable=stage_var, values=['W','N1','N2','N3','R','U'], width=6).grid(row=0, column=3, sticky='w', padx=(4,10))
-        ttk.Button(form, text="Ajouter/Mettre à jour", command=lambda: add_or_update()).grid(row=0, column=4, padx=(6,0))
-        ttk.Button(form, text="Supprimer sélection", command=lambda: delete_selected()).grid(row=0, column=5, padx=(6,0))
-
-        def table_to_dataframe():
-            import pandas as pd
-            rows = []
-            for iid in tree.get_children():
-                t, s = tree.item(iid, 'values')
-                rows.append({'time': float(t), 'stage': str(s)})
-            if rows:
-                df = pd.DataFrame(rows).sort_values('time').reset_index(drop=True)
-            else:
-                df = pd.DataFrame(columns=['time','stage'])
-            return df
-
-        def add_or_update():
-            t = float(time_var.get())
-            s = str(stage_var.get()).upper()
-            # Chercher si une ligne a le même time
-            found = None
-            for iid in tree.get_children():
-                vals = tree.item(iid, 'values')
-                if abs(float(vals[0]) - t) < 1e-6:
-                    found = iid; break
-            if found is not None:
-                tree.item(found, values=(t, s))
-            else:
-                tree.insert('', tk.END, values=(t, s))
-
-        def delete_selected():
-            sel = tree.selection()
-            for iid in sel:
-                tree.delete(iid)
-
-        def add_epochs_on_window():
-            try:
-                start = float(getattr(self, 'current_time', 0.0))
-                dur = float(getattr(self, 'duration', 10.0))
-                ep = float(epoch_var.get())
-                if ep <= 0:
-                    raise ValueError("Durée d'époque invalide")
-                n = int(np.ceil(dur / ep))
-                for k in range(n):
-                    t = start + k*ep
-                    tree.insert('', tk.END, values=(t, 'U'))
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Ajout d'époques: {e}")
-
-        def annotate_raw():
-            try:
-                df = table_to_dataframe()
-                if df is None or len(df) == 0:
-                    messagebox.showwarning("Scoring", "Aucune époque à annoter")
-                    return
-                epoch_len = float(epoch_var.get())
-                onsets = df['time'].to_numpy(float)
-                durations = np.full_like(onsets, fill_value=epoch_len, dtype=float)
-                descriptions = df['stage'].astype(str).to_list()
-                ann = mne.Annotations(onset=onsets, duration=durations, description=descriptions)
-                if hasattr(self.raw, 'annotations') and self.raw.annotations is not None:
-                    self.raw.set_annotations(self.raw.annotations + ann)
-                else:
-                    self.raw.set_annotations(ann)
-                # Stocker en manuel
-                self.manual_scoring_data = df.copy()
-                self.scoring_epoch_duration = epoch_len
-                messagebox.showinfo("Scoring", "Annotations ajoutées au Raw et scoring manuel mis à jour")
-                self.update_plot()
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Annotation Raw: {e}")
-
-        def export_csv():
-            try:
-                df = table_to_dataframe()
-                file_path = filedialog.asksaveasfilename(title="Exporter scoring (CSV)", defaultextension=".csv",
-                                                         filetypes=[("CSV", "*.csv")])
-                if not file_path:
-                    return
-                df.to_csv(file_path, index=False)
-                messagebox.showinfo("Export", f"CSV exporté: {file_path}")
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Export CSV: {e}")
-
+ 
     def _get_active_scoring_df(self) -> Optional[pd.DataFrame]:
         """Retourne le scoring actif: manuel non vide si dispo, sinon auto non vide, sinon None."""
         try:
@@ -6377,152 +6087,6 @@ Licence : MIT
             return None
         return None
 
-    def _analyze_sleep_periods(self):
-        """Analyse des périodes de sommeil (type SleepEEGpy)."""
-        # Utiliser le scoring manuel s'il est non vide, sinon auto
-        df = self._get_active_scoring_df()
-        if df is None or len(df) == 0:
-            messagebox.showwarning("Avertissement", "Aucun scoring de sommeil chargé.")
-            return
-
-        try:
-            epoch_len = float(getattr(self, 'scoring_epoch_duration', 30.0))
-            stages = df['stage'].astype(str).str.upper().values
-            times = df['time'].values
-
-            # Basic metrics (SleepEEGpy-like)
-            t_start = float(times.min())
-            t_end = float(times.max() + epoch_len)
-            tib = (t_end - t_start) / 60.0  # Time in bed (min)
-
-            # Sleep onset latency (first epoch in sleep N1/N2/N3/R)
-            sleep_mask = np.isin(stages, ['N1', 'N2', 'N3', 'R'])
-            if sleep_mask.any():
-                first_sleep_idx = int(np.where(sleep_mask)[0][0])
-                sol = (float(times[first_sleep_idx]) - t_start) / 60.0
-            else:
-                sol = float('nan')
-
-            # Time asleep and WASO
-            tst_sec = int(np.sum(np.isin(stages, ['N1','N2','N3','R'])) * epoch_len)
-            waso_sec = int(np.sum(stages == 'W') * epoch_len)
-            se = (tst_sec / (tib * 60.0)) * 100.0 if tib > 0 else float('nan')
-
-            # REM latency from sleep onset
-            if sleep_mask.any() and np.any(stages == 'R'):
-                rem_idxs = np.where(stages == 'R')[0]
-                rem_lat = (float(times[rem_idxs[0]]) - float(times[first_sleep_idx])) / 60.0
-            else:
-                rem_lat = float('nan')
-
-            # Stage durations (min)
-            stage_durations_min = {
-                s: (int(np.sum(stages == s)) * epoch_len) / 60.0 for s in ['W', 'N1', 'N2', 'N3', 'R']
-            }
-
-            # Awakenings: count transitions into W with at least 1 epoch
-            awakenings = 0
-            for i in range(1, len(stages)):
-                if stages[i] == 'W' and stages[i-1] != 'W':
-                    awakenings += 1
-
-            # Build contiguous periods (start-end in minutes, label)
-            periods = []
-            if len(stages) > 0:
-                start_idx = 0
-                for i in range(1, len(stages)):
-                    if stages[i] != stages[i-1]:
-                        periods.append((float(times[start_idx]) / 60.0, float(times[i]) / 60.0, stages[i-1]))
-                        start_idx = i
-                # last
-                periods.append((float(times[start_idx]) / 60.0, float((times[-1] + epoch_len)) / 60.0, stages[-1]))
-
-            # UI: window with summary + table of periods
-            top = tk.Toplevel(self.root)
-            top.title("Analyse des périodes de sommeil (type SleepEEGpy)")
-            top.geometry("1100x900")
-            top.transient(self.root)
-            top.grab_set()
-
-            container = ttk.Frame(top, padding=10)
-            container.pack(fill=tk.BOTH, expand=True)
-
-            summary = (
-                f"TIB: {tib:.1f} min | SOL: {sol:.1f} min | TST: {tst_sec/60.0:.1f} min\n"
-                f"WASO: {waso_sec/60.0:.1f} min | SE: {se:.1f}% | REM lat.: {rem_lat:.1f} min\n"
-                f"W: {stage_durations_min['W']:.1f} | N1: {stage_durations_min['N1']:.1f} | N2: {stage_durations_min['N2']:.1f} | "
-                f"N3: {stage_durations_min['N3']:.1f} | R: {stage_durations_min['R']:.1f} | Réveils: {awakenings}"
-            )
-            ttk.Label(container, text=summary, font=('Segoe UI', 10)).pack(anchor='w', pady=(0,10))
-
-            # Boutons d'export
-            btns = ttk.Frame(container)
-            btns.pack(fill=tk.X, pady=(0,10))
-            ttk.Button(btns, text="Exporter CSV", command=lambda: _export_periods_and_metrics_csv(periods, tib, sol, tst_sec, waso_sec, se, rem_lat, stage_durations_min, awakenings)).pack(side=tk.RIGHT)
-            ttk.Button(btns, text="Enregistrer Figure", command=lambda: _save_periods_figure(tree)).pack(side=tk.RIGHT, padx=(10,0))
-
-            cols = ("Début (min)", "Fin (min)", "Stade")
-            tree = ttk.Treeview(container, columns=cols, show="headings")
-            for c in cols:
-                tree.heading(c, text=c)
-                tree.column(c, width=120, anchor=tk.CENTER)
-            tree.pack(fill=tk.BOTH, expand=True)
-
-            for (a, b, s) in periods:
-                tree.insert("", tk.END, values=(f"{a:.1f}", f"{b:.1f}", s))
-
-            def _export_periods_and_metrics_csv(periods_list, tib_min, sol_min, tst_seconds, waso_seconds, se_pct, rem_latency_min, stage_dur_min_dict, n_awaken):
-                try:
-                    file_path = filedialog.asksaveasfilename(title="Exporter CSV", defaultextension=".csv",
-                                                             filetypes=[("CSV", "*.csv")])
-                    if not file_path:
-                        return
-                    import csv
-                    with open(file_path, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        # Metrics
-                        writer.writerow(["metric", "value"]) 
-                        writer.writerow(["TIB_min", f"{tib_min:.2f}"])
-                        writer.writerow(["SOL_min", f"{sol_min:.2f}"])
-                        writer.writerow(["TST_min", f"{tst_seconds/60.0:.2f}"])
-                        writer.writerow(["WASO_min", f"{waso_seconds/60.0:.2f}"])
-                        writer.writerow(["SE_percent", f"{se_pct:.2f}"])
-                        writer.writerow(["REM_latency_min", f"{rem_latency_min:.2f}"])
-                        for sname, minutes in stage_dur_min_dict.items():
-                            writer.writerow([f"Duration_{sname}_min", f"{minutes:.2f}"])
-                        writer.writerow(["Awakenings", n_awaken])
-                        writer.writerow([])
-                        # Periods table
-                        writer.writerow(["start_min", "end_min", "stage"]) 
-                        for (a, b, s) in periods_list:
-                            writer.writerow([f"{a:.2f}", f"{b:.2f}", s])
-                except Exception as e:
-                    messagebox.showerror("Erreur", f"Echec de l'export CSV: {e}")
-
-            def _save_periods_figure(treeview):
-                try:
-                    # Simple export: capture de la fenêtre via matplotlib n'est pas direct; on exporte la liste en figure.
-                    import matplotlib.pyplot as _plt
-                    _fig, _ax = _plt.subplots(figsize=(6, len(periods)/6 + 1))
-                    y = 0
-                    for (a, b, s) in periods:
-                        _ax.plot([a, b], [y, y], lw=6)
-                        _ax.text(b + 0.2, y, s)
-                        y += 1
-                    _ax.set_xlabel("Temps (min)")
-                    _ax.set_title("Périodes de sommeil")
-                    _ax.set_yticks([])
-                    _plt.tight_layout()
-                    file_path = filedialog.asksaveasfilename(title="Enregistrer la figure", defaultextension=".png",
-                                                             filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
-                    if file_path:
-                        _fig.savefig(file_path, dpi=200, bbox_inches='tight')
-                    _plt.close(_fig)
-                except Exception as e:
-                    messagebox.showerror("Erreur", f"Echec de l'enregistrement de la figure: {e}")
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Echec analyse périodes: {e}")
-    
     def _show_advanced_analysis(self):
         """Affiche la fenêtre d'analyse avancée."""
         try:
@@ -6552,13 +6116,13 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="📊 Analyse Avancée des Données EEG", 
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
             
             # Description
             desc_label = ttk.Label(scrollable_frame, 
                                  text="Outils d'analyse avancée pour l'exploration approfondie des données EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
             
             # Analyses disponibles
@@ -6631,13 +6195,13 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="🔬 Analyse des Micro-états EEG", 
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
             
             # Description
             desc_label = ttk.Label(scrollable_frame, 
                                  text="Identification et analyse des micro-états cérébraux dans les signaux EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
             
             # Paramètres d'analyse
@@ -6728,13 +6292,13 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="🧠 Analyse de Connectivité Cérébrale", 
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
             
             # Description
             desc_label = ttk.Label(scrollable_frame, 
                                  text="Analyse des connexions fonctionnelles entre différentes régions cérébrales",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
             
             # Types de connectivité
@@ -6839,13 +6403,13 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="⚡ Détection Automatique d'Artefacts", 
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
             
             # Description
             desc_label = ttk.Label(scrollable_frame, 
                                  text="Identification automatique des artefacts dans les signaux EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
             
             # Types d'artefacts
@@ -6954,13 +6518,13 @@ Licence : MIT
             
             # Titre
             title_label = ttk.Label(scrollable_frame, text="🎯 Analyse de Sources EEG", 
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
             
             # Description
             desc_label = ttk.Label(scrollable_frame, 
                                  text="Localisation des sources d'activité cérébrale à partir des signaux EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
             
             # Méthodes de localisation
@@ -7087,13 +6651,13 @@ Licence : MIT
 
             # 🔍 CHECKPOINT COHERENCE 2: Création des éléments d'interface utilisateur
             # Titre de la fenêtre d'analyse
-            title_label = ttk.Label(scrollable_frame, text="📈 Analyse de Cohérence Inter-canal", font=('Segoe UI', 14, 'bold'))
+            title_label = ttk.Label(scrollable_frame, text="📈 Analyse de Cohérence Inter-canal", font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # Description fonctionnelle de l'analyse
             desc_label = ttk.Label(scrollable_frame,
                                  text="Analyse de la cohérence fonctionnelle entre différents canaux EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
 
             # 🔍 CHECKPOINT COHERENCE 3: Configuration des paramètres d'analyse
@@ -7320,7 +6884,7 @@ Licence : MIT
 
             # Titre de la fenêtre de résultats
             title_label = ttk.Label(results_window, text=f"📊 Cohérence {self.coherence_band.get()} - {self.coherence_method.get()}",
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # 🔍 CHECKPOINT COHERENCE 20: Configuration de la figure matplotlib
@@ -7516,13 +7080,13 @@ Licence : MIT
             canvas.configure(yscrollcommand=scrollbar.set)
 
             # Titre
-            title_label = ttk.Label(scrollable_frame, text="🔗 Analyse de Corrélation Temporelle", font=('Segoe UI', 14, 'bold'))
+            title_label = ttk.Label(scrollable_frame, text="🔗 Analyse de Corrélation Temporelle", font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # Description
             desc_label = ttk.Label(scrollable_frame,
                                  text="Analyse de la corrélation temporelle entre différents canaux EEG",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
 
             # Paramètres
@@ -7644,7 +7208,7 @@ Licence : MIT
 
             # Titre
             title_label = ttk.Label(results_window, text=f"📊 Corrélation {self.correlation_method.get()}",
-                                  font=('Segoe UI', 14, 'bold'))
+                                  font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # Créer la figure matplotlib
@@ -7752,13 +7316,13 @@ Licence : MIT
             top.grab_set()
 
             # Titre
-            title_label = ttk.Label(top, text="📊 Analyse de Variance (ANOVA)", font=('Segoe UI', 14, 'bold'))
+            title_label = ttk.Label(top, text="📊 Analyse de Variance (ANOVA)", font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # Description
             desc_label = ttk.Label(top,
                                  text="Analyse de variance entre canaux et conditions expérimentales",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
 
             # Paramètres
@@ -7907,13 +7471,13 @@ Licence : MIT
             top.grab_set()
 
             # Titre
-            title_label = ttk.Label(top, text="📉 Test de Stationnarité (ADF)", font=('Segoe UI', 14, 'bold'))
+            title_label = ttk.Label(top, text="📉 Test de Stationnarité (ADF)", font=('Helvetica', 14, 'bold'))
             title_label.pack(pady=10)
 
             # Description
             desc_label = ttk.Label(top,
                                  text="Test de Dickey-Fuller Augmenté pour vérifier la stationnarité des signaux",
-                                 font=('Segoe UI', 10))
+                                 font=('Helvetica', 10))
             desc_label.pack(pady=(0, 20))
 
             # Paramètres
@@ -8503,24 +8067,6 @@ Licence : MIT
             messagebox.showerror("Erreur", error_msg)
             logging.error(f"Erreur export scoring: {e}")
 
-    def _save_active_scoring(self):
-        """Sauvegarde le scoring actif (manuel prioritaire) en CSV."""
-        df = self._get_active_scoring_df()
-        if df is None or len(df) == 0:
-            messagebox.showwarning("Scoring", "Aucun scoring à sauvegarder")
-            return
-        file_path = filedialog.asksaveasfilename(
-            title="Sauvegarder scoring (CSV)", defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")]
-        )
-        if not file_path:
-            return
-        try:
-            df[['time', 'stage']].to_csv(file_path, index=False, encoding='utf-8')
-            self.scoring_dirty = False
-            messagebox.showinfo("Scoring", f"Scoring sauvegardé: {file_path}")
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Echec sauvegarde scoring: {e}")
 
     def _open_goto_time_dialog(self):
         """Ouvre un dialogue pour aller à un temps t (en secondes ou HH:MM:SS)."""
@@ -8770,12 +8316,6 @@ Date: 2025-09-09
         
         # Configuration du graphique matplotlib moderne
         self._setup_modern_plot(plot_frame)
-        
-        # =====================================================================
-        # BARRE D'OUTILS MODERNE
-        # =====================================================================
-        
-        self._create_modern_toolbar(plot_frame)
         
         # =====================================================================
         # BARRE DE TEMPS EN BAS DE FENÊTRE (VRAIMENT EN BAS)
@@ -9370,7 +8910,7 @@ Date: 2025-09-09
         
         # Titre de la barre de temps
         time_title = ttk.Label(bottom_time_frame, text="⏱️ Navigation Temporelle", 
-                              style='Modern.TLabel', font=('Segoe UI', 10, 'bold'))
+                              style='Modern.TLabel', font=('Helvetica', 10, 'bold'))
         time_title.pack(anchor=tk.W, pady=(0, 3))  # Réduit l'espacement
         
         # Frame pour le slider et les contrôles - OCCUPE TOUTE LA LARGEUR
@@ -9393,7 +8933,7 @@ Date: 2025-09-09
             time_controls_frame,
             text="00h00",
             style='Modern.TLabel',
-            font=('Segoe UI', 10, 'bold'),
+            font=('Helvetica', 10, 'bold'),
             width=20
         )
         self.bottom_time_label.pack(side=tk.RIGHT)
@@ -9516,7 +9056,7 @@ Date: 2025-09-09
             status_frame, 
             text="v3.0", 
             style='Version.TLabel',
-            font=('Segoe UI', 8, 'bold')
+            font=('Helvetica', 8, 'bold')
         )
         self.version_label.pack(side=tk.LEFT, padx=(0, 8))  # Réduit l'espacement
         
@@ -9631,34 +9171,7 @@ Date: 2025-09-09
         except Exception:
             pass
     
-    def _update_status_bar(self):
-        """Met à jour la barre de statut avec les informations actuelles."""
-        try:
-            if hasattr(self, 'status_label') and hasattr(self, 'file_info_label'):
-                if self.raw is not None:
-                    # Fichier chargé
-                    filename = os.path.basename(self.current_file_path) if hasattr(self, 'current_file_path') else "Fichier EEG"
-                    self.status_label.config(text="Prêt")
-                    self.file_info_label.config(text=f"📁 {filename}")
-                    
-                    # Ajouter les informations de scoring si disponible
-                    if hasattr(self, 'manual_scoring_data') and self.manual_scoring_data is not None:
-                        scoring_info = f" | 📊 Scoring: {os.path.basename(self.current_scoring_path)}" if hasattr(self, 'current_scoring_path') else " | 📊 Scoring manuel"
-                        current_text = self.file_info_label.cget("text")
-                        if "Scoring:" not in current_text:
-                            self.file_info_label.config(text=current_text + scoring_info)
-                    
-                    if hasattr(self, 'sleep_scoring_data') and self.sleep_scoring_data is not None:
-                        auto_info = " | 🤖 Auto-scoring YASA"
-                        current_text = self.file_info_label.cget("text")
-                        if "Auto-scoring" not in current_text:
-                            self.file_info_label.config(text=current_text + auto_info)
-                else:
-                    # Aucun fichier chargé
-                    self.status_label.config(text="Prêt - Aucun fichier chargé")
-                    self.file_info_label.config(text="")
-        except Exception as e:
-            print(f"⚠️ Erreur mise à jour barre de statut: {e}")
+    
 
     def _show_batch_fft_automation(self):
         """Interface d'automatisation pour l'export FFT en lot de plusieurs fichiers et canaux."""
@@ -9679,8 +9192,8 @@ Date: 2025-09-09
         
         # Style
         style = ttk.Style()
-        style.configure('Heading.TLabel', font=('Segoe UI', 12, 'bold'))
-        style.configure('Info.TLabel', font=('Segoe UI', 9), foreground='#6c757d')
+        style.configure('Heading.TLabel', font=('Helvetica', 12, 'bold'))
+        style.configure('Info.TLabel', font=('Helvetica', 9), foreground='#6c757d')
         
         # Titre principal
         title_frame = ttk.Frame(batch_window)
@@ -9932,14 +9445,14 @@ Date: 2025-09-09
         status_frame.pack(fill=tk.X, padx=10, pady=10)
         
         self.batch_status_var = tk.StringVar(value="Prêt à démarrer")
-        ttk.Label(status_frame, textvariable=self.batch_status_var, font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        ttk.Label(status_frame, textvariable=self.batch_status_var, font=('Helvetica', 10, 'bold')).pack(anchor='w')
         
         # Barre de progression
         self.batch_progress = ttk.Progressbar(status_frame, mode='determinate')
         self.batch_progress.pack(fill=tk.X, pady=(10,0))
         
         self.batch_progress_text = tk.StringVar(value="")
-        ttk.Label(status_frame, textvariable=self.batch_progress_text, font=('Segoe UI', 9)).pack(anchor='w', pady=(5,0))
+        ttk.Label(status_frame, textvariable=self.batch_progress_text, font=('Helvetica', 9)).pack(anchor='w', pady=(5,0))
         
         # Section contrôles
         controls_section = ttk.LabelFrame(parent, text="🎮 Contrôles")
@@ -11248,7 +10761,7 @@ Date: 2025-09-09
             parent, 
             text="🎛️ Contrôles EEG", 
             style='Modern.TLabel',
-            font=('Segoe UI', 12, 'bold')
+            font=('Helvetica', 12, 'bold')
         )
         title_label.pack(pady=(0, 5))  # Réduit encore plus : 5px
         
@@ -11291,7 +10804,7 @@ Date: 2025-09-09
             time_control_frame, 
             text="00h00", 
             style='Modern.TLabel',
-            font=('Segoe UI', 10, 'bold')
+            font=('Helvetica', 10, 'bold')
         )
         self.time_label.pack()
         
@@ -11450,30 +10963,6 @@ Date: 2025-09-09
             )
             btn.pack(fill=tk.X, pady=1)  # Réduit l'espacement
     
-    def _create_modern_toolbar(self, parent: ttk.Frame) -> None:
-        """Crée la barre d'outils moderne."""
-        self.toolbar_frame = ttk.Frame(parent, style='Modern.TFrame')
-        self.toolbar_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        # Barre d'outils matplotlib
-        try:
-            self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
-            self.toolbar.update()
-        except Exception:
-            self.toolbar = None
-        
-        # Boutons personnalisés
-        custom_frame = ttk.Frame(self.toolbar_frame)
-        custom_frame.pack(side=tk.RIGHT, padx=(10, 0))
-        
-        # Bouton d'actualisation
-        refresh_btn = ttk.Button(
-            custom_frame, 
-            text="🔄 Actualiser", 
-            command=self._refresh_plot,
-            style='Modern.TButton'
-        )
-        refresh_btn.pack(side=tk.RIGHT, padx=2)
 
     def _recreate_toolbar(self) -> None:
         """Recrée la barre d'outils pour la rattacher au canvas courant."""
@@ -12145,453 +11634,6 @@ Date: 2025-09-09
         self.root.bind('<Control-o>', lambda e: self.load_edf_file())
         self.root.bind('<Control-a>', lambda e: self.toggle_autoscale())
         self.root.bind('<Control-f>', lambda e: self.toggle_filter())
-    
-    def load_edf_file(self, filename):
-        """Charge un fichier EDF avec barre de chargement stylée"""
-        dialog = OpenDatasetDialog(self.root)
-        selection = dialog.show()
-        if selection is None:
-            return
-
-        file_path = selection.edf_path
-        selected_mode = (selection.mode or "raw").lower()
-        precompute_action = (selection.precompute_action or "existing")
-        ms_path_input = selection.ms_path
-
-        logging.info(f"[OPEN] Mode choisi={selected_mode}")
-        logging.info(f"[OPEN] EDF path={file_path}")
-        if selected_mode == "precomputed":
-            logging.info(f"[OPEN] Zarr (input)={ms_path_input}")
-            logging.info(f"[OPEN] Action={precompute_action}")
-
-        try:
-            print(f"🧭 Mode choisi: {selected_mode}")
-            print(f"📁 EDF: {file_path}")
-            if selected_mode == "precomputed":
-                print(f"🗂️  Zarr (entrée): {ms_path_input}")
-                print(f"🛠️  Action: {precompute_action}")
-        except Exception:
-            pass
-
-        # Afficher la barre de chargement
-        self._show_loading_bar(
-            title="Chargement du fichier EEG",
-            message="Ouverture du fichier EDF..."
-        )
-        
-        try:
-            print(f"📁 Chargement du fichier: {os.path.basename(file_path)}")
-            self._update_loading_message("Lecture du fichier EDF...")
-            self.root.update()
-            
-            # Chargement du fichier
-            self.raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
-            self.sfreq = self.raw.info['sfreq']
-            logging.info(f"[OPEN] EDF chargé: n_channels={len(self.raw.ch_names)}, fs={self.sfreq}")
-            
-            # Extraire le temps absolu de début d'enregistrement
-            self._extract_absolute_time()
-            
-            # Extraire les bad spans depuis les annotations EDF+ (si présents)
-            try:
-                self.bad_spans = self._extract_bad_spans_from_annotations()
-                if self.bad_spans and len(self.bad_spans) > 0:
-                    print(f"✅ BAD SPANS: {len(self.bad_spans)} segments d'artefacts détectés dans les annotations EDF")
-                else:
-                    print("ℹ️ BAD SPANS: Aucun segment d'artefact détecté dans les annotations EDF")
-            except Exception as _e_bs:
-                print(f"⚠️ BAD SPANS: échec extraction annotations: {_e_bs}")
-            
-            print(f"✅ Fichier chargé - {len(self.raw.ch_names)} canaux, {self.sfreq} Hz")
-            
-            self._update_loading_message("Création des dérivations...")
-            self.root.update()
-            
-            # Création des dérivations
-            self.create_derivations()
-            
-            self._update_loading_message("Sélection des canaux...")
-            self.root.update()
-            
-            # Configuration des canaux par défaut selon l'ordre demandé
-            # Mapper les noms demandés vers les vrais canaux disponibles dans le fichier EDF
-            channel_mapping = {
-                # EEG différentiels (mapper vers les vrais noms disponibles)
-                'F3M2': ['F3-M2'],  # Essaie F3-M2 si F3M2 n'existe pas
-                'F4M1': ['F4-M1'],  # Essaie F4-M1 si F4M1 n'existe pas
-                'C3M2': ['C3-M2'],  # C3-M2 existe
-                'C4M2': ['C4-M1'],  # Essaie C4-M1 si C4M2 n'existe pas
-                'O1M2': ['O1-M2'],  # Essaie O1-M2 si O1M2 n'existe pas
-                'O2M2': ['O2-M1'],  # Essaie O2-M1 si O2M2 n'existe pas
-                # EOG
-                'E1M2': ['E1-M2'],  # E1-M2 existe
-                'E2M1': ['E2-M1'],  # E2-M1 existe
-                # EMG
-                'Left Leg': ['Left Leg'],  # Left Leg existe
-                'Right Leg': ['Right Leg'],  # Right Leg existe
-                # ECG
-                'Heart Rate': ['Heart Rate', 'Fréquence cardi']  # Essaie Heart Rate puis Fréquence cardi
-            }
-
-            # Construire la liste des canaux sélectionnés dans l'ordre demandé
-            selected_channels_ordered = []
-
-            for desired_ch in [
-                'F3M2', 'F4M1', 'C3M2', 'C4M2', 'O1M2', 'O2M2',
-                'E1M2', 'E2M1',
-                'Left Leg', 'Right Leg',
-                'Heart Rate'
-            ]:
-                # Essaie les alternatives pour chaque canal demandé
-                for alt_ch in channel_mapping.get(desired_ch, [desired_ch]):
-                    if alt_ch in self.derivations:
-                        if alt_ch not in selected_channels_ordered:  # Évite les doublons
-                            selected_channels_ordered.append(alt_ch)
-                        break
-
-            self.selected_channels = selected_channels_ordered
-            
-            if not self.selected_channels:
-                # Fallback vers canaux EEG ou tous les canaux
-                eeg_channels = [ch for ch in self.raw.ch_names if ch.startswith('EEG ')]
-                if eeg_channels:
-                    self.selected_channels = eeg_channels[:8]
-                    print(f"✅ Canaux EEG sélectionnés (fallback): {self.selected_channels}")
-                else:
-                    self.selected_channels = self.raw.ch_names[:8]
-                    print(f"✅ Canaux sélectionnés (fallback): {self.selected_channels}")
-            else:
-                print(f"✅ Canaux sélectionnés selon l'ordre demandé (EEG → EOG → EMG → ECG): {self.selected_channels}")
-
-                # Afficher la répartition par type pour information
-                eeg_channels = []
-                eog_channels = []
-                emg_channels = []
-                ecg_channels = []
-
-                for ch in self.selected_channels:
-                    signal_type = cesa_detect_signal_type(ch)
-                    if signal_type == 'eeg':
-                        eeg_channels.append(ch)
-                    elif signal_type == 'eog':
-                        eog_channels.append(ch)
-                    elif signal_type == 'emg':
-                        emg_channels.append(ch)
-                    elif signal_type == 'ecg':
-                        ecg_channels.append(ch)
-
-                print(f"   📊 Répartition - EEG: {eeg_channels}, EOG: {eog_channels}, EMG: {emg_channels}, ECG: {ecg_channels}")
-                print(f"   📈 Total sélectionné: {len(self.selected_channels)} canaux (max 8)")
-            
-            self._update_loading_message("Mise à jour de l'affichage...")
-            self.root.update()
-
-            ms_path_obj = Path(ms_path_input) if ms_path_input else None
-            self.data_bridge = None
-            self.data_mode = "raw"
-
-            # === GESTION DU MODE PRÉ-CALCULÉ ===
-            if selected_mode == "precomputed":
-                self._update_loading_message("Mode pré-calculé sélectionné...")
-                self.root.update()
-                
-                # Helpers de normalisation/validation
-                def _default_ms(p: Path) -> Path:
-                    try:
-                        return Path(p).with_suffix("") / "_ms"
-                    except Exception:
-                        return Path(str(p) + "_ms")
-
-                def _normalize_ms_path(edf: str, candidate: Path | None) -> Path:
-                    base_default = _default_ms(Path(edf))
-                    if candidate is None:
-                        return base_default
-                    c = Path(candidate)
-                    # If a file or an EDF path is provided, map to default _ms
-                    if c.is_file() or c.suffix.lower() == ".edf":
-                        return base_default
-                    # If a directory is provided but is not a valid Zarr, prefer a '_ms' child
-                    if c.exists() and (c / ".zattrs").exists() and (c / "levels").exists():
-                        return c
-                    # If user pointed to a parent like <edf_base>, use <edf_base>/_ms
-                    if c.name != "_ms":
-                        return c / "_ms"
-                    return c
-
-                def _is_valid_zarr(path: Path) -> bool:
-                    try:
-                        if not (path.exists() and (path / ".zattrs").exists() and (path / "levels").exists()):
-                            return False
-                        # Vérifier explicitement la présence du niveau 1
-                        if not (path / "levels" / "lvl1").exists():
-                            return False
-                        return True
-                    except Exception:
-                        return False
-
-                ms_path_obj = _normalize_ms_path(file_path, ms_path_obj)
-                try:
-                    print(f"📌 Zarr (normalisé): {ms_path_obj}")
-                except Exception:
-                    pass
-                logging.info(f"[OPEN] Zarr (normalized)={ms_path_obj}")
-
-                precompute_action = precompute_action if precompute_action in {"build", "existing"} else "existing"
-
-                if precompute_action == "existing":
-                    # Si invalide, basculer automatiquement en build
-                    if not _is_valid_zarr(ms_path_obj):
-                        try:
-                            print("⚠️  Zarr inexistant ou invalide → passage en mode création")
-                        except Exception:
-                            pass
-                        messagebox.showwarning(
-                            "Navigation rapide",
-                            "Le dossier de navigation rapide indiqué est introuvable ou incomplet.\n"
-                            "Il sera créé automatiquement.",
-                            parent=self.root,
-                        )
-                        precompute_action = "build"
-
-                build_succeeded = True
-                if precompute_action == "build":
-                    self._update_loading_message("⚡ Création du fichier de navigation rapide...")
-                    self.root.update()
-
-                    try:
-                        from core.multiscale import build_pyramid
-                        from ui.channel_selector import ChannelSelector
-
-                        ms_path_obj.parent.mkdir(parents=True, exist_ok=True)
-
-                        preselected = self.selected_channels if hasattr(self, 'selected_channels') else []
-
-                        channel_selector = ChannelSelector(
-                            parent=self.root,
-                            available_channels=list(self.raw.ch_names),
-                            preselected_channels=preselected
-                        )
-
-                        selected_channels_for_pyramid = channel_selector.get_selection()
-
-                        if selected_channels_for_pyramid is None:
-                            print("❌ Sélection de canaux annulée par l'utilisateur")
-                            selected_mode = "raw"
-                            ms_path_obj = None
-                            build_succeeded = False
-                        else:
-                            available_channels = list(self.raw.ch_names)
-
-                            def _dedupe_keep_order(values):
-                                seen = set()
-                                result = []
-                                for name in values:
-                                    if name in seen:
-                                        continue
-                                    if name not in available_channels:
-                                        continue
-                                    seen.add(name)
-                                    result.append(name)
-                                return result
-
-                            required_channels: list[str] = []
-                            try:
-                                required_channels = [ch for ch in getattr(self, "psg_channels_used", []) if ch in available_channels]
-                            except Exception:
-                                required_channels = []
-
-                            if not required_channels:
-                                required_channels = [ch for ch in self.selected_channels if ch in available_channels]
-
-                            if not required_channels:
-                                fallback_priority = [
-                                    "F3-M2",
-                                    "F4-M1",
-                                    "C3-M2",
-                                    "C4-M1",
-                                    "O1-M2",
-                                    "O2-M1",
-                                    "E1-M2",
-                                    "E2-M1",
-                                    "Left Leg",
-                                    "Right Leg",
-                                    "Heart Rate",
-                                ]
-                                required_channels = [ch for ch in fallback_priority if ch in available_channels]
-
-                            combined = _dedupe_keep_order(list(selected_channels_for_pyramid) + required_channels)
-                            auto_added = [ch for ch in combined if ch not in selected_channels_for_pyramid]
-                            if auto_added:
-                                print(f"   🔄 Canaux requis ajoutés automatiquement: {auto_added}", flush=True)
-                            selected_channels_for_pyramid = combined
-
-                            if not selected_channels_for_pyramid:
-                                print(f"🔧 Création du fichier de navigation rapide: {ms_path_obj}", flush=True)
-                                print("   ⚠️  Aucun canal sélectionné, annulation", flush=True)
-                                selected_mode = "raw"
-                                ms_path_obj = None
-                                build_succeeded = False
-                            else:
-                                print(f"🔧 Création du fichier de navigation rapide: {ms_path_obj}", flush=True)
-                                print(f"   📊 Canaux sélectionnés pour la pyramide: {selected_channels_for_pyramid}", flush=True)
-                                print(f"   ⚡ Utilisation de {len(selected_channels_for_pyramid)} canaux sur {len(self.raw.ch_names)} disponibles", flush=True)
-                                estimated_time = len(selected_channels_for_pyramid) * 15 / 90
-                                print(f"   ⏱️  Temps estimé: ~{estimated_time:.1f} minutes", flush=True)
-
-                                try:
-                                    build_pyramid(
-                                        raw_source=self.raw,
-                                        out_ms_path=ms_path_obj,
-                                        chunk_seconds=20,
-                                        resume=True,
-                                        selected_channels=selected_channels_for_pyramid
-                                    )
-                                    print(f"✅ Fichier créé: {ms_path_obj}")
-                                    logging.info(f"[OPEN] Zarr build success: {ms_path_obj}")
-                                    messagebox.showinfo(
-                                        "✅ Succès",
-                                        "Le fichier de navigation rapide a été créé avec succès !\n\n"
-                                        f"Canaux inclus: {len(selected_channels_for_pyramid)}\n"
-                                        "Vous pouvez maintenant naviguer instantanément dans vos données.",
-                                        parent=self.root,
-                                    )
-                                    try:
-                                        logging.info("[OPEN] Popup succès affiché (création Zarr)")
-                                    except Exception:
-                                        pass
-                                except Exception as e:
-                                    import traceback
-                                    print(f"❌ Erreur lors de la création: {e}")
-                                    print("Traceback complet:")
-                                    traceback.print_exc()
-                                    logging.error(f"[OPEN] Zarr build error: {e}")
-                                    messagebox.showerror(
-                                        "Erreur",
-                                        "Impossible de créer le fichier de navigation rapide:\n"
-                                        f"{str(e)}\n\nLe mode standard sera utilisé.",
-                                        parent=self.root,
-                                    )
-                                    selected_mode = "raw"
-                                    ms_path_obj = None
-                                    build_succeeded = False
-                    except Exception as e:
-                        import traceback
-                        print(f"❌ Erreur générale lors de la préparation: {e}")
-                        traceback.print_exc()
-                        messagebox.showerror(
-                            "Erreur",
-                            "Une erreur est survenue lors de la préparation du fichier de navigation rapide.\n"
-                            f"{str(e)}\n\nLe mode standard sera utilisé.",
-                            parent=self.root,
-                        )
-                        selected_mode = "raw"
-                        ms_path_obj = None
-                        build_succeeded = False
-
-                if selected_mode == "precomputed" and ms_path_obj is not None and (precompute_action != "build" or build_succeeded):
-                    try:
-                        self._update_loading_message("⚡ Activation de la navigation rapide...")
-                        self.root.update()
-                        
-                        from core.providers import PrecomputedProvider
-                        from concurrent.futures import ThreadPoolExecutor
-                        
-                        provider = PrecomputedProvider(ms_path_obj)
-                        executor = ThreadPoolExecutor(max_workers=2)
-                        self.data_bridge = DataBridge(provider, executor=executor)
-                        self.data_mode = "precomputed"
-                        
-                        print(f"✅ Navigation rapide activée avec {ms_path_obj}")
-                        logging.info(f"[OPEN] Navigation rapide activée: {ms_path_obj}")
-                    
-                    except Exception as e:
-                        print(f"❌ Erreur lors de l'activation: {e}")
-                        # Diagnostic supplémentaire pour "group not found":
-                        try:
-                            exists = ms_path_obj.exists()
-                            has_zattrs = (ms_path_obj / ".zattrs").exists()
-                            has_levels = (ms_path_obj / "levels").exists()
-                            has_lvl1 = (ms_path_obj / "levels" / "lvl1").exists()
-                            print(f"   🔎 Zarr path exists={exists}, .zattrs={has_zattrs}, levels_dir={has_levels}, lvl1={has_lvl1}")
-                        except Exception:
-                            pass
-                        logging.error(f"[OPEN] Activation rapide échouée: {e}")
-                        messagebox.showwarning(
-                            "Avertissement",
-                            "Impossible d'activer la navigation rapide:\n"
-                            f"{str(e)}\n\nLe mode standard sera utilisé.",
-                            parent=self.root,
-                        )
-                        self.data_bridge = None
-                        self.data_mode = "raw"
-                        selected_mode = "raw"
-                        ms_path_obj = None
-                        # Force redraw in raw mode to avoid blank screen
-                        try:
-                            self.update_time_scale()
-                            self.update_plot()
-                        except Exception:
-                            pass
-            else:
-                # Mode standard
-                self.data_bridge = None
-                self.data_mode = "raw"
-                ms_path_obj = None
-
-            # Mise à jour de l'interface
-            self.update_time_scale()
-            self.update_plot()
-            
-            # Stocker le chemin du fichier pour l'affichage
-            self.current_file_path = file_path
-            
-            # Mettre à jour la barre de statut
-            self._update_status_bar()
-            
-            self._update_loading_message("Chargement terminé!")
-            self.root.update()
-            
-            # Attendre un peu pour que l'utilisateur voie "Terminé!"
-            self.root.after(500, self._hide_loading_bar)
-            
-            mode_msg = "⚡ Navigation Rapide" if self.data_mode == "precomputed" else "📂 Mode Standard"
-            messagebox.showinfo(
-                "✅ Succès",
-                f"Fichier chargé: {os.path.basename(file_path)}\n\nMode: {mode_msg}",
-                parent=self.root,
-            )
-            logging.info(f"[OPEN] Popup succès affiché: {os.path.basename(file_path)} | mode={mode_msg}")
-            
-            # À la fin, si le chargement a réussi :
-            if hasattr(self, 'raw') and self.raw is not None and EVENTS_AVAILABLE:
-                try:
-                    filename = getattr(self, 'current_file_path', 'Unknown')
-                    event_data = EventData.DataLoaded(
-                        filename=filename,
-                        channels=self.raw.ch_names,
-                        sfreq=self.sfreq
-                    )
-                    event_bus.emit(Events.DATA_LOADED, event_data)
-                    logging.info(f"EVENT: Data loaded - {filename}")
-                except Exception as e:
-                    logging.error(f"EVENT: Error emitting data_loaded - {e}")
-
-
-        except Exception as e:
-            # Cacher la barre de chargement en cas d'erreur
-            self._hide_loading_bar()
-            
-            print(f"❌ Erreur lors du chargement: {e}")
-            messagebox.showerror("Erreur", f"Erreur lors du chargement: {str(e)}", parent=self.root)
-
-        # Émettre l'événement une fois le fichier chargé
-        if self.raw:
-            event_data = EventData.DataLoaded(
-                filename=filename,
-                channels=self.raw.ch_names,
-                sfreq=self.sfreq
-            )
-            event_bus.emit(Events.DATA_LOADED, event_data)
 
     
     def _extract_absolute_time(self):
@@ -12677,68 +11719,6 @@ Date: 2025-09-09
         minutes = (total_seconds % 3600) // 60
         return f"{hours:02d}h{minutes:02d}"
     
-    def _to_microvolts_and_sanitize(self, data: np.ndarray) -> np.ndarray:
-        """Convertit un signal en µV et remplace NaN/Inf par 0 pour l'affichage.
-        Hypothèse MNE: les données sont en Volts en entrée.
-        """
-        try:
-            x = np.asarray(data, dtype=float) * 1e6  # V -> µV
-            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            return x
-        except Exception as e:
-            print(f"⚠️ CHECKPOINT UNIT: Echec conversion µV: {e}")
-            return data
-    
-    def create_derivations(self):
-        """Crée les dérivations EEG et prépare tous les canaux"""
-        if not self.raw:
-            return
-        
-        print(f"🔧 Création des dérivations...")
-        
-        # Ajouter tous les canaux originaux du fichier
-        for channel in self.raw.ch_names:
-            try:
-                raw_arr = self.raw.get_data(channel)
-                data = self._to_microvolts_and_sanitize(raw_arr.flatten())
-                self.derivations[channel] = data
-                
-                # Diagnostic de l'amplitude
-                amplitude = np.max(data) - np.min(data)
-                if amplitude < 1e-3:
-                    print(f"   ⚠️  {channel}: amplitude très faible ({amplitude:.6f} µV)")
-                else:
-                    print(f"   ✅ {channel}: amplitude normale ({amplitude:.6f} µV)")
-                if not np.any(np.diff(data)):
-                    print(f"   ⚠️  {channel}: signal constant (ligne plate) après chargement")
-                    
-            except Exception as e:
-                print(f"   ❌ Erreur pour {channel}: {e}")
-        
-        print(f"✅ {len(self.derivations)} canaux chargés")
-        
-        # Appliquer les filtres par défaut selon le type de signal
-        self._apply_default_filters()
-    
-    def _apply_default_filters(self):
-        """Applique les filtres par défaut selon le type de signal."""
-        print("🔧 Application des filtres par défaut...")
-        
-        for channel in self.derivations:
-            if channel in self.default_derivation_presets:
-                low, high = self.default_derivation_presets[channel]
-                self.channel_filter_params[channel] = {
-                    'low': low,
-                    'high': high,
-                    'enabled': True,
-                    'amplitude': 100.0  # Amplitude par défaut
-                }
-                print(f"   ✅ {channel}: {low}-{high} Hz")
-        
-        # Activer le filtre global si des filtres par canal sont définis
-        if self.channel_filter_params:
-            self.filter_var.set(True)
-            print("🔧 Filtre global activé automatiquement")
     
     def update_time_scale(self):
         """Met à jour l'échelle de temps"""
@@ -13320,7 +12300,7 @@ Date: 2025-09-09
         # Titre
         title_label = ttk.Label(scrollable_frame, 
                                text=f"📊 Indicateurs de Sommeil ({scoring_type})",
-                               font=('Segoe UI', 14, 'bold'))
+                               font=('Helvetica', 14, 'bold'))
         title_label.pack(pady=(0, 15))
         
         # Option pour compter les périodes U
@@ -14030,7 +13010,7 @@ Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             self._hide_loading_bar()
             
             # Mettre à jour la barre de statut
-            self._update_status_bar()
+            self.update_status_bar()
             
             # Message de succès avec information sur la durée d'époque
             success_msg = f"Scoring manuel importé avec succès!\n{len(manual_data)} époques\nPlage: {manual_data['time'].min():.1f}s - {manual_data['time'].max():.1f}s\nDurée d'époque détectée: {self.scoring_epoch_duration:.1f}s"
@@ -14070,7 +13050,7 @@ Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         
         # Titre
         title_label = ttk.Label(main_frame, text="⚙️ Ajuster la Durée d'Époque", 
-                               font=('Segoe UI', 12, 'bold'))
+                               font=('Helvetica', 12, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Information actuelle
@@ -14134,15 +13114,6 @@ Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         ttk.Button(action_frame, text="Annuler", command=dialog.destroy).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(action_frame, text="Appliquer", command=apply_duration).pack(side=tk.RIGHT)
     
-    def _get_active_scoring_df(self):
-        """Retourne le DataFrame de scoring actuellement actif."""
-        # Priorité: scoring manuel, puis scoring automatique
-        if hasattr(self, 'manual_scoring_data') and self.manual_scoring_data is not None:
-            return self.manual_scoring_data
-        elif hasattr(self, 'sleep_scoring_data') and self.sleep_scoring_data is not None:
-            return self.sleep_scoring_data
-        else:
-            return None
     
     def _center_view_on_epoch(self, epoch_start_time, epoch_duration):
         """Centre la vue sur une époque spécifique."""
@@ -14224,6 +13195,52 @@ Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             messagebox.showerror("Erreur", error_msg)
             logging.error(f"Erreur export scoring: {e}")
     
+    def open_edf_file_dialog(self):
+        # Crée une fenêtre Toplevel pour choisir un fichier EDF
+        window = tk.Toplevel(self.parent)
+        window.title("Ouvrir un fichier EEG")
+        window.geometry("400x150")
+        window.transient(self.parent)
+        window.grab_set()
+
+        label = ttk.Label(window, text="Sélectionnez un fichier EDF à ouvrir :", font=("Helvetica", 10))
+        label.pack(padx=10, pady=10)
+
+        entry_var = tk.StringVar()
+        entry = ttk.Entry(window, textvariable=entry_var, width=50)
+        entry.pack(padx=10, pady=5)
+
+        def browse_files():
+            file_path = filedialog.askopenfilename(
+                parent=window,
+                title="Choisir un fichier EDF",
+                filetypes=[("Fichiers EDF", "*.edf *.EDF")]
+            )
+            if file_path:
+                entry_var.set(file_path)
+
+        browse_button = ttk.Button(window, text="Parcourir...", command=browse_files)
+        browse_button.pack(pady=5)
+
+        def load_file():
+            file_path = entry_var.get()
+            if not file_path:
+                messagebox.showerror("Erreur", "Veuillez sélectionner un fichier EDF.")
+                return
+            window.grab_release()
+            window.destroy()
+            self.load_edf_file(file_path)
+
+        open_button = ttk.Button(window, text="Ouvrir", command=load_file)
+        open_button.pack(pady=10)
+
+        window.wait_window()
+
+
+    def _on_file_loaded(self, raw, sfreq):
+        # Méthode à redéfinir dans l'app principale pour récupérer le fichier chargé
+        logging.info("Fichier chargé avec succès, méthode _on_file_loaded à implémenter.")
+
     def _show_about(self):
         """Affiche la boîte de dialogue À propos"""
         about_text = """

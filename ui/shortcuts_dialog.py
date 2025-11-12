@@ -30,7 +30,7 @@ class ShortcutsDialog:
             
             # Titre
             title_label = ttk.Label(main_frame, text="⌨️ Raccourcis Clavier", 
-                                  font=('Segoe UI', 18, 'bold'))
+                                  font=('Helvetica', 18, 'bold'))
             title_label.pack(pady=(0, 20))
             
             # Canvas et scrollbar pour le contenu
@@ -141,7 +141,7 @@ class ShortcutsDialog:
                     
                     # Description
                     desc_label = ttk.Label(shortcut_frame, text=description, 
-                                         font=('Segoe UI', 9))
+                                         font=('Helvetica', 9))
                     desc_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
             
             # Ajouter une section d'informations supplémentaires
@@ -155,7 +155,7 @@ class ShortcutsDialog:
 • Les raccourcis sont également disponibles dans les menus contextuels"""
             
             info_label = ttk.Label(info_frame, text=info_text.strip(), 
-                                 font=('Segoe UI', 8), justify=tk.LEFT)
+                                 font=('Helvetica', 8), justify=tk.LEFT)
             info_label.pack(anchor='w')
             
             # Boutons de contrôle

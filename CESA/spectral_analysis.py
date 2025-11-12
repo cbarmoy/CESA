@@ -31,11 +31,11 @@ Version: 3.0.0 - Compatible CESA v3.0
 Date: 2025-09-26
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 import numpy as np
 from scipy.signal import welch
 import pandas as pd
-from typing import Optional, List
+
 
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
     "Delta": (0.5, 4.0),
@@ -45,6 +45,7 @@ EEG_BANDS: Dict[str, Tuple[float, float]] = {
     "Gamma": (30.0, 45.0),
 }
 
+
 def _canonical_stage(stage: str) -> Optional[str]:
     """Map various stage labels to canonical codes: W, N1, N2, N3, R.
     Returns None for unknown/unhandled labels.
@@ -53,18 +54,15 @@ def _canonical_stage(stage: str) -> Optional[str]:
         return None
     s = str(stage).strip().upper()
     mapping = {
-        # Wake
         'W': 'W', 'WAKE': 'W', 'AWAKE': 'W', 'EVEIL': 'W', 'ÉVEIL': 'W', 'EVEIL ': 'W', 'EVEILL': 'W',
-        # REM
         'R': 'R', 'REM': 'R', 'PARADOXAL': 'R', 'SOMMEIL PARADOXAL': 'R',
-        # N1
         'N1': 'N1', 'S1': 'N1', 'NREM1': 'N1', 'STAGE1': 'N1', 'STAGE 1': 'N1',
-        # N2
         'N2': 'N2', 'S2': 'N2', 'NREM2': 'N2', 'STAGE2': 'N2', 'STAGE 2': 'N2',
-        # N3 (merge deep sleep labels)
-        'N3': 'N3', 'S3': 'N3', 'S4': 'N3', 'NREM3': 'N3', 'NREM4': 'N3', 'STAGE3': 'N3', 'STAGE 3': 'N3', 'STAGE4': 'N3', 'STAGE 4': 'N3',
+        'N3': 'N3', 'S3': 'N3', 'S4': 'N3', 'NREM3': 'N3', 'NREM4': 'N3', 'STAGE3': 'N3', 'STAGE 3': 'N3',
+        'STAGE4': 'N3', 'STAGE 4': 'N3',
     }
     return mapping.get(s, None)
+
 
 def detrend_mean(signal: np.ndarray) -> np.ndarray:
     """Remove DC offset (mean) from signal."""
@@ -72,9 +70,9 @@ def detrend_mean(signal: np.ndarray) -> np.ndarray:
         return signal
     return signal - np.mean(signal)
 
+
 def compute_psd_fft(signal: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute single-sided FFT magnitude spectrum of a 1D signal.
+    """Compute single-sided FFT magnitude spectrum of a 1D signal.
 
     Args:
         signal: 1D array of samples (µV).
@@ -98,9 +96,9 @@ def compute_psd_fft(signal: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarr
     spectrum = np.abs(np.fft.rfft(x))
     return freqs, spectrum
 
+
 def compute_band_powers(freqs: np.ndarray, spectrum: np.ndarray, bands: Dict[str, Tuple[float, float]] = None) -> Dict[str, float]:
-    """
-    Sum magnitudes within band limits.
+    """Sum magnitudes within band limits.
 
     Args:
         freqs: Frequency axis (Hz)
@@ -121,6 +119,7 @@ def compute_band_powers(freqs: np.ndarray, spectrum: np.ndarray, bands: Dict[str
         band_power[name] = float(np.sum(spectrum[mask]))
     return band_power
 
+
 def compute_peak_and_centroid(freqs: np.ndarray, spectrum: np.ndarray) -> Tuple[float, float]:
     """Compute dominant frequency and spectral centroid."""
     if freqs.size == 0 or spectrum.size == 0:
@@ -129,6 +128,7 @@ def compute_peak_and_centroid(freqs: np.ndarray, spectrum: np.ndarray) -> Tuple[
     denom = float(np.sum(spectrum))
     centroid = float(np.sum(freqs * spectrum) / denom) if denom > 0 else float("nan")
     return peak_freq, centroid
+
 
 def compute_psd_welch(signal: np.ndarray, fs: float, nperseg: int = 1024, noverlap: int = 512, window: str = 'hann') -> Tuple[np.ndarray, np.ndarray]:
     """Compute PSD using Welch (µV^2/Hz)."""
@@ -212,7 +212,6 @@ def compute_stage_psd_welch_for_array(
             if len(seg) >= int(max(8, round(nperseg_sec * fs))):
                 segs[st].append(seg)
 
-    # Equalize number of epochs per stage
     if equalize_epochs:
         counts = [len(v) for v in segs.values() if len(v) > 0]
         if counts:
@@ -302,12 +301,11 @@ def compute_stage_psd_fft_for_array(
                 continue
             t0 = float(row.get('time', 0.0))
             i0 = int(max(0, min(n-1, round(t0 * fs))))
-            i1 = int(max(i0+1, min(n, round((t0 + eplen) * fs))))
+            i1 = int(max(i0 + 1, min(n, round((t0 + eplen) * fs))))
             seg = signal[i0:i1]
             if len(seg) >= int(max(8, round(1.0 * fs))):  # >= 1s
                 segs[st].append(seg)
 
-    # Égaliser le nombre d'époques par stade si demandé
     if equalize_epochs:
         counts = [len(v) for v in segs.values() if len(v) > 0]
         if counts:

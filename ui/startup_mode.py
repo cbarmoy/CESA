@@ -70,13 +70,13 @@ class ModeSelector:
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
 
-        title = ttk.Label(container, text="Mode de chargement des données", font=("Segoe UI", 14, "bold"))
+        title = ttk.Label(container, text="Mode de chargement des données", font=("Helvetica", 14, "bold"))
         title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         subtitle = ttk.Label(
             container, 
             text="Choisissez comment vous souhaitez charger votre fichier EEG :",
-            font=("Segoe UI", 9)
+            font=("Helvetica", 9)
         )
         subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 16))
 
@@ -98,7 +98,7 @@ class ModeSelector:
             fast_frame,
             text="• Déplacement et zoom ultra-rapides\n• Idéal pour les longues sessions d'analyse\n• Nécessite une préparation initiale (quelques minutes)",
             foreground="#059669",
-            font=("Segoe UI", 8)
+            font=("Helvetica", 8)
         )
         fast_desc.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
@@ -118,14 +118,14 @@ class ModeSelector:
             standard_frame,
             text="• Chargement direct sans préparation\n• Adapté aux fichiers courts ou analyse ponctuelle",
             foreground="#6b7280",
-            font=("Segoe UI", 8)
+            font=("Helvetica", 8)
         )
         raw_desc.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         ttk.Separator(container, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", pady=12)
 
         # Section fichier pré-calculé
-        path_label = ttk.Label(container, text="Fichier de navigation rapide existant (optionnel) :", font=("Segoe UI", 9, "bold"))
+        path_label = ttk.Label(container, text="Fichier de navigation rapide existant (optionnel) :", font=("Helvetica", 9, "bold"))
         path_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 4))
         
         path_var = tk.StringVar(value="")
@@ -136,7 +136,7 @@ class ModeSelector:
                  "CESA vous proposera de créer le fichier automatiquement.\n\n"
                  "Vous avez déjà un fichier ? Sélectionnez-le avec 'Parcourir...'",
             foreground="#059669",
-            font=("Segoe UI", 8),
+            font=("Helvetica", 8),
             justify="left"
         )
         path_info.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))

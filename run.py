@@ -121,7 +121,7 @@ def show_splash():
                 lbl2.image = img_esa
                 lbl2.pack(side=tk.LEFT, padx=8, pady=0)
         else:
-            lbl = tk.Label(root, text="CESA 0.0alpha3.0", fg='white', bg='black', font=('Segoe UI', 12, 'bold'))
+            lbl = tk.Label(root, text="CESA 0.0alpha3.0", fg='white', bg='black', font=('Helvetica', 12, 'bold'))
             lbl._is_splash = True
             lbl.pack(padx=10, pady=10)
 

@@ -99,7 +99,7 @@ class ChannelSelector:
         title_label = ttk.Label(
             main_frame,
             text="🔧 Sélection des Canaux pour la Pyramide",
-            font=('Segoe UI', 14, 'bold')
+            font=('Helvetica', 14, 'bold')
         )
         title_label.pack(pady=(0, 5))
         
@@ -107,7 +107,7 @@ class ChannelSelector:
             main_frame,
             text="Choisissez les canaux à inclure dans le fichier de navigation rapide.\n"
                  "Plus vous sélectionnez de canaux, plus la construction sera longue.",
-            font=('Segoe UI', 9),
+            font=('Helvetica', 9),
             foreground='gray'
         )
         desc_label.pack(pady=(0, 15))
@@ -134,7 +134,7 @@ class ChannelSelector:
         checkbuttons: Dict[str, tk.BooleanVar] = {}
         
         # Label pour le temps estimé (sera utilisé par update_count)
-        time_label = ttk.Label(main_frame, text="", font=('Segoe UI', 9, 'italic'))
+        time_label = ttk.Label(main_frame, text="", font=('Helvetica', 9, 'italic'))
         
         # Définir update_count AVANT toutes les fonctions qui l'utilisent
         def update_count():
@@ -217,7 +217,7 @@ class ChannelSelector:
             type_label = ttk.Label(
                 scrollable_frame,
                 text=f"━━━ {channel_type} ({len(channels)} canaux) ━━━",
-                font=('Segoe UI', 10, 'bold'),
+                font=('Helvetica', 10, 'bold'),
                 foreground='navy'
             )
             type_label.pack(anchor=tk.W, pady=(10, 5))

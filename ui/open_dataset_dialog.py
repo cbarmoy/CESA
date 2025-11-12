@@ -23,11 +23,17 @@ class OpenDatasetSelection:
 class OpenDatasetDialog:
     """Gather EDF path, navigation mode, and optional multiscale settings."""
 
-    def __init__(self, parent: tk.Tk | tk.Toplevel) -> None:
+    def __init__(self, parent):
         self.parent = parent
-        self.result: Optional[OpenDatasetSelection] = None
+        self.result = None
 
-        self.window = tk.Toplevel(parent)
+        # Déterminer le widget root correct
+        if hasattr(parent, 'root'):
+            root_widget = parent.root
+        else:
+            root_widget = parent
+        
+        self.window = tk.Toplevel(root_widget)
         self.window.title("Ouvrir un enregistrement")
         self.window.transient(parent)
         self.window.grab_set()

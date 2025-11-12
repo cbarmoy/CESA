@@ -72,14 +72,14 @@ class CESAInstaller:
         
         # Titre
         title_label = ttk.Label(main_frame, text="🧠 CESA v3.0 - Installateur Graphique", 
-                               font=('Segoe UI', 18, 'bold'))
+                               font=('Helvetica', 18, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Sous-titre
         subtitle_label = ttk.Label(main_frame, 
                                   text="Installation automatique d'EEG Studio Analysis v3.0\n"
                                        "Développé pour l'Unité Neuropsychologie du Stress (IRBA)",
-                                  font=('Segoe UI', 10))
+                                  font=('Helvetica', 10))
         subtitle_label.pack(pady=(0, 30))
         
         # Frame de contenu
@@ -289,7 +289,7 @@ class CESAInstaller:
    Une fois installé, CESA est prêt à analyser vos données EEG !
         """
         
-        help_text_widget = ScrolledText(guide_frame, wrap=tk.WORD, font=('Segoe UI', 10))
+        help_text_widget = ScrolledText(guide_frame, wrap=tk.WORD, font=('Helvetica', 10))
         help_text_widget.pack(fill=tk.BOTH, expand=True)
         help_text_widget.insert(tk.END, guide_text)
         help_text_widget.config(state=tk.DISABLED)

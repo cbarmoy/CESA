@@ -112,12 +112,12 @@ class UserAssistant:
         # Titre de bienvenue
         title_label = ttk.Label(scrollable_frame, 
                                text="🎉 Bienvenue dans CESA v3.0 !",
-                               font=('Segoe UI', 20, 'bold'))
+                               font=('Helvetica', 20, 'bold'))
         title_label.pack(pady=(0, 10))
         
         subtitle_label = ttk.Label(scrollable_frame,
                                  text="Assistant Personnalisé - Guide Complet des Fonctionnalités",
-                                 font=('Segoe UI', 12, 'italic'))
+                                 font=('Helvetica', 12, 'italic'))
         subtitle_label.pack(pady=(0, 20))
         
         # Informations détaillées sur CESA
@@ -145,7 +145,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         """
         
         esa_info_label = ttk.Label(esa_info_frame, text=esa_info_text.strip(), 
-                                  font=('Segoe UI', 10), justify='left')
+                                  font=('Helvetica', 10), justify='left')
         esa_info_label.pack(anchor='w')
         
         # Nouvelles fonctionnalités v3.0
@@ -179,7 +179,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         """
         
         features_label = ttk.Label(features_frame, text=features_text.strip(), 
-                                 font=('Segoe UI', 10), justify='left')
+                                 font=('Helvetica', 10), justify='left')
         features_label.pack(anchor='w')
         
         # Guide d'utilisation personnalisé
@@ -218,7 +218,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         """
         
         guide_label = ttk.Label(guide_frame, text=guide_text.strip(), 
-                               font=('Segoe UI', 10), justify='left')
+                               font=('Helvetica', 10), justify='left')
         guide_label.pack(anchor='w')
         
         # Options de démarrage personnalisées
@@ -252,28 +252,28 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         ttk.Button(tour_frame, text="🎯 Visite Guidée Interactive", 
                   command=start_guided_tour).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(tour_frame, text="Découvrez CESA étape par étape avec un guide interactif", 
-                 font=('Segoe UI', 9), foreground='gray').pack(side=tk.LEFT)
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.LEFT)
         
         sample_frame = ttk.Frame(buttons_frame)
         sample_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(sample_frame, text="📁 Charger Données d'Exemple", 
                   command=load_sample_data).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(sample_frame, text="Testez CESA avec des données EEG pré-configurées", 
-                 font=('Segoe UI', 9), foreground='gray').pack(side=tk.LEFT)
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.LEFT)
         
         explore_frame = ttk.Frame(buttons_frame)
         explore_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(explore_frame, text="🔍 Explorateur de Fonctionnalités", 
                   command=explore_features).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(explore_frame, text="Explorez toutes les fonctionnalités disponibles", 
-                 font=('Segoe UI', 9), foreground='gray').pack(side=tk.LEFT)
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.LEFT)
         
         reference_frame = ttk.Frame(buttons_frame)
         reference_frame.pack(fill=tk.X, pady=(0, 10))
         ttk.Button(reference_frame, text="📚 Guide de Référence Complet", 
                   command=open_reference).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(reference_frame, text="Accédez à la documentation complète et aux références", 
-                 font=('Segoe UI', 9), foreground='gray').pack(side=tk.LEFT)
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.LEFT)
         
         # Options utilisateur avancées
         prefs_frame = ttk.LabelFrame(scrollable_frame, text="⚙️ Préférences Personnalisées", padding=15)
@@ -312,7 +312,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         """
         
         support_label = ttk.Label(support_frame, text=support_text.strip(), 
-                                 font=('Segoe UI', 10), justify='left')
+                                 font=('Helvetica', 10), justify='left')
         support_label.pack(anchor='w')
         
         # Boutons de contrôle
@@ -352,7 +352,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         
         # Titre
         title_label = ttk.Label(main_frame, text="🎯 Visite Guidée CESA v3.0", 
-                               font=('Segoe UI', 16, 'bold'))
+                               font=('Helvetica', 16, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Étapes de la visite
@@ -405,18 +405,18 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         self.step_frame = ttk.LabelFrame(content_frame, text="Étape actuelle", padding=10)
         self.step_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.step_title = ttk.Label(self.step_frame, font=('Segoe UI', 12, 'bold'))
+        self.step_title = ttk.Label(self.step_frame, font=('Helvetica', 12, 'bold'))
         self.step_title.pack(anchor='w', pady=(0, 10))
         
-        self.step_description = ttk.Label(self.step_frame, font=('Segoe UI', 10), 
+        self.step_description = ttk.Label(self.step_frame, font=('Helvetica', 10), 
                                         wraplength=600, justify='left')
         self.step_description.pack(anchor='w', pady=(0, 10))
         
-        self.step_action = ttk.Label(self.step_frame, font=('Segoe UI', 10, 'italic'), 
+        self.step_action = ttk.Label(self.step_frame, font=('Helvetica', 10, 'italic'), 
                                     foreground='blue')
         self.step_action.pack(anchor='w', pady=(0, 10))
         
-        self.step_tip = ttk.Label(self.step_frame, font=('Segoe UI', 9), 
+        self.step_tip = ttk.Label(self.step_frame, font=('Helvetica', 9), 
                                  foreground='green', wraplength=600, justify='left')
         self.step_tip.pack(anchor='w')
         
@@ -517,12 +517,12 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         title_frame.pack(fill=tk.X, pady=(0, 20))
         
         title_label = ttk.Label(title_frame, text="🔍 Explorateur de Fonctionnalités CESA v3.0", 
-                               font=('Segoe UI', 20, 'bold'))
+                               font=('Helvetica', 20, 'bold'))
         title_label.pack()
         
         subtitle_label = ttk.Label(title_frame, 
                                   text="Guide complet et personnalisé pour chaque fonctionnalité", 
-                                  font=('Segoe UI', 12, 'italic'))
+                                  font=('Helvetica', 12, 'italic'))
         subtitle_label.pack(pady=(5, 0))
         
         # Frame avec arbre et détails
@@ -548,7 +548,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         self._text_frame = text_frame
 
         self.feature_details = tk.Text(text_frame, wrap=tk.WORD, height=25,
-                                      font=('Segoe UI', 11), state='disabled')
+                                      font=('Helvetica', 11), state='disabled')
 
         # Scrollbar pour le texte
         scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.feature_details.yview)
@@ -670,7 +670,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
 
         # Créer un nouveau widget Text
         self.feature_details = tk.Text(self._text_frame, wrap=tk.WORD, height=25,
-                                      font=('Segoe UI', 11), state='disabled')
+                                      font=('Helvetica', 11), state='disabled')
 
         # Recréer la scrollbar
         scrollbar = ttk.Scrollbar(self._text_frame, orient="vertical", command=self.feature_details.yview)
@@ -2163,13 +2163,13 @@ Utilisez le bouton "🚀 Essayer cette fonctionnalité" pour lancer directement 
         
         # Titre
         title_label = ttk.Label(scrollable_frame, text=f"📚 Tutoriel Détaillé - {feature_name}", 
-                               font=('Segoe UI', 18, 'bold'))
+                               font=('Helvetica', 18, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Contenu du tutoriel
         tutorial_content = self._get_tutorial_content(feature_name)
         
-        tutorial_text = tk.Text(scrollable_frame, wrap=tk.WORD, font=('Segoe UI', 11))
+        tutorial_text = tk.Text(scrollable_frame, wrap=tk.WORD, font=('Helvetica', 11))
         tutorial_text.pack(fill=tk.BOTH, expand=True)
         tutorial_text.insert(tk.END, tutorial_content)
         tutorial_text.config(state='disabled')
@@ -2380,7 +2380,7 @@ Consultez le guide de référence complet pour les références scientifiques d�
             
             label = tk.Label(tooltip, text=text, justify='left', 
                            background='#ffffe0', relief='solid', borderwidth=1,
-                           font=('Segoe UI', 9), wraplength=300, padx=5, pady=5)
+                           font=('Helvetica', 9), wraplength=300, padx=5, pady=5)
             label.pack()
             
             widget.tooltip = tooltip
@@ -2417,7 +2417,7 @@ Consultez le guide de référence complet pour les références scientifiques d�
         
         # Titre
         title_label = ttk.Label(main_frame, text="❓ Aide CESA v3.0", 
-                               font=('Segoe UI', 16, 'bold'))
+                               font=('Helvetica', 16, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Options d'aide
@@ -2434,8 +2434,8 @@ Consultez le guide de référence complet pour les références scientifiques d�
             option_frame = ttk.Frame(main_frame)
             option_frame.pack(fill=tk.X, pady=(0, 10))
             
-            ttk.Label(option_frame, text=title, font=('Segoe UI', 12, 'bold')).pack(anchor='w')
-            ttk.Label(option_frame, text=description, font=('Segoe UI', 10)).pack(anchor='w')
+            ttk.Label(option_frame, text=title, font=('Helvetica', 12, 'bold')).pack(anchor='w')
+            ttk.Label(option_frame, text=description, font=('Helvetica', 10)).pack(anchor='w')
             ttk.Button(option_frame, text="Ouvrir", command=command).pack(anchor='e')
         
         # Bouton fermer
@@ -2542,12 +2542,12 @@ Licence : MIT
         
         # Titre
         title_label = ttk.Label(scrollable_frame, text="📚 Guide de Référence CESA v3.0", 
-                               font=('Segoe UI', 18, 'bold'))
+                               font=('Helvetica', 18, 'bold'))
         title_label.pack(pady=(0, 10))
         
         subtitle_label = ttk.Label(scrollable_frame,
                                  text="Documentation Complète et Références Scientifiques",
-                                 font=('Segoe UI', 12, 'italic'))
+                                 font=('Helvetica', 12, 'italic'))
         subtitle_label.pack(pady=(0, 20))
         
         # Section Documentation
@@ -2583,7 +2583,7 @@ Licence : MIT
         """
         
         doc_label = ttk.Label(doc_frame, text=doc_text.strip(), 
-                             font=('Segoe UI', 10), justify='left')
+                             font=('Helvetica', 10), justify='left')
         doc_label.pack(anchor='w')
         
         # Section Références Scientifiques
@@ -2627,7 +2627,7 @@ Licence : MIT
         """
         
         ref_label = ttk.Label(ref_frame, text=ref_text.strip(), 
-                             font=('Segoe UI', 10), justify='left')
+                             font=('Helvetica', 10), justify='left')
         ref_label.pack(anchor='w')
         
         # Section Standards et Conventions
@@ -2662,7 +2662,7 @@ Licence : MIT
         """
         
         standards_label = ttk.Label(standards_frame, text=standards_text.strip(), 
-                                   font=('Segoe UI', 10), justify='left')
+                                   font=('Helvetica', 10), justify='left')
         standards_label.pack(anchor='w')
         
         # Section Support Technique
@@ -2700,7 +2700,7 @@ Licence : MIT
         """
         
         support_label = ttk.Label(support_frame, text=support_text.strip(), 
-                                 font=('Segoe UI', 10), justify='left')
+                                 font=('Helvetica', 10), justify='left')
         support_label.pack(anchor='w')
         
         # Boutons d'action
@@ -2748,7 +2748,7 @@ Licence : MIT
         
         # Titre
         title_label = ttk.Label(main_frame, text="🔧 Diagnostic Système", 
-                               font=('Segoe UI', 16, 'bold'))
+                               font=('Helvetica', 16, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Zone de résultats
@@ -2850,7 +2850,7 @@ def create_detailed_tooltip(widget, text, delay=500):
         
         label = tk.Label(tooltip, text=text, justify='left', 
                        background='#ffffe0', relief='solid', borderwidth=1,
-                       font=('Segoe UI', 9), wraplength=300, padx=5, pady=5)
+                       font=('Helvetica', 9), wraplength=300, padx=5, pady=5)
         label.pack()
         
         widget.tooltip = tooltip
