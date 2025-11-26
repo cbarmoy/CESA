@@ -71,14 +71,20 @@ import os
 import sys
 import json
 import csv
+import math
+import time
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
 import warnings
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Iterable, Sequence
 import logging
 import re
 from itertools import groupby
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from logging.handlers import RotatingFileHandler
 
 from core.bridge import DataBridge
 from ui.startup_mode import ModeSelector
@@ -94,7 +100,9 @@ from CESA.filters import (apply_filter as cesa_apply_filter,
                          get_filter_presets as cesa_get_filter_presets)
 from CESA.scoring_io import import_excel_scoring as cesa_import_excel_scoring, import_edf_hypnogram as cesa_import_edf_hypnogram
 from CESA.theme_manager import theme_manager
-import time
+from CESA import group_analysis
+from core.telemetry import telemetry
+from core.lazy_provider import LazyProvider
 
 # Configuration des warnings
 warnings.filterwarnings('ignore')
@@ -108,13 +116,66 @@ logging.basicConfig(
     ]
 )
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """
+    Variante tolérante aux verrous Windows.
+    Si la rotation échoue (fichier ouvert dans un autre programme), la rotation
+    est désactivée pour éviter les traces d'erreur répétées tout en conservant
+    l'écriture dans le fichier courant.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._rotation_disabled = False
+        kwargs.setdefault("delay", True)
+        super().__init__(*args, **kwargs)
+
+    def shouldRollover(self, record):
+        if self._rotation_disabled:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self):
+        if self._rotation_disabled:
+            return
+        try:
+            super().doRollover()
+        except PermissionError as exc:
+            self._rotation_disabled = True
+            # Réouvrir le flux pour continuer à écrire dans le fichier courant.
+            if self.stream is None:
+                self.stream = self._open()
+            try:
+                sys.stderr.write(
+                    "[WARN] Unable to rotate 'eeg_studio.log' (file locked). "
+                    "Rotation disabled for this session. Close viewers and "
+                    "restart CESA to re-enable log rotation.\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # Éviter l'enchaînement d'autres handlers qui pourraient relancer la rotation.
+            self.handleError = self._silent_handle_error
+
+    def _silent_handle_error(self, record):
+        """Empêche l'affichage d'erreurs supplémentaires si la rotation est désactivée."""
+        pass
+
+
 # Ajout d'un RotatingFileHandler pour les checkpoints persistants
 try:
-    from logging.handlers import RotatingFileHandler
-    rotating_handler = RotatingFileHandler('eeg_studio.log', maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rotating_handler = SafeRotatingFileHandler(
+        log_dir / 'eeg_studio.log',
+        maxBytes=2_000_000,
+        backupCount=3,
+        encoding='utf-8',
+    )
     rotating_handler.setLevel(logging.INFO)
     rotating_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-    logging.getLogger().addHandler(rotating_handler)
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, SafeRotatingFileHandler) for h in root_logger.handlers):
+        root_logger.addHandler(rotating_handler)
 except Exception as _e:
     logging.warning(f"Impossible d'initialiser le RotatingFileHandler: {_e}")
 
@@ -162,6 +223,15 @@ class EEGAnalysisStudio:
         self.raw: Optional[mne.io.Raw] = None
         self.derivations: Dict[str, np.ndarray] = {}
         self.selected_channels: List[str] = []
+        self._bridge_executor: Optional[ThreadPoolExecutor] = None
+        self._preprocess_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=3)
+        self._processed_lock = threading.Lock()
+        self._processed_window_cache: OrderedDict[str, Tuple[np.ndarray, float, Dict[str, Any]]] = OrderedDict()
+        self._processed_window_limit = 64
+        self._processing_generation = 0
+        self._current_window_signature: Optional[Tuple] = None
+        self._expected_channels: set[str] = set()
+        self._last_preprocessed_signals: Dict[str, Tuple[np.ndarray, float]] = {}
         
         # Paramètres temporels
         self.current_time: float = 0.0
@@ -233,6 +303,13 @@ class EEGAnalysisStudio:
         # Scoring de sommeil
         self.sleep_scoring_data: Optional[pd.DataFrame] = None  # Auto (YASA)
         self.manual_scoring_data: Optional[pd.DataFrame] = None  # Manuel (Excel)
+        
+        # FFT Comparison data (for comparing two conditions)
+        self.fft_comparison_raw: Optional[mne.io.Raw] = None
+        self.fft_comparison_derivations: Dict[str, np.ndarray] = {}
+        self.fft_comparison_scoring: Optional[pd.DataFrame] = None
+        self.fft_comparison_name: str = "Condition 2"
+        self.fft_main_name: str = "Condition 1"
         self.show_manual_scoring: bool = True
         self.scoring_epoch_duration: float = 30.0  # Durée d'une époque en secondes
         # Cache PSG
@@ -253,6 +330,18 @@ class EEGAnalysisStudio:
         except Exception:
             pass
         
+        # Clustering Spaghetti (UI et logique)
+        self.spag_clusters: Dict[str, str] = {}
+        self.spag_cluster_names: Dict[str, str] = {'A': "Cluster A", 'B': "Cluster B"}
+        self.spag_cluster_name_vars: Dict[str, tk.StringVar] = {}
+        self.spag_subjects: List[str] = []
+        self.spag_subject_listbox: Optional[tk.Listbox] = None
+        self.spag_cluster_listboxes: Dict[str, tk.Listbox] = {}
+
+        # Libellés personnalisés pour les groupes (Before/After)
+        self.spag_group_before_var = tk.StringVar(value="Before")
+        self.spag_group_after_var = tk.StringVar(value="After")
+
         # Mapping des stades FR -> codes standard
         self.french_to_standard = {
             'eveil': 'W', 'éveil': 'W', 'w': 'W', 'wake': 'W', 'veille': 'W',
@@ -670,10 +759,12 @@ class EEGAnalysisStudio:
         analysis_menu.add_command(label="📊 PSD par stade (FFT – Analyse_spectrale)", command=self._show_stage_psd_fft)
         analysis_menu.add_command(label="🌈 Spectrogramme ondelettes (avant/après)", command=self._show_wavelet_spectrogram_before_after)
         analysis_menu.add_command(label="🧮 Entropie Renormée (Issartel)", command=self._show_renormalized_entropy)
+        analysis_menu.add_command(label="🔬 Entropie Multiscale (MSE)", command=self._show_multiscale_entropy)
         analysis_menu.add_command(label="🧮 Analyse périodes (SleepEEGpy)", command=self._analyze_sleep_periods)
         analysis_menu.add_command(label="🌊 Analyse Temporelle", command=self._show_temporal_analysis)
         analysis_menu.add_separator()
         analysis_menu.add_command(label="📈 Graphiques Spaghetti (EDF…)", command=self._generate_spaghetti_from_edf)
+        analysis_menu.add_command(label="📚 Analyse Groupe (MSE/REN)", command=self._show_group_analysis)
         analysis_menu.add_command(label="🤖 Automatisation FFT en Lot", command=self._show_batch_fft_automation)
         analysis_menu.add_command(label="📊 Analyse Avancée", command=self._show_advanced_analysis)
         analysis_menu.add_command(label="🔬 Analyse Micro-états", command=self._show_microstates_analysis)
@@ -847,11 +938,32 @@ class EEGAnalysisStudio:
         selected_stages = ["W", "N1", "N2", "N3", "R"]
 
         try:
+            # Prendre en compte les combinaisons explicites s'il y en a
+            combos = self._parse_spag_combinations()
+            if combos:
+                add_channels = sorted({c for (c, _s, _b) in combos})
+                if not selected_channels:
+                    selected_channels = list(add_channels)
+                else:
+                    for c in add_channels:
+                        if c not in selected_channels:
+                            selected_channels.append(c)
+                # Étendre filtres bande/stade
+                add_bands = sorted({b for (_c, _s, b) in combos})
+                add_stages = sorted({s for (_c, s, _b) in combos})
+                for b in add_bands:
+                    if b not in selected_bands:
+                        selected_bands.append(b)
+                for s in add_stages:
+                    if s not in selected_stages:
+                        selected_stages.append(s)
             self._set_status_message("Génération des graphiques spaghetti en cours…")
         except Exception:
             pass
 
         try:
+            clusters_payload, cluster_names_payload = self._get_spag_cluster_payload()
+            before_label, after_label = self._get_spag_group_labels()
             outputs = generate_spaghetti_from_edf_dirs(
                 before_dir=before_dir,
                 after_dir=after_dir,
@@ -860,6 +972,12 @@ class EEGAnalysisStudio:
                 selected_stages=selected_stages,
                 selected_channels=selected_channels,
                 selected_subjects=None,
+                selected_band_stage_map=None,
+                selected_combinations=combos if 'combos' in locals() else None,
+                clusters=clusters_payload,
+                cluster_names=cluster_names_payload,
+                before_label=before_label,
+                after_label=after_label,
                 epoch_len=30.0,
                 metric='AUC',
                 rng_seed=42,
@@ -1754,82 +1872,118 @@ class EEGAnalysisStudio:
         selected.extend(emg)
         selected.extend(ecg)
 
+        # Filtrer pour ne garder que les canaux qui existent réellement dans self.raw
+        available_channels = set(self.raw.ch_names)
+        selected = [ch for ch in selected if ch in available_channels]
+
         # Mémoriser les canaux utilisés par le viewer PSG pour des rafraîchissements rapides
         try:
             self.psg_channels_used = list(selected)
         except Exception:
             pass
 
+        # Créer un sample de télémetrie pour la visualisation
+        dataset_id = 'unknown'
+        if hasattr(self, 'raw') and self.raw is not None:
+            try:
+                meas_id = self.raw.info.get('meas_id')
+                if meas_id is not None and isinstance(meas_id, dict):
+                    dataset_id = str(meas_id.get('file_id', 'unknown'))
+                else:
+                    dataset_id = str(getattr(self.raw.info, 'filename', 'unknown'))
+            except Exception:
+                dataset_id = 'unknown'
+        viz_sample = telemetry.new_sample({
+            "channel": "visualization",
+            "dataset_id": dataset_id,
+            "start_s": float(self.current_time),
+            "duration_s": float(self.duration),
+            "notes": f"n_channels={len(selected)}",
+        })
+        
         # Pre-slice only the visible window to improve performance
         start_idx = int(max(0, float(self.current_time) * fs))
         end_idx = int(min(len(self.raw.times), (float(self.current_time) + float(self.duration)) * fs))
         if end_idx <= start_idx + 1:
             end_idx = min(len(self.raw.times), start_idx + int(max(2, fs)))
 
+        # Mesurer le temps d'extraction des canaux et de conversion µV
+        extract_start = time.perf_counter()
+        convert_total = 0.0
+        
         for ch in selected:
             try:
                 arr = self.raw.get_data(picks=[ch], start=start_idx, stop=end_idx)[0]
+                # Mesurer le temps de conversion µV
+                convert_start = time.perf_counter()
                 data_uv = self._to_microvolts_and_sanitize(arr)
+                convert_total += (time.perf_counter() - convert_start) * 1000.0
                 # Provide pre-windowed time base by letting PSGPlotter detect it
                 signals[ch] = (data_uv, fs)
             except Exception:
                 continue
+        
+        extract_channels_ms = (time.perf_counter() - extract_start) * 1000.0
+        viz_sample.setdefault("extract_channels_ms", extract_channels_ms - convert_total)
+        viz_sample.setdefault("convert_uv_ms", convert_total)
 
-        # Hypnogramme depuis scoring actif (tolérant et complet)
+        # Hypnogramme depuis scoring actif (tolérant et complet) avec mesure du temps
         hypnogram = None
-        df = self._get_active_scoring_df()
-        if df is not None and len(df) > 0 and 'time' in df.columns and 'stage' in df.columns:
-            try:
-                # Assurer l'ordre chronologique
-                df_work = df[['time', 'stage']].copy()
-                df_work['time'] = pd.to_numeric(df_work['time'], errors='coerce')
-                df_work = df_work.dropna(subset=['time']).sort_values('time').reset_index(drop=True)
+        with telemetry.measure(viz_sample, "prepare_hypno_ms"):
+            df = self._get_active_scoring_df()
+            if df is not None and len(df) > 0 and 'time' in df.columns and 'stage' in df.columns:
+                try:
+                    # Assurer l'ordre chronologique
+                    df_work = df[['time', 'stage']].copy()
+                    df_work['time'] = pd.to_numeric(df_work['time'], errors='coerce')
+                    df_work = df_work.dropna(subset=['time']).sort_values('time').reset_index(drop=True)
 
-                if len(df_work) >= 2:
-                    diffs = np.diff(df_work['time'].to_numpy(dtype=float))
-                    diffs_pos = diffs[diffs > 0]
-                    epoch_len = float(np.median(diffs_pos)) if len(diffs_pos) > 0 else float(self.scoring_epoch_duration)
-                else:
-                    epoch_len = float(self.scoring_epoch_duration)
+                    if len(df_work) >= 2:
+                        diffs = np.diff(df_work['time'].to_numpy(dtype=float))
+                        diffs_pos = diffs[diffs > 0]
+                        epoch_len = float(np.median(diffs_pos)) if len(diffs_pos) > 0 else float(self.scoring_epoch_duration)
+                    else:
+                        epoch_len = float(self.scoring_epoch_duration)
 
-                # Étendre en séquence complète avec remplissage 'U' sur toute la durée
-                if len(df_work) > 0:
-                    try:
-                        total_dur = float(len(self.raw.times) / self.sfreq)
-                    except Exception:
-                        total_dur = float(df_work['time'].iloc[-1]) + epoch_len
-                    start_fill = 0.0
-                    end_fill = total_dur
-                    num_epochs = int(np.ceil((end_fill - start_fill) / epoch_len))
-                    labels = ['U'] * num_epochs
-                    for t, s in zip(
-                        df_work['time'].to_numpy(dtype=float),
-                        df_work['stage'].astype(str).str.upper().str.strip().to_numpy()
-                    ):
-                        idx = int(round((t - start_fill) / epoch_len))
-                        if 0 <= idx < len(labels):
-                            labels[idx] = s
-                    hypnogram = (labels, epoch_len)
-            except Exception:
-                hypnogram = None
+                    # Étendre en séquence complète avec remplissage 'U' sur toute la durée
+                    if len(df_work) > 0:
+                        try:
+                            total_dur = float(len(self.raw.times) / self.sfreq)
+                        except Exception:
+                            total_dur = float(df_work['time'].iloc[-1]) + epoch_len
+                        start_fill = 0.0
+                        end_fill = total_dur
+                        num_epochs = int(np.ceil((end_fill - start_fill) / epoch_len))
+                        labels = ['U'] * num_epochs
+                        for t, s in zip(
+                            df_work['time'].to_numpy(dtype=float),
+                            df_work['stage'].astype(str).str.upper().str.strip().to_numpy()
+                        ):
+                            idx = int(round((t - start_fill) / epoch_len))
+                            if 0 <= idx < len(labels):
+                                labels[idx] = s
+                        hypnogram = (labels, epoch_len)
+                except Exception:
+                    hypnogram = None
 
         # Événements (placeholder: extraire plus tard depuis annotations EDF si dispo)
         events = []
 
-        # Créer et afficher le plotter PSG
+        # Créer et afficher le plotter PSG avec mesure du temps
         from CESA.psg_plot import PSGPlotter
 
-        plotter = PSGPlotter(
-            signals=signals,
-            hypnogram=hypnogram,
-            scoring_annotations=events,
-            start_time_s=float(self.current_time),
-            duration_s=float(self.duration),
-            filter_params_by_channel=self.channel_filter_params,
-            global_filter_enabled=bool(self.filter_var.get()),
-            theme_name=self.theme_manager.current_theme_name,
-            total_duration_s=float(len(self.raw.times) / fs) if hasattr(self, 'raw') and self.raw is not None else None,
-        )
+        with telemetry.measure(viz_sample, "create_plotter_ms"):
+            plotter = PSGPlotter(
+                signals=signals,
+                hypnogram=hypnogram,
+                scoring_annotations=events,
+                start_time_s=float(self.current_time),
+                duration_s=float(self.duration),
+                filter_params_by_channel=self.channel_filter_params,
+                global_filter_enabled=bool(self.filter_var.get()),
+                theme_name=self.theme_manager.current_theme_name,
+                total_duration_s=float(len(self.raw.times) / fs) if hasattr(self, 'raw') and self.raw is not None else None,
+            )
 
         # Stocker la référence pour mises à jour rapides
         self.psg_plotter = plotter
@@ -1871,6 +2025,14 @@ class EEGAnalysisStudio:
             except Exception:
                 pass
             # (Supprimé) Panel sous le canvas pour éviter les doublons.
+            
+            # Commiter le sample de télémetrie
+            try:
+                if viz_sample:
+                    viz_sample.setdefault("total_ms", 0.0)
+                    telemetry.commit(viz_sample)
+            except Exception:
+                pass
             return
 
         # Sinon, créer une fenêtre Toplevel dédiée (mode secondaire)
@@ -1885,6 +2047,14 @@ class EEGAnalysisStudio:
         canvas = FigureCanvasTkAgg(plotter.figure, master=main_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Commiter le sample de télémetrie
+        try:
+            if viz_sample:
+                viz_sample.setdefault("total_ms", 0.0)
+                telemetry.commit(viz_sample)
+        except Exception:
+            pass
 
         toolbar_frame = ttk.Frame(main_frame)
         toolbar_frame.pack(fill=tk.X, pady=(5, 0))
@@ -2524,7 +2694,7 @@ class EEGAnalysisStudio:
         # Fenêtre secondaire
         print("🔍 CHECKPOINT FFT 2: Création fenêtre secondaire")
         spec_window = tk.Toplevel(self.root)
-        spec_window.title("Analyse spectrale - FFT (puissance par bande)")
+        spec_window.title("Spectral Analysis - FFT (Power by Band)")
         spec_window.geometry("1000x700")
         spec_window.transient(self.root)
         spec_window.grab_set()
@@ -2654,7 +2824,11 @@ class EEGAnalysisStudio:
                     if freqs.size == 0:
                         print(f"⚠️ CHECKPOINT FFT 7: FFT vide pour {ch}")
                         continue
-                    ax.plot(freqs, spec, label=ch, linewidth=1.0)
+                    
+                    # Apply log10 scaling to power (spec^2)
+                    power = spec ** 2
+                    power_log = np.log10(np.maximum(power, 1e-20))  # Avoid log(0)
+                    ax.plot(freqs, power_log, label=ch, linewidth=1.0)
 
                     # Band powers et métriques
                     bands = compute_band_powers(freqs, spec)
@@ -2662,9 +2836,9 @@ class EEGAnalysisStudio:
                     row = [ch] + [f"{bands[b]:.2f}" for b in EEG_BANDS.keys()] + [f"{peak:.2f}", f"{centroid:.2f}"]
                     tree.insert("", tk.END, values=tuple(row))
 
-                ax.set_title("Spectre (FFT magnitude)")
-                ax.set_xlabel("Fréquence (Hz)")
-                ax.set_ylabel("Magnitude")
+                ax.set_title("Spectrum (FFT Power)")
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("Power (µV², log10)")
                 ax.set_xlim(0, min(50, self.sfreq / 2))
                 ax.legend(loc="upper right", fontsize=8, ncol=1)
                 ax.grid(True, alpha=0.3)
@@ -3390,24 +3564,27 @@ class EEGAnalysisStudio:
 
         # Fenêtre UI
         top = tk.Toplevel(self.root)
-        top.title("PSD par stade (FFT – Analyse_spectrale)")
+        top.title("PSD by Sleep Stage (FFT – Spectral Analysis)")
         top.geometry("1100x680")
         top.transient(self.root)
         top.grab_set()
 
         toolbar = ttk.Frame(top, style='Custom.TFrame')
         toolbar.pack(fill=tk.X, side=tk.TOP)
-        save_fig_btn = ttk.Button(toolbar, text="Enregistrer Figure", style='Custom.TButton')
+        save_fig_btn = ttk.Button(toolbar, text="Save Figure", style='Custom.TButton')
         save_fig_btn.pack(side=tk.RIGHT, padx=(6,6), pady=4)
-        export_csv_btn = ttk.Button(toolbar, text="Exporter CSV")
+        export_csv_btn = ttk.Button(toolbar, text="Export CSV")
         export_csv_btn.pack(side=tk.RIGHT, padx=(6,0), pady=4)
+        # Comparison import button
+        compare_btn = ttk.Button(toolbar, text="Compare Conditions", style='Custom.TButton')
+        compare_btn.pack(side=tk.RIGHT, padx=(6,0), pady=4)
         # Sélecteur de thème pour la fenêtre FFT
         theme_var = tk.StringVar(value=self.theme_manager.current_theme_name)
         theme_combo = ttk.Combobox(toolbar, textvariable=theme_var, state="readonly", width=12)
         theme_combo['values'] = list(self.theme_manager.get_available_themes().values())
         theme_combo.pack(side=tk.RIGHT, padx=(6,0), pady=4)
         theme_combo.bind('<<ComboboxSelected>>', lambda e: self._change_theme_by_display_name(theme_var.get()))
-        toolbar_label = ttk.Label(toolbar, text=f"Canal: {candidate} | FFT magnitude | DC retirée", font=('Segoe UI', 9))
+        toolbar_label = ttk.Label(toolbar, text=f"Channel: {candidate} | FFT Power | DC removed", font=('Segoe UI', 9))
         toolbar_label.pack(side=tk.LEFT, padx=8)
 
         main = ttk.Frame(top)
@@ -3420,11 +3597,11 @@ class EEGAnalysisStudio:
         content.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         # Options
-        opt = ttk.LabelFrame(side, text="Paramètres (FFT)", padding=8)
+        opt = ttk.LabelFrame(side, text="Parameters (FFT)", padding=8)
         opt.pack(fill=tk.Y, expand=True, padx=8, pady=8)
         
         # Sélection du canal
-        channel_box = ttk.LabelFrame(opt, text="Canal", padding=6)
+        channel_box = ttk.LabelFrame(opt, text="Channel", padding=6)
         channel_box.pack(fill=tk.X, pady=(0,8))
         available_channels = list(self.derivations.keys())
         selected_channel_var = tk.StringVar(value=candidate)
@@ -3433,38 +3610,44 @@ class EEGAnalysisStudio:
         
         # Tooltip pour la sélection du canal
         create_tooltip(channel_combo, 
-                      "Sélection du canal EEG pour l'analyse PSD.\n\n"
-                      "• Choisissez le canal qui vous intéresse pour l'analyse spectrale\n"
-                      "• Les canaux bipolaires (ex: C4-M1) sont généralement préférés\n"
-                      "• Le canal sélectionné sera utilisé pour calculer la densité spectrale de puissance\n"
-                      "• Chaque canal peut avoir des caractéristiques spectrales différentes selon sa position anatomique")
+                      "Select EEG channel for PSD analysis.\n\n"
+                      "• Choose the channel of interest for spectral analysis\n"
+                      "• Bipolar channels (e.g., C4-M1) are generally preferred\n"
+                      "• The selected channel will be used to compute power spectral density\n"
+                      "• Each channel may have different spectral characteristics based on anatomical position")
         
         # Taille du bin (nperseg) pour FFT
-        bin_box = ttk.LabelFrame(opt, text="Taille du bin (nperseg)", padding=6)
+        bin_box = ttk.LabelFrame(opt, text="Bin Size (nperseg)", padding=6)
         bin_box.pack(fill=tk.X, pady=(8,8))
-        ttk.Label(bin_box, text="Durée (secondes):").pack(anchor='w')
+        ttk.Label(bin_box, text="Duration (seconds):").pack(anchor='w')
         nperseg_sec_var = tk.DoubleVar(value=4.0)
         nperseg_entry = ttk.Entry(bin_box, textvariable=nperseg_sec_var, width=10)
-        nperseg_entry.pack(anchor='w', pady=(2,0))
-        ttk.Label(bin_box, text="(recommandé: 2-8s)").pack(anchor='w')
+        nperseg_entry.pack(anchor='w', pady=(2,4))
+        ttk.Label(bin_box, text="(recommended: 2-8s)").pack(anchor='w', pady=(0,4))
+        
+        def _apply_bin_size():
+            render()
+        
+        ttk.Button(bin_box, text="Apply Bin Size", command=_apply_bin_size).pack(anchor='w', pady=(4,0))
         
         # Tooltip pour la taille du bin
         create_tooltip(nperseg_entry, 
-                      "Taille du segment (nperseg) pour la méthode FFT.\n\n"
-                      "• Définit la durée de chaque segment utilisé pour le calcul de la PSD\n"
-                      "• Valeurs plus petites (2-4s) : meilleure résolution temporelle, plus de bruit\n"
-                      "• Valeurs plus grandes (6-8s) : meilleure résolution fréquentielle, moins de bruit\n"
-                      "• Recommandé : 4 secondes pour un bon compromis\n"
-                      "• Doit être ≥ 1 seconde pour des résultats fiables")
+                      "Segment size (nperseg) for FFT method.\n\n"
+                      "• Defines the duration of each segment used for PSD computation\n"
+                      "• Smaller values (2-4s): better temporal resolution, more noise\n"
+                      "• Larger values (6-8s): better frequency resolution, less noise\n"
+                      "• Recommended: 4 seconds for a good compromise\n"
+                      "• Must be ≥ 1 second for reliable results\n"
+                      "• Click 'Apply Bin Size' button to update the plot")
         
         robust_var = tk.BooleanVar(value=True)
-        robust_cb = ttk.Checkbutton(opt, text="Médiane + SEM robuste (MAD)", variable=robust_var)
+        robust_cb = ttk.Checkbutton(opt, text="Robust Median + SEM (MAD)", variable=robust_var)
         robust_cb.pack(anchor='w')
         equalize_var = tk.BooleanVar(value=True)
-        equalize_cb = ttk.Checkbutton(opt, text="Égaliser n d'époques par stade", variable=equalize_var)
+        equalize_cb = ttk.Checkbutton(opt, text="Equalize n epochs per stage", variable=equalize_var)
         equalize_cb.pack(anchor='w', pady=(4,0))
 
-        freq_box = ttk.LabelFrame(opt, text="Affichage fréquence", padding=6)
+        freq_box = ttk.LabelFrame(opt, text="Frequency Display", padding=6)
         freq_box.pack(fill=tk.X, pady=(10,4))
         ttk.Label(freq_box, text="Min (Hz)").grid(row=0, column=0, sticky='w')
         freq_min_var = tk.DoubleVar(value=0.5)
@@ -3476,12 +3659,12 @@ class EEGAnalysisStudio:
         freq_max_entry.grid(row=1, column=1, sticky='w', pady=(6,0))
 
         # Période d'analyse (nouveau)
-        period_box = ttk.LabelFrame(opt, text="Période d'analyse", padding=6)
+        period_box = ttk.LabelFrame(opt, text="Analysis Period", padding=6)
         period_box.pack(fill=tk.X, pady=(10,4))
 
         # Case à cocher pour activer la période personnalisée
         self.fft_use_period_var = tk.BooleanVar(value=False)
-        use_period_cb = ttk.Checkbutton(period_box, text="Analyser seulement une période", variable=self.fft_use_period_var)
+        use_period_cb = ttk.Checkbutton(period_box, text="Analyze only a specific period", variable=self.fft_use_period_var)
         use_period_cb.pack(anchor='w', pady=(0,8))
 
         # Contrôles de période (désactivés par défaut)
@@ -3499,20 +3682,20 @@ class EEGAnalysisStudio:
         use_period_cb.config(command=toggle_period_entries)
         toggle_period_entries()  # Initialiser l'état
 
-        ttk.Label(period_box, text="Début (s):").pack(anchor='w')
+        ttk.Label(period_box, text="Start (s):").pack(anchor='w')
         period_start_entry.pack(anchor='w', pady=(2,4))
-        ttk.Label(period_box, text="Fin (s):").pack(anchor='w')
+        ttk.Label(period_box, text="End (s):").pack(anchor='w')
         period_end_entry.pack(anchor='w', pady=(2,0))
 
         # Tooltip pour la période
         create_tooltip(use_period_cb,
-                      "Analyser seulement une période temporelle spécifique.\n\n"
-                      "• Permet de focaliser l'analyse FFT sur une portion d'intérêt\n"
-                      "• Utile pour analyser des événements spécifiques (ex: sommeil paradoxal)\n"
-                      "• Laisse les champs vides pour analyser toute la durée disponible\n"
-                      "• Les temps sont en secondes depuis le début de l'enregistrement")
+                      "Analyze only a specific time period.\n\n"
+                      "• Allows focusing FFT analysis on a portion of interest\n"
+                      "• Useful for analyzing specific events (e.g., REM sleep)\n"
+                      "• Leave fields empty to analyze the entire duration available\n"
+                      "• Times are in seconds from the start of the recording")
 
-        info_box = ttk.LabelFrame(opt, text="Infos", padding=6)
+        info_box = ttk.LabelFrame(opt, text="Info", padding=6)
         info_box.pack(fill=tk.X, pady=(10,4))
         info_var = tk.StringVar(value="")
         info_label = ttk.Label(info_box, textvariable=info_var, justify='left')
@@ -3520,43 +3703,43 @@ class EEGAnalysisStudio:
         
         # Tooltips pour les contrôles FFT
         create_tooltip(robust_cb, 
-                      "Statistiques robustes (médiane + MAD).\n\n"
-                      "• Utilise la médiane au lieu de la moyenne pour la tendance centrale\n"
-                      "• Utilise l'écart absolu médian (MAD) pour l'erreur standard\n"
-                      "• Plus robuste aux valeurs aberrantes et au bruit\n"
-                      "• Standard dans la littérature scientifique pour l'analyse EEG\n"
-                      "• Fournit des intervalles de confiance plus fiables")
+                      "Robust statistics (median + MAD).\n\n"
+                      "• Uses median instead of mean for central tendency\n"
+                      "• Uses median absolute deviation (MAD) for standard error\n"
+                      "• More robust to outliers and noise\n"
+                      "• Standard in scientific literature for EEG analysis\n"
+                      "• Provides more reliable confidence intervals")
         
         create_tooltip(equalize_cb, 
-                      "Égaliser le nombre d'époques par stade.\n\n"
-                      "• Évite le biais statistique dû aux différences de durée entre stades\n"
-                      "• Chaque stade aura le même nombre d'époques (minimum disponible)\n"
-                      "• Important pour les comparaisons statistiques équitables\n"
-                      "• Peut réduire le nombre d'époques utilisées si un stade est rare")
+                      "Equalize the number of epochs per stage.\n\n"
+                      "• Avoids statistical bias due to duration differences between stages\n"
+                      "• Each stage will have the same number of epochs (minimum available)\n"
+                      "• Important for fair statistical comparisons\n"
+                      "• May reduce the number of epochs used if one stage is rare")
         
         create_tooltip(freq_min_entry, 
-                      "Fréquence minimale d'affichage (Hz).\n\n"
-                      "• Définit la fréquence la plus basse affichée sur le graphique\n"
-                      "• Recommandé : 0.5 Hz pour voir les ondes lentes du sommeil\n"
-                      "• Valeurs plus basses : inclut plus de composantes basse fréquence\n"
-                      "• Valeurs plus hautes : exclut les ondes delta (0.5-4 Hz)\n"
-                      "• Doit être ≥ 0 Hz et < fréquence maximale")
+                      "Minimum display frequency (Hz).\n\n"
+                      "• Defines the lowest frequency displayed on the graph\n"
+                      "• Recommended: 0.5 Hz to see slow sleep waves\n"
+                      "• Lower values: includes more low-frequency components\n"
+                      "• Higher values: excludes delta waves (0.5-4 Hz)\n"
+                      "• Must be ≥ 0 Hz and < maximum frequency")
         
         create_tooltip(freq_max_entry, 
-                      "Fréquence maximale d'affichage (Hz).\n\n"
-                      "• Définit la fréquence la plus haute affichée sur le graphique\n"
-                      "• Recommandé : 30-45 Hz pour l'analyse du sommeil\n"
-                      "• Valeurs plus basses : focus sur les bandes de sommeil (delta, theta, alpha, sigma)\n"
-                      "• Valeurs plus hautes : inclut les ondes gamma et artefacts\n"
-                      "• Doit être ≤ fréquence de Nyquist (fréquence d'échantillonnage / 2)")
+                      "Maximum display frequency (Hz).\n\n"
+                      "• Defines the highest frequency displayed on the graph\n"
+                      "• Recommended: 30-45 Hz for sleep analysis\n"
+                      "• Lower values: focus on sleep bands (delta, theta, alpha, sigma)\n"
+                      "• Higher values: includes gamma waves and artifacts\n"
+                      "• Must be ≤ Nyquist frequency (sampling frequency / 2)")
         
         create_tooltip(info_label, 
-                      "Informations sur l'analyse PSD par stade.\n\n"
-                      "• Affiche le nombre d'époques disponibles pour chaque stade de sommeil\n"
-                      "• Format : W: n=X | N1: n=Y | N2: n=Z | N3: n=A | R: n=B\n"
-                      "• Plus le nombre d'époques est élevé, plus l'analyse est fiable\n"
-                      "• Les stades avec peu d'époques peuvent avoir des statistiques moins robustes\n"
-                      "• Mis à jour automatiquement lors du rendu")
+                      "Information on PSD analysis by stage.\n\n"
+                      "• Displays the number of epochs available for each sleep stage\n"
+                      "• Format: W: n=X | N1: n=Y | N2: n=Z | N3: n=A | R: n=B\n"
+                      "• Higher epoch count means more reliable analysis\n"
+                      "• Stages with few epochs may have less robust statistics\n"
+                      "• Automatically updated during rendering")
         
         # Tooltip pour le sélecteur de thème
         create_tooltip(theme_combo,
@@ -3669,7 +3852,7 @@ class EEGAnalysisStudio:
                 current_nperseg_sec = float(nperseg_sec_var.get())
                 
                 # Mettre à jour le titre de la barre d'outils
-                toolbar_label.config(text=f"Canal: {current_channel} | FFT {current_nperseg_sec}s | DC retirée")
+                toolbar_label.config(text=f"Channel: {current_channel} | FFT {current_nperseg_sec}s | DC removed")
                 
                 # Récupérer la palette de couleurs actuelle
                 current_stage_colors = self.theme_manager.get_stage_colors()
@@ -3692,21 +3875,68 @@ class EEGAnalysisStudio:
                 n_per_stage = {k: v[3] for k, v in out.items()}
                 info_var.set(" | ".join([f"{k}: n={n_per_stage.get(k, 0)}" for k in stages_order]))
 
-                # Tracé (échelle linéaire; magnitude a.u.)
+                # Tracé (échelle log10; puissance)
+                # Check if comparison data is available
+                has_comparison = (self.fft_comparison_raw is not None and 
+                                 self.fft_comparison_scoring is not None and
+                                 current_channel in self.fft_comparison_derivations)
+                
+                # Plot main condition
                 for s in stages_order:
                     if s not in out:
                         continue
                     f, mean_vals, sem_vals, n_ep = out[s]
-                    ax.plot(f, mean_vals, color=current_stage_colors[s], label=f"{s} (n={n_ep})")
-                    ax.fill_between(f, np.maximum(mean_vals - sem_vals, 0.0), mean_vals + sem_vals,
+                    # Convert magnitude to power and apply log10
+                    power_vals = mean_vals ** 2
+                    power_log = np.log10(np.maximum(power_vals, 1e-20))
+                    
+                    # For error bands, also convert SEM to log space
+                    power_upper = (mean_vals + sem_vals) ** 2
+                    power_lower = np.maximum(mean_vals - sem_vals, 0.0) ** 2
+                    power_upper_log = np.log10(np.maximum(power_upper, 1e-20))
+                    power_lower_log = np.log10(np.maximum(power_lower, 1e-20))
+                    
+                    label = f"{self.fft_main_name} - {s} (n={n_ep})" if has_comparison else f"{s} (n={n_ep})"
+                    ax.plot(f, power_log, color=current_stage_colors[s], label=label, 
+                           linestyle='-', linewidth=1.5)
+                    ax.fill_between(f, power_lower_log, power_upper_log,
                                     color=current_stage_colors[s], alpha=0.15, linewidth=0)
+                
+                # Plot comparison condition if available
+                if has_comparison:
+                    try:
+                        comp_signal = self.fft_comparison_derivations[current_channel]
+                        comp_fs = self.fft_comparison_raw.info['sfreq']
+                        comp_out = self._compute_stage_psd_fft_custom(
+                            signal=comp_signal, fs=comp_fs, 
+                            scoring_df=self.fft_comparison_scoring,
+                            epoch_len=float(getattr(self, 'scoring_epoch_duration', 30.0)),
+                            stages=stages_order, fmin=fmin, fmax=fmax,
+                            equalize_epochs=eq, robust_stats=robust,
+                            nperseg_sec=current_nperseg_sec,
+                        )
+                        
+                        for s in stages_order:
+                            if s not in comp_out:
+                                continue
+                            f_comp, mean_vals_comp, sem_vals_comp, n_ep_comp = comp_out[s]
+                            # Convert to log10 power
+                            power_vals_comp = mean_vals_comp ** 2
+                            power_log_comp = np.log10(np.maximum(power_vals_comp, 1e-20))
+                            
+                            label_comp = f"{self.fft_comparison_name} - {s} (n={n_ep_comp})"
+                            ax.plot(f_comp, power_log_comp, color=current_stage_colors[s], 
+                                   label=label_comp, linestyle='--', linewidth=1.5)
+                    except Exception as e:
+                        print(f"⚠️ Warning: Failed to plot comparison data: {e}")
 
                 ax.set_xlim(max(0.0, fmin), min(fmax, fs/2))
-                ax.set_xlabel("Fréquence (Hz)")
-                ax.set_ylabel("Magnitude (a.u.)")
-                ax.set_title("PSD par stade (FFT magnitude; DC retirée)")
+                ax.set_xlabel("Frequency (Hz)")
+                ax.set_ylabel("Power (µV², log10)")
+                title = "PSD by Sleep Stage - Comparison" if has_comparison else "PSD by Sleep Stage (FFT Power; DC removed)"
+                ax.set_title(title)
                 ax.grid(True, alpha=0.3)
-                ax.legend(loc='upper right', ncol=1, fontsize=8)
+                ax.legend(loc='upper right', ncol=1, fontsize=7 if has_comparison else 8)
                 fig.tight_layout()
                 canvas.draw()
             except Exception as e:
@@ -3716,18 +3946,18 @@ class EEGAnalysisStudio:
         def _apply_freq_window():
             render()
 
-        ttk.Button(freq_box, text="Appliquer", command=_apply_freq_window).grid(row=2, column=0, columnspan=2, pady=(8,0))
+        ttk.Button(freq_box, text="Apply", command=_apply_freq_window).grid(row=2, column=0, columnspan=2, pady=(8,0))
 
         render()
 
         def _save_figure(fig_obj):
             try:
-                file_path = filedialog.asksaveasfilename(title="Enregistrer la figure", defaultextension=".png",
+                file_path = filedialog.asksaveasfilename(title="Save Figure", defaultextension=".png",
                                                          filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")])
                 if file_path:
                     fig_obj.savefig(file_path, dpi=200, bbox_inches='tight')
             except Exception as e:
-                messagebox.showerror("Erreur", f"Echec de l'enregistrement de la figure: {e}")
+                messagebox.showerror("Error", f"Failed to save figure: {e}")
 
         def _export_csv():
             try:
@@ -3737,7 +3967,7 @@ class EEGAnalysisStudio:
                 robust = bool(robust_var.get())
                 current_channel = selected_channel_var.get()
                 if current_channel not in self.derivations:
-                    messagebox.showerror("Erreur", f"Canal '{current_channel}' non disponible")
+                    messagebox.showerror("Error", f"Channel '{current_channel}' not available")
                     return
                 signal = self.derivations[current_channel]
                 current_nperseg_sec = float(nperseg_sec_var.get())
@@ -3748,7 +3978,7 @@ class EEGAnalysisStudio:
                     equalize_epochs=eq, robust_stats=robust,
                     nperseg_sec=current_nperseg_sec,
                 )
-                file_path = filedialog.asksaveasfilename(title="Exporter CSV (long format)", defaultextension=".csv",
+                file_path = filedialog.asksaveasfilename(title="Export CSV (long format)", defaultextension=".csv",
                                                          filetypes=[("CSV", "*.csv")])
                 if not file_path:
                     return
@@ -3759,13 +3989,149 @@ class EEGAnalysisStudio:
                     for s, (fvals, mean_vals, sem_vals, n_ep) in out.items():
                         for i in range(len(fvals)):
                             writer.writerow([s, n_ep, float(fvals[i]), float(mean_vals[i]), float(sem_vals[i])])
-                messagebox.showinfo("Export", f"CSV exporté: {file_path}")
+                messagebox.showinfo("Export", f"CSV exported: {file_path}")
             except Exception as e:
-                messagebox.showerror("Erreur", f"Echec de l'export CSV: {e}")
+                messagebox.showerror("Error", f"Failed to export CSV: {e}")
 
+        def _open_comparison_dialog():
+            """Open dialog to import a second EDF+scoring for comparison."""
+            try:
+                comp_dialog = tk.Toplevel(top)
+                comp_dialog.title("Import Comparison Data")
+                comp_dialog.geometry("550x400")
+                comp_dialog.transient(top)
+                comp_dialog.grab_set()
+                
+                ttk.Label(comp_dialog, text="Import a second EDF + Scoring file for comparison", 
+                         font=('Segoe UI', 10, 'bold')).pack(pady=(10,10))
+                
+                # Show current channel info
+                current_channel = selected_channel_var.get()
+                info_frame = ttk.Frame(comp_dialog)
+                info_frame.pack(fill=tk.X, padx=20, pady=(0,10))
+                ttk.Label(info_frame, text=f"Channel to import: {current_channel}", 
+                         font=('Segoe UI', 9), foreground='blue').pack(anchor='w')
+                ttk.Label(info_frame, text="(Only this channel will be loaded to save memory)", 
+                         font=('Segoe UI', 8), foreground='gray').pack(anchor='w')
+                
+                # Condition names
+                names_frame = ttk.LabelFrame(comp_dialog, text="Condition Names", padding=10)
+                names_frame.pack(fill=tk.X, padx=20, pady=(0,10))
+                
+                ttk.Label(names_frame, text="Main condition (current data):").grid(row=0, column=0, sticky='w', pady=5)
+                main_name_var = tk.StringVar(value=self.fft_main_name)
+                ttk.Entry(names_frame, textvariable=main_name_var, width=30).grid(row=0, column=1, padx=(10,0), pady=5)
+                
+                ttk.Label(names_frame, text="Comparison condition:").grid(row=1, column=0, sticky='w', pady=5)
+                comp_name_var = tk.StringVar(value=self.fft_comparison_name)
+                ttk.Entry(names_frame, textvariable=comp_name_var, width=30).grid(row=1, column=1, padx=(10,0), pady=5)
+                
+                # File paths
+                files_frame = ttk.LabelFrame(comp_dialog, text="Comparison Files", padding=10)
+                files_frame.pack(fill=tk.X, padx=20, pady=(0,10))
+                
+                edf_path_var = tk.StringVar(value="")
+                scoring_path_var = tk.StringVar(value="")
+                
+                ttk.Label(files_frame, text="EDF file:").grid(row=0, column=0, sticky='w', pady=5)
+                ttk.Entry(files_frame, textvariable=edf_path_var, width=30).grid(row=0, column=1, padx=(10,0), pady=5)
+                ttk.Button(files_frame, text="Browse...", command=lambda: edf_path_var.set(
+                    filedialog.askopenfilename(title="Select EDF file", 
+                                               filetypes=[("EDF files", "*.edf"), ("All files", "*.*")])
+                )).grid(row=0, column=2, padx=(5,0), pady=5)
+                
+                ttk.Label(files_frame, text="Scoring (XLS):").grid(row=1, column=0, sticky='w', pady=5)
+                ttk.Entry(files_frame, textvariable=scoring_path_var, width=30).grid(row=1, column=1, padx=(10,0), pady=5)
+                ttk.Button(files_frame, text="Browse...", command=lambda: scoring_path_var.set(
+                    filedialog.askopenfilename(title="Select Scoring file", 
+                                               filetypes=[("Excel files", "*.xlsx;*.xls"), ("All files", "*.*")])
+                )).grid(row=1, column=2, padx=(5,0), pady=5)
+                
+                # Buttons
+                btn_frame = ttk.Frame(comp_dialog)
+                btn_frame.pack(pady=20)
+                
+                def _load_comparison():
+                    edf_path = edf_path_var.get()
+                    scoring_path = scoring_path_var.get()
+                    
+                    if not edf_path or not scoring_path:
+                        messagebox.showwarning("Warning", "Please select both EDF and Scoring files.")
+                        return
+                    
+                    try:
+                        # Get current channel to import only that one
+                        current_channel = selected_channel_var.get()
+                        
+                        # Load EDF with only the selected channel to save memory
+                        comp_raw = mne.io.read_raw_edf(edf_path, preload=False, verbose=False)
+                        
+                        # Check if channel exists in comparison file
+                        if current_channel not in comp_raw.ch_names:
+                            available = ", ".join(comp_raw.ch_names[:10])
+                            if len(comp_raw.ch_names) > 10:
+                                available += f"... ({len(comp_raw.ch_names)} total)"
+                            messagebox.showerror("Error", 
+                                               f"Channel '{current_channel}' not found in comparison EDF.\n\n"
+                                               f"Available channels: {available}")
+                            return
+                        
+                        # Load only the selected channel
+                        comp_raw_picked = comp_raw.copy().pick_channels([current_channel])
+                        comp_raw_picked.load_data()
+                        
+                        # Extract derivation for selected channel only
+                        comp_derivations = {}
+                        data, _ = comp_raw_picked[current_channel, :]
+                        comp_derivations[current_channel] = data[0] * 1e6  # Convert to µV
+                        
+                        # Load scoring
+                        comp_scoring = cesa_import_excel_scoring(scoring_path)
+                        if comp_scoring is None:
+                            messagebox.showerror("Error", "Failed to load scoring file.")
+                            return
+                        
+                        # Store comparison data
+                        self.fft_comparison_raw = comp_raw_picked
+                        self.fft_comparison_derivations = comp_derivations
+                        self.fft_comparison_scoring = comp_scoring
+                        self.fft_main_name = main_name_var.get()
+                        self.fft_comparison_name = comp_name_var.get()
+                        
+                        messagebox.showinfo("Success", 
+                                          f"Loaded comparison data:\n"
+                                          f"Channel: {current_channel}\n"
+                                          f"{len(comp_scoring)} epochs")
+                        comp_dialog.destroy()
+                        
+                        # Re-render with comparison
+                        render()
+                        
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to load comparison data:\n{str(e)}")
+                
+                ttk.Button(btn_frame, text="Load and Compare", command=_load_comparison).pack(side=tk.LEFT, padx=5)
+                ttk.Button(btn_frame, text="Cancel", command=comp_dialog.destroy).pack(side=tk.LEFT, padx=5)
+                
+                # Clear button
+                def _clear_comparison():
+                    self.fft_comparison_raw = None
+                    self.fft_comparison_derivations = {}
+                    self.fft_comparison_scoring = None
+                    messagebox.showinfo("Cleared", "Comparison data cleared.")
+                    comp_dialog.destroy()
+                    render()
+                
+                if self.fft_comparison_raw is not None:
+                    ttk.Button(btn_frame, text="Clear Comparison", command=_clear_comparison).pack(side=tk.LEFT, padx=5)
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open comparison dialog:\n{str(e)}")
+        
         # Configurer les boutons après la définition de render
         save_fig_btn.configure(command=lambda: _save_figure(fig))
         export_csv_btn.configure(command=_export_csv)
+        compare_btn.configure(command=_open_comparison_dialog)
 
     def _compute_stage_psd_fft_custom(self, signal, fs, scoring_df, epoch_len, stages, fmin, fmax, equalize_epochs, robust_stats, nperseg_sec):
         """Calcul PSD par stade avec FFT et taille de bin personnalisée."""
@@ -4823,6 +5189,1375 @@ Canaux: {', '.join(self.selected_channels)}
             logging.error(f"[ENTROPY] Failed to show entropy window: {e}")
             messagebox.showerror("Erreur", f"Erreur lors de l'affichage de l'entropie renormée : {str(e)}")
     
+    def _show_multiscale_entropy(self):
+        """Affiche l'analyse d'entropie multiscale avec retours détaillés."""
+        print("🔍 CHECKPOINT MSE-GUI: Entrée _show_multiscale_entropy")
+        try:
+            if not self.raw or not self.selected_channels:
+                print(
+                    "⚠️ CHECKPOINT MSE-GUI: raw loaded?",
+                    self.raw is not None,
+                    "channels",
+                    self.selected_channels,
+                )
+                messagebox.showwarning("Attention", "Chargez un fichier et sélectionnez au moins un canal")
+                return
+
+            from CESA.entropy import (
+                MultiscaleEntropyConfig,
+                compute_multiscale_entropy_from_raw,
+            )
+
+            default_cfg = MultiscaleEntropyConfig()
+
+            def create_tooltip(widget, text):
+                """Crée un tooltip pour expliquer les champs sensibles."""
+
+                def show_tooltip(event):
+                    tooltip = tk.Toplevel()
+                    tooltip.wm_overrideredirect(True)
+                    tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+                    label = tk.Label(
+                        tooltip,
+                        text=text,
+                        justify="left",
+                        background="#ffffe0",
+                        relief="solid",
+                        borderwidth=1,
+                        font=("Segoe UI", 9),
+                        wraplength=320,
+                    )
+                    label.pack()
+                    widget.tooltip = tooltip
+
+                def hide_tooltip(_event):
+                    if hasattr(widget, "tooltip") and widget.tooltip:
+                        widget.tooltip.destroy()
+                        widget.tooltip = None
+
+                widget.bind("<Enter>", show_tooltip)
+                widget.bind("<Leave>", hide_tooltip)
+
+            mse_window = tk.Toplevel(self.root)
+            mse_window.title("Entropie Multiscale (MSE) - EEG Analysis Studio")
+            mse_window.geometry("1200x900")
+            mse_window.transient(self.root)
+            mse_window.grab_set()
+            mse_window.update_idletasks()
+            x_pos = (mse_window.winfo_screenwidth() // 2) - 600
+            y_pos = (mse_window.winfo_screenheight() // 2) - 450
+            mse_window.geometry(f"1200x900+{x_pos}+{y_pos}")
+
+            main_frame = ttk.Frame(mse_window)
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            canvas = tk.Canvas(main_frame)
+            scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+            scrollable_frame = ttk.Frame(canvas)
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+            )
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+
+            title_label = ttk.Label(
+                scrollable_frame,
+                text="🔬 Analyse d'Entropie Multiscale (Costa et al.)",
+                font=("Segoe UI", 16, "bold"),
+            )
+            title_label.pack(pady=(0, 20))
+
+            info_frame = ttk.LabelFrame(scrollable_frame, text="Informations Générales", padding=10)
+            info_frame.pack(fill=tk.X, pady=(0, 10))
+            info_text = f"""
+Fichier: {getattr(self, 'current_file', 'Inconnu')}
+Fréquence d'échantillonnage: {self.sfreq} Hz
+Durée totale: {len(self.raw.times)/60:.1f} minutes
+Canaux sélectionnés: {', '.join(self.selected_channels)}
+"""
+            ttk.Label(info_frame, text=info_text.strip()).pack(anchor="w")
+
+            config_frame = ttk.LabelFrame(scrollable_frame, text="Configuration MSE", padding=10)
+            config_frame.pack(fill=tk.X, pady=(0, 10))
+            config_grid = ttk.Frame(config_frame)
+            config_grid.pack(fill=tk.X)
+
+            m_var = tk.IntVar(value=2)
+            r_var = tk.DoubleVar(value=0.2)
+            scales_var = tk.StringVar(value="1-20")
+            max_samples_var = tk.StringVar(
+                value=str(default_cfg.max_samples) if default_cfg.max_samples is not None else ""
+            )
+            return_intermediate_var = tk.BooleanVar(value=False)
+
+            ttk.Label(config_grid, text="Embedding (m):").grid(row=0, column=0, sticky="w", padx=(0, 10))
+            m_spin = ttk.Spinbox(config_grid, from_=1, to=5, textvariable=m_var, width=10)
+            m_spin.grid(row=0, column=1, sticky="w")
+
+            ttk.Label(config_grid, text="Tolérance (r):").grid(row=0, column=2, sticky="w", padx=(20, 10))
+            r_spin = ttk.Spinbox(config_grid, from_=0.05, to=0.5, increment=0.05, textvariable=r_var, width=10)
+            r_spin.grid(row=0, column=3, sticky="w")
+
+            ttk.Label(config_grid, text="Échelles (ex: 1-5,8,16):").grid(
+                row=1,
+                column=0,
+                sticky="w",
+                padx=(0, 10),
+                pady=(10, 0),
+            )
+            scales_entry = ttk.Entry(config_grid, textvariable=scales_var, width=25)
+            scales_entry.grid(row=1, column=1, sticky="w", pady=(10, 0))
+
+            ttk.Label(config_grid, text="Max samples (optionnel):").grid(
+                row=1,
+                column=2,
+                sticky="w",
+                padx=(20, 10),
+                pady=(10, 0),
+            )
+            max_samples_entry = ttk.Entry(config_grid, textvariable=max_samples_var, width=15)
+            max_samples_entry.grid(row=1, column=3, sticky="w", pady=(10, 0))
+
+            intermediate_check = ttk.Checkbutton(
+                config_grid,
+                text="Sauvegarder signaux coarse-grained",
+                variable=return_intermediate_var,
+            )
+            intermediate_check.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+            create_tooltip(
+                m_spin,
+                "Dimension d'embedding (m). Plus la valeur est élevée, plus les motifs à comparer sont longs.\n"
+                "m = 2 est la valeur classique pour EEG.",
+            )
+            create_tooltip(
+                r_spin,
+                "Tolérance relative appliquée à l'écart-type du canal (r × σ).\n"
+                "Des valeurs plus faibles rendent le critère de similitude plus strict.",
+            )
+            create_tooltip(
+                scales_entry,
+                "Définissez les échelles τ. Utilisez des listes séparées par des virgules\n"
+                "ou des plages 'début-fin'. Exemple: 1-5,8,16",
+            )
+            create_tooltip(
+                max_samples_entry,
+                "Limiter le nombre d'échantillons utilisés (par défaut 200 000).\n"
+                "Laissez 'auto' ou vide pour la valeur par défaut, tapez 'all' pour tout traiter.",
+            )
+            create_tooltip(
+                intermediate_check,
+                "Activez pour stocker les signaux coarse-grained dans le résultat.\n"
+                "Utile pour vérifier visuellement le lissage à chaque échelle.",
+            )
+
+            results_frame = ttk.LabelFrame(scrollable_frame, text="Résultats MSE", padding=10)
+            results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+            results_text = tk.Text(results_frame, height=18, wrap=tk.WORD, font=("Consolas", 10))
+            results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=results_text.yview)
+            results_text.configure(yscrollcommand=results_scrollbar.set)
+            results_text.pack(side="left", fill="both", expand=True)
+            results_scrollbar.pack(side="right", fill="y")
+
+            plot_frame = ttk.LabelFrame(scrollable_frame, text="Visualisation rapide", padding=10)
+            plot_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+            button_frame = ttk.Frame(scrollable_frame)
+            button_frame.pack(fill=tk.X, pady=(10, 0))
+
+            def parse_scales(raw_text: str) -> Sequence[int]:
+                """Analyse l'entrée utilisateur en liste d'échelles."""
+
+                scales: list[int] = []
+                cleaned = raw_text.replace(";", ",").split(",")
+                for chunk in cleaned:
+                    part = chunk.strip()
+                    if not part:
+                        continue
+                    if "-" in part:
+                        start_str, end_str = part.split("-", 1)
+                        start_val = int(start_str)
+                        end_val = int(end_str)
+                        if end_val < start_val:
+                            start_val, end_val = end_val, start_val
+                        scales.extend(range(start_val, end_val + 1))
+                    else:
+                        scales.append(int(part))
+                if not scales:
+                    raise ValueError("Veuillez définir au moins une échelle (ex: 1-5).")
+                return scales
+
+            def update_plot(entropy_dict: Dict[int, float]) -> None:
+                """Dessine le profil MSE dans le frame prévu."""
+
+                for child in plot_frame.winfo_children():
+                    child.destroy()
+
+                valid_points = [(scale, value) for scale, value in entropy_dict.items() if math.isfinite(value)]
+                if not valid_points:
+                    ttk.Label(plot_frame, text="Aucune valeur exploitable pour le tracé.").pack()
+                    return
+
+                scales_sorted = [pt[0] for pt in sorted(valid_points)]
+                values_sorted = [pt[1] for pt in sorted(valid_points)]
+                fig = Figure(figsize=(6, 3), dpi=100)
+                ax = fig.add_subplot(111)
+                ax.plot(scales_sorted, values_sorted, marker="o")
+                ax.set_xlabel("Échelle τ")
+                ax.set_ylabel("SampEn moyenne")
+                ax.set_title("Profil multiscale de l'entropie")
+                ax.grid(True, alpha=0.3)
+
+                canvas_plot = FigureCanvasTkAgg(fig, master=plot_frame)
+                canvas_plot.draw()
+                canvas_widget = canvas_plot.get_tk_widget()
+                canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+            def run_mse_analysis():
+                """Lance le calcul MSE avec des checkpoints lisibles."""
+
+                try:
+                    results_text.delete(1.0, tk.END)
+                    results_text.insert(tk.END, "🔄 CHECKPOINT: Lancement du pipeline MSE...\n")
+                    mse_window.update()
+
+                    scales = parse_scales(scales_var.get())
+                    max_samples_text = max_samples_var.get().strip().lower()
+                    if not max_samples_text or max_samples_text == "auto":
+                        max_samples_int = default_cfg.max_samples
+                    elif max_samples_text in {"none", "all", "full", "∞", "inf"}:
+                        max_samples_int = None
+                    else:
+                        max_samples_int = int(max_samples_text)
+
+                    config = MultiscaleEntropyConfig(
+                        m=int(m_var.get()),
+                        r=float(r_var.get()),
+                        scales=scales,
+                        max_samples=max_samples_int,
+                        return_intermediate=bool(return_intermediate_var.get()),
+                    )
+
+                    results_text.insert(
+                        tk.END,
+                        f"▶️ CHECKPOINT: Configuration validée (m={config.m}, r={config.r}, "
+                        f"τ={list(config.scales)})\n",
+                    )
+                    mse_window.update()
+
+                    mse_result = compute_multiscale_entropy_from_raw(self.raw, self.selected_channels, config)
+
+                    results_text.insert(tk.END, "✅ CHECKPOINT: Calcul terminé\n\n")
+                    results_text.insert(tk.END, "📊 RÉSUMÉ PRINCIPAL\n")
+                    results_text.insert(tk.END, f"{'='*60}\n")
+                    results_text.insert(
+                        tk.END,
+                        f"Canaux: {', '.join(self.selected_channels)}\nTotal samples: {mse_result.processed_samples}\n\n",
+                    )
+
+                    results_text.insert(tk.END, "Échelle | SampEn moyenne\n")
+                    results_text.insert(tk.END, f"{'-'*60}\n")
+                    for scale, value in mse_result.entropy_by_scale.items():
+                        results_text.insert(tk.END, f"{scale:>6} | {value:>10.4f}\n")
+                    results_text.insert(tk.END, "\n")
+
+                    results_text.insert(tk.END, "📌 DÉTAILS PAR ÉCHELLE ET CANAL\n")
+                    results_text.insert(tk.END, f"{'='*60}\n")
+                    for scale, detail in mse_result.sample_entropy_by_scale.items():
+                        results_text.insert(
+                            tk.END,
+                            f"τ={scale} → état={detail.get('status')} (n={detail.get('coarse_samples')})\n",
+                        )
+                        channel_details = detail.get("channel_details", {})
+                        for channel, ch_detail in channel_details.items():
+                            matches_m = ch_detail.get("matches_m", 0)
+                            matches_m1 = ch_detail.get("matches_m1", 0)
+                            samp_en = mse_result.channel_entropy.get(channel, {}).get(scale, math.nan)
+                            results_text.insert(
+                                tk.END,
+                                f"   • {channel}: SampEn={samp_en:.4f} | matches m={matches_m} | "
+                                f"matches m+1={matches_m1}\n",
+                            )
+                        results_text.insert(tk.END, "\n")
+
+                    results_text.insert(tk.END, "🧾 INTERPRÉTATION RAPIDE\n")
+                    results_text.insert(tk.END, f"{'='*60}\n")
+                    results_text.insert(
+                        tk.END,
+                        "• Profil décroissant = davantage de régularité aux grandes échelles.\n"
+                        "• Profil stable ou croissant = richesse multi-échelle.\n"
+                        "• SampEn → ∞ signifie absence de motifs répétées au seuil r.\n",
+                    )
+
+                    update_plot(mse_result.entropy_by_scale)
+                    print("✅ CHECKPOINT MSE-GUI: Résultats affichés")
+
+                except Exception as exc:
+                    results_text.delete(1.0, tk.END)
+                    results_text.insert(tk.END, f"❌ Erreur MSE: {exc}\n")
+                    print(f"❌ CHECKPOINT MSE-GUI: Erreur {exc}")
+
+            def export_mse_results():
+                """Sauvegarde le texte affiché."""
+
+                file_path = filedialog.asksaveasfilename(
+                    title="Exporter résultats MSE",
+                    defaultextension=".txt",
+                    filetypes=[("Fichier texte", "*.txt"), ("Tous les fichiers", "*.*")],
+                )
+                if not file_path:
+                    return
+                with open(file_path, "w", encoding="utf-8") as handle:
+                    handle.write(results_text.get(1.0, tk.END))
+                messagebox.showinfo("Export", f"Résultats sauvegardés dans {file_path}")
+
+            analyze_btn = ttk.Button(button_frame, text="🔬 Calculer MSE", command=run_mse_analysis)
+            analyze_btn.pack(side=tk.LEFT, padx=(0, 10))
+            export_btn = ttk.Button(button_frame, text="📁 Exporter Résultats", command=export_mse_results)
+            export_btn.pack(side=tk.LEFT, padx=(0, 10))
+            close_btn = ttk.Button(button_frame, text="Fermer", command=mse_window.destroy)
+            close_btn.pack(side=tk.RIGHT)
+
+            create_tooltip(
+                analyze_btn,
+                "Lance le pipeline : coarse-graining → SampEn pour chaque échelle.\n"
+                "Des checkpoints détaillent chaque étape dans la console et ici.",
+            )
+            create_tooltip(export_btn, "Sauvegarde le rapport textuel affiché ci-dessus.")
+            create_tooltip(close_btn, "Ferme la fenêtre d'entropie multiscale.")
+
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+            def _unbind_mousewheel(_event):
+                canvas.unbind_all("<MouseWheel>")
+
+            mse_window.bind("<Destroy>", _unbind_mousewheel)
+            print("✅ CHECKPOINT MSE-GUI: Fenêtre affichée")
+
+        except Exception as e:
+            print(f"❌ CHECKPOINT MSE-GUI: Erreur affichage fenêtre: {e}")
+            messagebox.showerror("Erreur", f"Impossible d'afficher l'entropie multiscale : {e}")
+
+    # =========================================================================
+    # Analyse de groupe (MSE / Entropie renormée)
+    # =========================================================================
+
+    def _show_group_analysis(self):
+        """Fenêtre d'analyse de groupe inspirée de la FFT en lot."""
+        print("🔍 CHECKPOINT GROUP: ouverture interface d'analyse de groupe")
+
+        if getattr(self, "group_analysis_window", None) is not None:
+            try:
+                if self.group_analysis_window.winfo_exists():  # type: ignore[attr-defined]
+                    self.group_analysis_window.lift()
+                    return
+            except Exception:
+                self.group_analysis_window = None  # type: ignore[attr-defined]
+
+        if not hasattr(self, "group_design_df"):
+            self.group_design_df = pd.DataFrame(
+                columns=["subject", "condition", "edf_path", "scoring_path", "stage"]
+            )
+        if not hasattr(self, "group_analysis_result"):
+            self.group_analysis_result = None
+        if not hasattr(self, "_group_analysis_running"):
+            self._group_analysis_running = False
+            self._group_analysis_thread = None
+
+        window = tk.Toplevel(self.root)
+        window.title("📚 Analyse de groupe – MSE / Entropie renormée")
+        window.geometry("1250x920")
+        window.configure(bg="#f8f9fa")
+        window.grab_set()
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", lambda: self._close_group_analysis_window(window))
+        self.group_analysis_window = window
+
+        style = ttk.Style(window)
+        style.configure("GAHeading.TLabel", font=("Segoe UI", 12, "bold"))
+        style.configure("GAInfo.TLabel", font=("Segoe UI", 9), foreground="#6c757d")
+
+        title_frame = ttk.Frame(window)
+        title_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
+        ttk.Label(title_frame, text="📚 Analyse de groupe avant/après", style="GAHeading.TLabel").pack(anchor="w")
+        ttk.Label(
+            title_frame,
+            text="Comparer plusieurs sujets (EDF) sur les profils MSE ou entropie renormée, par stade de sommeil.",
+            style="GAInfo.TLabel",
+        ).pack(anchor="w")
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+
+        design_tab = ttk.Frame(notebook)
+        params_tab = ttk.Frame(notebook)
+        results_tab = ttk.Frame(notebook)
+        notebook.add(design_tab, text="📋 Design & Données")
+        notebook.add(params_tab, text="⚙️ Paramètres")
+        notebook.add(results_tab, text="📊 Tests & Visualisation")
+
+        # -----------------------
+        # Onglet DESIGN
+        # -----------------------
+        self._build_group_design_tab(design_tab)
+
+        # -----------------------
+        # Onglet PARAMÈTRES
+        # -----------------------
+        self._build_group_params_tab(params_tab)
+
+        # -----------------------
+        # Onglet RÉSULTATS
+        # -----------------------
+        self._build_group_results_tab(results_tab)
+
+        self._group_refresh_design_tree()
+        self._group_toggle_metric_frames()
+
+    def _close_group_analysis_window(self, window: tk.Toplevel) -> None:
+        try:
+            window.destroy()
+        except Exception:
+            pass
+        finally:
+            self.group_analysis_window = None
+
+    # ------------------------------------------------------------------
+    # Onglet Design
+    # ------------------------------------------------------------------
+
+    def _build_group_design_tab(self, parent: ttk.Frame) -> None:
+        controls = ttk.Frame(parent)
+        controls.pack(fill=tk.X, padx=10, pady=(10, 0))
+
+        ttk.Button(
+            controls,
+            text="🔍 Scanner un dossier",
+            command=self._group_scan_directory,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            controls,
+            text="📥 Importer design CSV",
+            command=self._group_import_design_from_csv,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(
+            controls,
+            text="💾 Exporter design",
+            command=self._group_export_design_csv,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+
+        columns = ("subject", "condition", "edf", "scoring", "stage")
+        self.group_design_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12)
+        for col, label, width in zip(
+            columns,
+            ["Sujet", "Condition", "EDF", "Scoring", "Stades"],
+            [120, 100, 320, 260, 120],
+        ):
+            self.group_design_tree.heading(col, text=label)
+            self.group_design_tree.column(col, width=width, anchor="w")
+
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.group_design_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.group_design_tree.xview)
+        self.group_design_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        self.group_design_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+        instr = ttk.Label(
+            parent,
+            text="Colonnes attendues : subject, condition, edf_path, scoring_path (optionnel), stage (ex: W,N2 ou *).",
+            style="GAInfo.TLabel",
+        )
+        instr.pack(fill=tk.X, padx=12, pady=(6, 0))
+
+        group_ctrl = ttk.Frame(parent)
+        group_ctrl.pack(fill=tk.X, padx=10, pady=(4, 4))
+        ttk.Label(group_ctrl, text="Affecter la condition aux entrées sélectionnées:").pack(side=tk.LEFT)
+        ttk.Button(group_ctrl, text="Marquer AVANT", command=lambda: self._group_mark_selected_condition(self.ga_before_label_var.get() or "AVANT")).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(group_ctrl, text="Marquer APRÈS", command=lambda: self._group_mark_selected_condition(self.ga_after_label_var.get() or "APRÈS")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(group_ctrl, text="Effacer", command=lambda: self._group_mark_selected_condition("")).pack(side=tk.LEFT, padx=(6, 0))
+
+        manual = ttk.LabelFrame(parent, text="Ajout manuel rapide")
+        manual.pack(fill=tk.X, padx=10, pady=(10, 12))
+
+        self.ga_manual_subject_var = tk.StringVar()
+        self.ga_manual_condition_var = tk.StringVar(value="AVANT")
+        self.ga_manual_stage_var = tk.StringVar(value="*")
+        self.ga_manual_edf_var = tk.StringVar()
+        self.ga_manual_scoring_var = tk.StringVar()
+
+        row1 = ttk.Frame(manual)
+        row1.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row1, text="Sujet:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row1, textvariable=self.ga_manual_subject_var, width=18).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(row1, text="Condition:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row1, textvariable=self.ga_manual_condition_var, width=12).grid(row=0, column=3, padx=(4, 12))
+        ttk.Label(row1, text="Stades (*=tous):").grid(row=0, column=4, sticky="w")
+        ttk.Entry(row1, textvariable=self.ga_manual_stage_var, width=16).grid(row=0, column=5, padx=(4, 12))
+
+        row2 = ttk.Frame(manual)
+        row2.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row2, text="EDF:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row2, textvariable=self.ga_manual_edf_var, width=50).grid(row=0, column=1, padx=(4, 6), sticky="we")
+        ttk.Button(row2, text="Parcourir", command=lambda: self._group_browse_file_to_var(self.ga_manual_edf_var, [("EDF", "*.edf *.EDF *.edf+ *.EDF+")])).grid(row=0, column=2, padx=(0, 12))
+
+        ttk.Label(row2, text="Scoring (optionnel):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(row2, textvariable=self.ga_manual_scoring_var, width=50).grid(row=1, column=1, padx=(4, 6), pady=(6, 0), sticky="we")
+        ttk.Button(
+            row2,
+            text="Parcourir",
+            command=lambda: self._group_browse_file_to_var(self.ga_manual_scoring_var, [("Scoring", "*.edf *.EDF *.xls *.xlsx *.csv")]),
+        ).grid(row=1, column=2, padx=(0, 12), pady=(6, 0))
+
+        row3 = ttk.Frame(manual)
+        row3.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Button(row3, text="➕ Ajouter", command=self._group_add_manual_entry).pack(side=tk.LEFT)
+        ttk.Button(row3, text="🗑️ Supprimer sélection", command=self._group_remove_selected_entries).pack(side=tk.LEFT, padx=(10, 0))
+
+    # ------------------------------------------------------------------
+    # Onglet Paramètres
+    # ------------------------------------------------------------------
+
+    def _build_group_params_tab(self, parent: ttk.Frame) -> None:
+        metric_frame = ttk.LabelFrame(parent, text="Choix de la métrique")
+        metric_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        self.ga_metric_var = tk.StringVar(value="mse")
+        ttk.Radiobutton(metric_frame, text="Multiscale Entropy (MSE)", variable=self.ga_metric_var, value="mse", command=self._group_toggle_metric_frames).pack(side=tk.LEFT, padx=(4, 20))
+        ttk.Radiobutton(metric_frame, text="Entropie renormée", variable=self.ga_metric_var, value="renorm", command=self._group_toggle_metric_frames).pack(side=tk.LEFT)
+
+        stage_frame = ttk.LabelFrame(parent, text="Stades inclus")
+        stage_frame.pack(fill=tk.X, padx=10, pady=6)
+        self.ga_stage_vars: Dict[str, tk.BooleanVar] = {}
+        for idx, stage in enumerate(group_analysis.DEFAULT_STAGES):
+            var = tk.BooleanVar(value=(stage != "ALL"))
+            self.ga_stage_vars[stage] = var
+            ttk.Checkbutton(stage_frame, text=stage, variable=var).grid(row=idx // 4, column=idx % 4, sticky="w", padx=8, pady=2)
+
+        labels_frame = ttk.LabelFrame(parent, text="Conditions et canaux")
+        labels_frame.pack(fill=tk.X, padx=10, pady=6)
+        self.ga_before_label_var = tk.StringVar(value="AVANT")
+        self.ga_after_label_var = tk.StringVar(value="APRÈS")
+        self.ga_channels_var = tk.StringVar()
+        self.ga_epoch_var = tk.DoubleVar(value=30.0)
+
+        ttk.Label(labels_frame, text="Libellé AVANT:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        ttk.Entry(labels_frame, textvariable=self.ga_before_label_var, width=16).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(labels_frame, text="Libellé APRÈS:").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(labels_frame, textvariable=self.ga_after_label_var, width=16).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(labels_frame, text="Canaux sélectionnés:").grid(row=1, column=0, columnspan=2, sticky="w", padx=(8, 4), pady=(4, 2))
+        ttk.Entry(labels_frame, textvariable=self.ga_channels_var, width=50).grid(row=1, column=2, columnspan=2, sticky="we", pady=(4, 2))
+
+        ttk.Label(labels_frame, text="Durée d'époque (s):").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=(4, 6))
+        ttk.Entry(labels_frame, textvariable=self.ga_epoch_var, width=10).grid(row=2, column=1, sticky="w", pady=(4, 6))
+
+        channel_frame = ttk.LabelFrame(parent, text="Sélection des canaux (comme FFT en lot)")
+        channel_frame.pack(fill=tk.X, padx=10, pady=6)
+        control_row = ttk.Frame(channel_frame)
+        control_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Button(control_row, text="Charger depuis un EDF", command=self._group_load_channels_from_design).pack(side=tk.LEFT)
+        ttk.Button(control_row, text="EEG standard", command=lambda: self._group_select_channel_preset("standard")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(control_row, text="Tout sélectionner", command=lambda: self._group_select_channel_preset("all")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(control_row, text="Tout désélectionner", command=lambda: self._group_select_channel_preset("none")).pack(side=tk.LEFT, padx=(6, 0))
+
+        self.ga_channel_vars: Dict[str, tk.BooleanVar] = {}
+        checklist_frame = ttk.Frame(channel_frame)
+        checklist_frame.pack(fill=tk.X, padx=8, pady=(4, 8))
+        self._group_channel_columns = 4
+        self._group_available_channels: List[str] = []
+        self.group_channel_checklist_frame = checklist_frame
+        self._group_build_channel_checklist()
+
+
+        # Paramètres MSE
+        self.ga_mse_frame = ttk.LabelFrame(parent, text="Paramètres MSE")
+        self.ga_mse_frame.pack(fill=tk.X, padx=10, pady=6)
+        mse_cfg = group_analysis.MultiscaleEntropyConfig()
+        self.ga_m_var = tk.IntVar(value=mse_cfg.m)
+        self.ga_r_var = tk.DoubleVar(value=mse_cfg.r)
+        self.ga_scales_var = tk.StringVar(value="1-20")
+        default_max_samples = mse_cfg.max_samples if mse_cfg.max_samples else ""
+        self.ga_max_samples_var = tk.StringVar(value=str(default_max_samples))
+        self.ga_max_points_var = tk.StringVar(value=str(mse_cfg.max_pattern_length))
+
+        row = ttk.Frame(self.ga_mse_frame)
+        row.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row, text="m:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row, textvariable=self.ga_m_var, width=8).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(row, text="r:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row, textvariable=self.ga_r_var, width=8).grid(row=0, column=3, padx=(4, 12))
+        ttk.Label(row, text="Échelles (ex: 1-20,24,32):").grid(row=0, column=4, sticky="w")
+        ttk.Entry(row, textvariable=self.ga_scales_var, width=20).grid(row=0, column=5, padx=(4, 12))
+
+        row2 = ttk.Frame(self.ga_mse_frame)
+        row2.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(row2, text="Max samples:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row2, textvariable=self.ga_max_samples_var, width=12).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(row2, text="Max points SampEn:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row2, textvariable=self.ga_max_points_var, width=12).grid(row=0, column=3, padx=(4, 12))
+        ttk.Label(
+            self.ga_mse_frame,
+            text="Laissez \"auto\" pour la troncature par défaut (200k échantillons). \"all\" pour tout traiter.",
+            style="GAInfo.TLabel",
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+
+        # Paramètres Renorm
+        self.ga_renorm_frame = ttk.LabelFrame(parent, text="Paramètres Entropie renormée")
+        self.ga_renorm_frame.pack(fill=tk.X, padx=10, pady=6)
+        renorm_cfg = group_analysis.RenormalizedEntropyConfig()
+        self.ga_window_length_var = tk.DoubleVar(value=renorm_cfg.window_length)
+        self.ga_overlap_var = tk.DoubleVar(value=renorm_cfg.overlap)
+        self.ga_moment_order_var = tk.DoubleVar(value=renorm_cfg.moment_order)
+        self.ga_psi_name_var = tk.StringVar(value=renorm_cfg.psi_name)
+        self.ga_gamma_var = tk.DoubleVar(value=renorm_cfg.psi_params.get("gamma", 0.5))
+
+        row3 = ttk.Frame(self.ga_renorm_frame)
+        row3.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row3, text="Fenêtre (s):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row3, textvariable=self.ga_window_length_var, width=10).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(row3, text="Chevauchement (0-0.9):").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row3, textvariable=self.ga_overlap_var, width=10).grid(row=0, column=3, padx=(4, 12))
+        ttk.Label(row3, text="Ordre du moment:").grid(row=0, column=4, sticky="w")
+        ttk.Entry(row3, textvariable=self.ga_moment_order_var, width=10).grid(row=0, column=5, padx=(4, 12))
+
+        row4 = ttk.Frame(self.ga_renorm_frame)
+        row4.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(row4, text="Kernel ψ:").grid(row=0, column=0, sticky="w")
+        psi_combo = ttk.Combobox(row4, textvariable=self.ga_psi_name_var, values=("identity", "powerlaw", "log", "adaptive"), width=12, state="readonly")
+        psi_combo.grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(row4, text="Gamma (powerlaw):").grid(row=0, column=2, sticky="w")
+        ttk.Entry(row4, textvariable=self.ga_gamma_var, width=10).grid(row=0, column=3, padx=(4, 12))
+
+    # ------------------------------------------------------------------
+    # Onglet Résultats / Visualisation
+    # ------------------------------------------------------------------
+
+    def _build_group_results_tab(self, parent: ttk.Frame) -> None:
+        status_frame = ttk.LabelFrame(parent, text="Progression")
+        status_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+        self.ga_progress_var = tk.StringVar(value="Prêt")
+        ttk.Label(status_frame, textvariable=self.ga_progress_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(6, 2))
+        self.ga_progress = ttk.Progressbar(status_frame, mode="determinate", maximum=100)
+        self.ga_progress.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        controls = ttk.Frame(parent)
+        controls.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self.ga_run_button = ttk.Button(controls, text="🚀 Calculer", command=self._group_run_analysis)
+        self.ga_run_button.pack(side=tk.LEFT)
+        ttk.Button(controls, text="📤 Export profils", command=self._group_export_profiles).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(controls, text="📊 Export tests", command=self._group_export_stats).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(controls, text="🖼️ Export figure", command=self._group_export_plot).pack(side=tk.LEFT, padx=(8, 0))
+
+        tests_frame = ttk.LabelFrame(parent, text="Options statistiques")
+        tests_frame.pack(fill=tk.X, padx=10, pady=6)
+        self.ga_run_wilcoxon_var = tk.BooleanVar(value=True)
+        self.ga_run_permutation_var = tk.BooleanVar(value=True)
+        self.ga_run_bootstrap_var = tk.BooleanVar(value=False)
+        self.ga_run_robust_z_var = tk.BooleanVar(value=False)
+        self.ga_bh_var = tk.BooleanVar(value=True)
+        self.ga_nperm_var = tk.IntVar(value=5000)
+
+        ttk.Checkbutton(tests_frame, text="Wilcoxon apparié", variable=self.ga_run_wilcoxon_var).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(tests_frame, text="Permutation médiane", variable=self.ga_run_permutation_var).grid(row=0, column=1, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(tests_frame, text="Bootstrap IC", variable=self.ga_run_bootstrap_var).grid(row=0, column=2, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(tests_frame, text="Z robuste", variable=self.ga_run_robust_z_var).grid(row=0, column=3, sticky="w", padx=8, pady=4)
+        ttk.Label(tests_frame, text="n_perm:").grid(row=1, column=0, sticky="w", padx=(8, 4))
+        ttk.Entry(tests_frame, textvariable=self.ga_nperm_var, width=10).grid(row=1, column=1, sticky="w", padx=(0, 12))
+        ttk.Checkbutton(tests_frame, text="Correction Benjamini-Hochberg", variable=self.ga_bh_var).grid(row=1, column=2, columnspan=2, sticky="w", padx=8)
+
+        plot_frame = ttk.Frame(parent)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 6))
+        plot_controls = ttk.Frame(plot_frame)
+        plot_controls.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(plot_controls, text="Stade pour le graphique:").pack(side=tk.LEFT)
+        self.ga_plot_stage_var = tk.StringVar()
+        self.ga_plot_stage_combo = ttk.Combobox(plot_controls, textvariable=self.ga_plot_stage_var, values=group_analysis.DEFAULT_STAGES, width=12, state="readonly")
+        self.ga_plot_stage_combo.pack(side=tk.LEFT, padx=(6, 12))
+        self.ga_plot_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self._group_on_stage_change())
+
+        from matplotlib.figure import Figure  # import local pour éviter surcharge si inutilisé
+        self.ga_plot_figure = Figure(figsize=(6, 3), dpi=100)
+        self.ga_plot_canvas = FigureCanvasTkAgg(self.ga_plot_figure, master=plot_frame)
+        self.ga_plot_canvas.draw()
+        toolbar = NavigationToolbar2Tk(self.ga_plot_canvas, plot_frame)
+        toolbar.update()
+        self.ga_plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        summary_frame = ttk.LabelFrame(parent, text="Résumé / checkpoints")
+        summary_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.ga_results_text = tk.Text(summary_frame, height=14, wrap=tk.WORD, font=("Consolas", 10))
+        summary_scroll = ttk.Scrollbar(summary_frame, orient=tk.VERTICAL, command=self.ga_results_text.yview)
+        self.ga_results_text.configure(yscrollcommand=summary_scroll.set)
+        self.ga_results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        summary_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ------------------------------------------------------------------
+    # Actions sur le design
+    # ------------------------------------------------------------------
+
+    def _group_import_design_from_csv(self):
+        path = filedialog.askopenfilename(
+            title="Sélectionner le CSV de design",
+            filetypes=[("CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            entries = group_analysis.load_design_csv(path)
+            self.group_design_df = self._group_entries_to_dataframe(entries)
+            self._group_refresh_design_tree()
+            messagebox.showinfo("Design importé", f"{len(entries)} entrées chargées depuis {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Import échoué", str(exc))
+
+    def _group_export_design_csv(self):
+        if self.group_design_df.empty:
+            messagebox.showwarning("Export", "Aucune entrée à exporter.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exporter le design",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        self.group_design_df.to_csv(path, index=False, encoding="utf-8")
+        messagebox.showinfo("Export", f"Design sauvegardé dans {path}")
+
+    def _group_entries_to_dataframe(self, entries: Sequence[group_analysis.GroupDesignEntry]) -> pd.DataFrame:
+        rows = []
+        for entry in entries:
+            rows.append(
+                {
+                    "subject": entry.subject,
+                    "condition": entry.condition,
+                    "edf_path": str(entry.edf_path),
+                    "scoring_path": str(entry.scoring_path) if entry.scoring_path else "",
+                    "stage": ",".join(entry.stages) if entry.stages else "*",
+                }
+            )
+        return pd.DataFrame(rows, columns=["subject", "condition", "edf_path", "scoring_path", "stage"])
+
+    def _group_refresh_design_tree(self):
+        self.group_design_df = self.group_design_df.reset_index(drop=True)
+        for item in self.group_design_tree.get_children():
+            self.group_design_tree.delete(item)
+        for idx, row in self.group_design_df.iterrows():
+            self.group_design_tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    row.get("subject", ""),
+                    row.get("condition", ""),
+                    row.get("edf_path", ""),
+                    row.get("scoring_path", ""),
+                    row.get("stage", ""),
+                ),
+            )
+
+    def _group_add_manual_entry(self):
+        subject = self.ga_manual_subject_var.get().strip()
+        condition = self.ga_manual_condition_var.get().strip()
+        edf_path = self.ga_manual_edf_var.get().strip()
+        if not subject or not condition or not edf_path:
+            messagebox.showwarning("Entrée incomplète", "Sujet, condition et chemin EDF sont obligatoires.")
+            return
+        new_row = {
+            "subject": subject,
+            "condition": condition,
+            "edf_path": edf_path,
+            "scoring_path": self.ga_manual_scoring_var.get().strip(),
+            "stage": self.ga_manual_stage_var.get().strip() or "*",
+        }
+        self.group_design_df = pd.concat([self.group_design_df, pd.DataFrame([new_row])], ignore_index=True)
+        self._group_refresh_design_tree()
+        self.ga_manual_subject_var.set("")
+
+    def _group_remove_selected_entries(self):
+        selection = self.group_design_tree.selection()
+        if not selection:
+            return
+        indices = sorted(int(iid) for iid in selection)
+        self.group_design_df = self.group_design_df.drop(indices).reset_index(drop=True)
+        self._group_refresh_design_tree()
+
+    def _group_browse_file_to_var(self, var: tk.StringVar, filetypes):
+        path = filedialog.askopenfilename(filetypes=filetypes)
+        if path:
+            var.set(path)
+
+    def _group_build_channel_checklist(self, channel_list: Optional[Sequence[str]] = None):
+        frame = getattr(self, "group_channel_checklist_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        if channel_list is None or not list(channel_list):
+            channel_list = self._group_available_channels or [
+                "C3-M2",
+                "C4-M1",
+                "F3-M2",
+                "F4-M1",
+                "O1-M2",
+                "O2-M1",
+                "Fpz-Cz",
+                "Pz-Oz",
+                "E1-M2",
+                "E2-M1",
+                "EMG submental",
+            ]
+        uniq = []
+        for ch in channel_list:
+            if ch and ch not in uniq:
+                uniq.append(ch)
+        self._group_available_channels = uniq
+        self.ga_channel_vars = {}
+        for idx, ch in enumerate(uniq):
+            var = tk.BooleanVar(value=False)
+            self.ga_channel_vars[ch] = var
+            cb = ttk.Checkbutton(frame, text=ch, variable=var, command=self._group_update_channel_entry)
+            row = idx // self._group_channel_columns
+            col = idx % self._group_channel_columns
+            cb.grid(row=row, column=col, sticky="w", padx=4, pady=2)
+
+    def _group_update_channel_entry(self):
+        selected = [ch for ch, var in self.ga_channel_vars.items() if var.get()]
+        if selected:
+            self.ga_channels_var.set(",".join(selected))
+        else:
+            self.ga_channels_var.set("")
+
+    def _group_select_channel_preset(self, mode: str):
+        if not self.ga_channel_vars:
+            return
+        if mode == "standard":
+            target = {"C3-M2", "C4-M1", "F3-M2", "F4-M1", "O1-M2", "O2-M1"}
+        elif mode == "all":
+            target = set(self.ga_channel_vars.keys())
+        elif mode == "none":
+            target = set()
+        else:
+            target = set()
+        for ch, var in self.ga_channel_vars.items():
+            var.set(ch in target)
+        self._group_update_channel_entry()
+
+    def _group_load_channels_from_design(self):
+        if self.group_design_df.empty:
+            messagebox.showwarning("Canaux", "Ajoutez d'abord des fichiers dans le design.")
+            return
+        for _, row in self.group_design_df.iterrows():
+            edf_path = Path(str(row.get("edf_path", "")).strip())
+            if edf_path.exists():
+                try:
+                    raw = mne.io.read_raw_edf(str(edf_path), preload=False, verbose="ERROR")  # type: ignore[arg-type]
+                    channels = list(raw.ch_names)
+                    raw.close()
+                except Exception as exc:
+                    print(f"⚠️ Impossible de charger {edf_path}: {exc}")
+                    continue
+                if channels:
+                    self._group_build_channel_checklist(channels)
+                    self._group_update_channel_entry()
+                    messagebox.showinfo("Canaux", f"{len(channels)} canaux chargés depuis {edf_path.name}.")
+                    return
+        messagebox.showwarning("Canaux", "Impossible de détecter les canaux (EDF introuvable ou illisible).")
+
+    def _group_scan_directory(self):
+        directory = filedialog.askdirectory(title="Sélectionner le dossier contenant les EDF + scoring")
+        if not directory:
+            return
+
+        directory_path = Path(directory)
+        if not directory_path.exists():
+            messagebox.showwarning("Scan dossier", "Dossier invalide.")
+            return
+
+        edf_entries = self._group_collect_edf_entries(directory_path)
+        if not edf_entries:
+            messagebox.showinfo("Scan dossier", "Aucun fichier EDF détecté.")
+            return
+
+        df_new = pd.DataFrame(edf_entries, columns=["subject", "condition", "edf_path", "scoring_path", "stage"])
+        self.group_design_df = pd.concat([self.group_design_df, df_new], ignore_index=True)
+        self._group_refresh_design_tree()
+        messagebox.showinfo("Scan dossier", f"{len(edf_entries)} fichiers ajoutés depuis {directory_path}")
+
+    def _group_collect_edf_entries(self, base_dir: Path) -> List[Dict[str, str]]:
+        excel_map = self._group_build_excel_map(base_dir)
+        edf_list = self._group_scan_edf_files(base_dir)
+        entries: List[Dict[str, str]] = []
+        before_label = self.ga_before_label_var.get() or "AVANT"
+        after_label = self.ga_after_label_var.get() or "APRÈS"
+
+        for edf_path in edf_list:
+            name = Path(edf_path).stem
+            normalized = self._normalize_filename_for_association(name)
+            scoring_path = excel_map.get(normalized, "")
+            condition = self._group_guess_condition(name, before_label, after_label)
+            subject = normalized or name.upper()
+            entries.append(
+                {
+                    "subject": subject,
+                    "condition": condition,
+                    "edf_path": edf_path,
+                    "scoring_path": scoring_path,
+                    "stage": "*",
+                }
+            )
+        return entries
+
+    def _group_scan_edf_files(self, base_dir: Path) -> List[str]:
+        matches: List[str] = []
+        extensions = (".edf", ".EDF", ".edf+", ".EDF+")
+        for root, _dirs, files in os.walk(base_dir):
+            for file in files:
+                if file.endswith(extensions):
+                    matches.append(str(Path(root) / file))
+        return matches
+
+    def _group_build_excel_map(self, base_dir: Path) -> Dict[str, str]:
+        excel_map: Dict[str, str] = {}
+        excel_ext = (".xlsx", ".xls")
+        for root, _dirs, files in os.walk(base_dir):
+            for file in files:
+                if file.endswith(excel_ext):
+                    stem = Path(file).stem
+                    key = self._normalize_filename_for_association(stem)
+                    excel_map[key] = str(Path(root) / file)
+        return excel_map
+
+    def _group_guess_condition(self, filename_stem: str, before_label: str, after_label: str) -> str:
+        name_up = filename_stem.upper()
+        if any(tag in name_up for tag in ("_AV", " AV", "-AV", "AVANT")):
+            return before_label
+        if any(tag in name_up for tag in ("_AP", " AP", "-AP", "APRES", "APRÈS", "AFTER")):
+            return after_label
+        # défaut : vide → l'utilisateur pourra marquer via les boutons
+        return ""
+
+    def _group_mark_selected_condition(self, condition: str):
+        selection = self.group_design_tree.selection()
+        if not selection:
+            return
+        for iid in selection:
+            idx = int(iid)
+            if 0 <= idx < len(self.group_design_df):
+                self.group_design_df.at[idx, "condition"] = condition
+        self._group_refresh_design_tree()
+
+    # ------------------------------------------------------------------
+    # Exécution de l'analyse
+    # ------------------------------------------------------------------
+
+    def _group_run_analysis(self):
+        if self.group_design_df.empty:
+            messagebox.showwarning("Analyse", "Ajoutez au moins une entrée dans le design.")
+            return
+
+        if getattr(self, "_group_analysis_running", False):
+            messagebox.showinfo("Analyse", "Une analyse de groupe est déjà en cours.")
+            return
+
+        try:
+            entries = self._group_build_entries()
+            analysis_cfg = self._group_build_analysis_config()
+            stats_cfg = self._group_build_stats_config()
+        except Exception as exc:
+            messagebox.showerror("Configuration invalide", str(exc))
+            return
+
+        self._group_analysis_running = True
+        if hasattr(self, "ga_run_button"):
+            self.ga_run_button.config(state=tk.DISABLED)
+        self._group_set_progress("Préparation…", 5)
+
+        worker = threading.Thread(
+            target=self._group_execute_analysis,
+            args=(entries, analysis_cfg, stats_cfg),
+            daemon=True,
+            name="GroupAnalysisWorker",
+        )
+        self._group_analysis_thread = worker
+        worker.start()
+
+    def _group_execute_analysis(self, entries, analysis_cfg, stats_cfg):
+        try:
+            self._group_progress_callback("Calcul des profils…", 0.05)
+            result = group_analysis.compute_group_profiles(
+                entries,
+                analysis_cfg,
+                progress_cb=self._group_progress_callback,
+            )
+            self._group_progress_callback("Tests statistiques…", 0.8)
+            stats = group_analysis.run_statistical_tests(result, stats_cfg)
+        except Exception as exc:
+            try:
+                self.root.after(0, lambda: self._group_analysis_failed(exc))
+            except Exception:
+                pass
+        else:
+            try:
+                self.root.after(0, lambda: self._group_analysis_completed(result, stats))
+            except Exception:
+                pass
+        finally:
+            self._group_analysis_running = False
+            self._group_analysis_thread = None
+
+    def _group_analysis_completed(self, result, stats: pd.DataFrame) -> None:
+        self.group_analysis_result = result
+        self._group_set_progress("Prêt", 100)
+        self._group_update_summary(stats)
+        self._group_update_plot_stage_options()
+        if hasattr(self, "ga_run_button"):
+            self.ga_run_button.config(state=tk.NORMAL)
+        try:
+            messagebox.showinfo("Analyse terminée", "Les profils ont été calculés avec succès.")
+        except Exception:
+            pass
+
+    def _group_analysis_failed(self, exc: Exception) -> None:
+        self._group_set_progress("Échec", 0)
+        if hasattr(self, "ga_run_button"):
+            self.ga_run_button.config(state=tk.NORMAL)
+        try:
+            messagebox.showerror("Analyse échouée", str(exc))
+        except Exception:
+            pass
+
+    def _group_progress_callback(self, message: str, ratio: float) -> None:
+        def _update():
+            self._group_set_progress(message, ratio * 100.0)
+
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
+
+    def _group_set_progress(self, message: str, value: float) -> None:
+        try:
+            self.ga_progress_var.set(message)
+            if hasattr(self, "ga_progress"):
+                self.ga_progress["value"] = max(0.0, min(100.0, value))
+                self.ga_progress.update_idletasks()
+        except Exception:
+            pass
+
+    def _group_build_entries(self) -> List[group_analysis.GroupDesignEntry]:
+        entries: List[group_analysis.GroupDesignEntry] = []
+        for _, row in self.group_design_df.iterrows():
+            subject = str(row.get("subject", "")).strip()
+            condition = str(row.get("condition", "")).strip()
+            edf_path = Path(str(row.get("edf_path", "")).strip())
+            scoring_path_str = str(row.get("scoring_path", "")).strip()
+            stage_field = str(row.get("stage", "")).strip()
+            stages = tuple(group_analysis.parse_stage_field(stage_field)) if stage_field and stage_field not in {"*", ""} else None
+            scoring_path = Path(scoring_path_str) if scoring_path_str else None
+            entries.append(
+                group_analysis.GroupDesignEntry(
+                    subject=subject,
+                    condition=condition,
+                    edf_path=edf_path,
+                    scoring_path=scoring_path,
+                    stages=stages,
+                )
+            )
+        return entries
+
+    def _group_selected_stages(self) -> List[str]:
+        stages = [stage for stage, var in self.ga_stage_vars.items() if var.get()]
+        return stages or list(group_analysis.DEFAULT_STAGES)
+
+    def _group_parse_channels(self) -> Optional[List[str]]:
+        selected = [ch for ch, var in self.ga_channel_vars.items() if var.get()]
+        if selected:
+            return selected
+        raw = self.ga_channels_var.get().strip()
+        if not raw:
+            return None
+        channels = [ch.strip() for ch in raw.replace(";", ",").split(",") if ch.strip()]
+        return channels or None
+
+    def _group_parse_scales(self, text: str) -> List[int]:
+        raw = text.replace(";", ",").split(",")
+        scales: List[int] = []
+        for chunk in raw:
+            part = chunk.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_str, end_str = part.split("-", 1)
+                start = int(start_str)
+                end = int(end_str)
+                if start > end:
+                    start, end = end, start
+                scales.extend(range(start, end + 1))
+            else:
+                scales.append(int(part))
+        unique = sorted({max(1, int(val)) for val in scales})
+        return unique or list(range(1, 21))
+
+    def _group_parse_optional_int(self, text: str, default: Optional[int]) -> Optional[int]:
+        raw = text.strip().lower()
+        if not raw or raw == "auto":
+            return default
+        if raw in {"all", "none", "full", "∞", "inf"}:
+            return None
+        return int(raw)
+
+    def _group_build_analysis_config(self) -> group_analysis.GroupAnalysisConfig:
+        channels = self._group_parse_channels()
+        stages = self._group_selected_stages()
+        metric = self.ga_metric_var.get().strip().lower()
+
+        design_conditions: List[str] = []
+        if hasattr(self, "group_design_df") and "condition" in self.group_design_df.columns:
+            for raw_cond in self.group_design_df["condition"].tolist():
+                cond = str(raw_cond).strip()
+                if cond and cond not in design_conditions:
+                    design_conditions.append(cond)
+
+        before_display = (self.ga_before_label_var.get() or "").strip()
+        after_display = (self.ga_after_label_var.get() or "").strip()
+
+        def _normalize(label: str) -> str:
+            return group_analysis.normalise_condition_label(label)
+
+        def _match_design(label: str) -> Optional[str]:
+            if not label:
+                return None
+            wanted = _normalize(label)
+            if not wanted:
+                return None
+            for cond in design_conditions:
+                if _normalize(cond) == wanted:
+                    return cond
+            return None
+
+        def _fallback_condition(index: int, default: str) -> str:
+            if design_conditions:
+                idx = max(0, min(index, len(design_conditions) - 1))
+                return design_conditions[idx]
+            return default
+
+        if not before_display:
+            before_display = _fallback_condition(0, "AVANT")
+            self.ga_before_label_var.set(before_display)
+
+        if not after_display or _normalize(after_display) == _normalize(before_display):
+            default_idx = 1 if len(design_conditions) > 1 else 0
+            after_display = _fallback_condition(default_idx, "APRÈS")
+            self.ga_after_label_var.set(after_display)
+
+        before_label = _match_design(before_display)
+        if not before_label:
+            before_label = _fallback_condition(0, "AVANT")
+
+        after_label = _match_design(after_display)
+        if not after_label or after_label == before_label:
+            after_label = None
+            for cond in design_conditions:
+                if cond != before_label:
+                    after_label = cond
+                    break
+            if after_label is None:
+                after_label = "APRÈS" if not design_conditions else before_label
+
+        channels_display = self.ga_channels_var.get().strip()
+
+        mse_cfg = group_analysis.MultiscaleEntropyConfig(
+            m=int(self.ga_m_var.get()),
+            r=float(self.ga_r_var.get()),
+            scales=self._group_parse_scales(self.ga_scales_var.get()),
+            max_samples=self._group_parse_optional_int(self.ga_max_samples_var.get(), group_analysis.MultiscaleEntropyConfig().max_samples),
+            max_pattern_length=max(self._group_parse_optional_int(self.ga_max_points_var.get(), 5000) or 5000, 32),
+        )
+
+        renorm_cfg = group_analysis.RenormalizedEntropyConfig(
+            window_length=float(self.ga_window_length_var.get()),
+            overlap=float(self.ga_overlap_var.get()),
+            moment_order=float(self.ga_moment_order_var.get()),
+            psi_name=self.ga_psi_name_var.get(),
+            psi_params={"gamma": float(self.ga_gamma_var.get()), "epsilon": 1e-12},
+        )
+
+        return group_analysis.GroupAnalysisConfig(
+            metric=metric,
+            before_label=before_label,
+            after_label=after_label,
+            display_before_label=before_display,
+            display_after_label=after_display,
+            display_channels=channels_display or (", ".join(channels) if channels else None),
+            stages=stages,
+            epoch_seconds=float(self.ga_epoch_var.get()),
+            channel_names=channels,
+            mse_config=mse_cfg,
+            renorm_config=renorm_cfg,
+        )
+
+    def _group_resolve_condition_labels(self) -> Tuple[str, str]:
+        before = (self.ga_before_label_var.get() or "").strip() or "AVANT"
+        after = (self.ga_after_label_var.get() or "").strip() or "APRÈS"
+
+        if self.group_analysis_result is not None:
+            df = self.group_analysis_result.profiles
+            available = [str(cond) for cond in sorted(df["condition"].dropna().unique())]
+            if available:
+                if before not in available:
+                    before = available[0]
+                if after not in available or after == before:
+                    fallback = next((c for c in available if c != before), available[0])
+                    after = fallback
+        return before, after
+
+    def _group_build_stats_config(self) -> group_analysis.StatsConfig:
+        return group_analysis.StatsConfig(
+            run_wilcoxon=self.ga_run_wilcoxon_var.get(),
+            run_permutation=self.ga_run_permutation_var.get(),
+            run_bootstrap=self.ga_run_bootstrap_var.get(),
+            run_robust_z=self.ga_run_robust_z_var.get(),
+            n_permutations=int(max(100, self.ga_nperm_var.get())),
+            apply_bh=self.ga_bh_var.get(),
+        )
+
+    def _group_update_summary(self, stats: pd.DataFrame) -> None:
+        if not hasattr(self, "ga_results_text"):
+            return
+        self.ga_results_text.delete("1.0", tk.END)
+        if not self.group_analysis_result:
+            return
+        result = self.group_analysis_result
+        df = result.profiles
+        subjects = sorted(df["subject"].unique())
+        stages = result.available_stages()
+        self.ga_results_text.insert(tk.END, f"✅ Profils calculés pour {len(subjects)} sujets et {len(stages)} stades.\n")
+        self.ga_results_text.insert(tk.END, f"   Conditions : {', '.join(sorted(df['condition'].unique()))}\n")
+        self.ga_results_text.insert(tk.END, f"   Total lignes : {len(df):,}\n\n")
+
+        if stats is not None and not stats.empty:
+            best = stats.dropna(subset=["p_value"]).sort_values("p_value").head(10)
+            self.ga_results_text.insert(tk.END, "📊 Top p-values (corrigées si BH actif):\n")
+            for _, row in best.iterrows():
+                p_val = row.get("p_value")
+                p_adj = row.get("p_adj", np.nan)
+                line = f" - {row['test']} | {row['stage']} τ={row['tau']:.0f} → p={p_val:.4g}"
+                if not np.isnan(p_adj):
+                    line += f" (p_adj={p_adj:.4g})"
+                line += f" | n={int(row['n_subjects'])}\n"
+                self.ga_results_text.insert(tk.END, line)
+            self.ga_results_text.insert(tk.END, "\n")
+
+        summary = result.subject_summary
+        if summary is not None and not summary.empty:
+            self.ga_results_text.insert(tk.END, "📈 Moyenne AUC par condition/stade:\n")
+            agg = summary.groupby(["condition", "stage"])["auc"].mean().reset_index()
+            for _, row in agg.iterrows():
+                self.ga_results_text.insert(
+                    tk.END,
+                    f"   {row['condition']} – {row['stage']}: AUC moyenne = {row['auc']:.4f}\n",
+                )
+
+    def _group_update_plot_stage_options(self):
+        if not self.group_analysis_result:
+            return
+        stages = self.group_analysis_result.available_stages()
+        self.ga_plot_stage_combo["values"] = stages
+        if stages:
+            self.ga_plot_stage_var.set(stages[0])
+            self._group_render_plot(stages[0])
+
+    def _group_on_stage_change(self):
+        stage = self.ga_plot_stage_var.get()
+        if stage and self.group_analysis_result:
+            self._group_render_plot(stage)
+
+    def _group_render_plot(self, stage: str):
+        if not self.group_analysis_result:
+            return
+        self.ga_plot_figure.clf()
+        ax = self.ga_plot_figure.add_subplot(111)
+        before_label, after_label = self._group_resolve_condition_labels()
+        group_analysis.plot_stage_profiles(
+            self.group_analysis_result,
+            stage,
+            before_label=before_label,
+            after_label=after_label,
+            ax=ax,
+        )
+        self.ga_plot_figure.tight_layout()
+        self.ga_plot_canvas.draw()
+
+    def _group_toggle_metric_frames(self):
+        metric = self.ga_metric_var.get()
+        if metric == "renorm":
+            self.ga_mse_frame.pack_forget()
+            self.ga_renorm_frame.pack(fill=tk.X, padx=10, pady=6)
+        else:
+            self.ga_renorm_frame.pack_forget()
+            self.ga_mse_frame.pack(fill=tk.X, padx=10, pady=6)
+
+    # ------------------------------------------------------------------
+    # Export résultats
+    # ------------------------------------------------------------------
+
+    def _group_export_profiles(self):
+        if not self.group_analysis_result:
+            messagebox.showwarning("Export", "Exécutez d'abord l'analyse.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exporter les profils",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        group_analysis.export_profiles_to_csv(self.group_analysis_result, path)
+        messagebox.showinfo("Export profils", f"Profils sauvegardés dans {path}")
+
+    def _group_export_stats(self):
+        if not self.group_analysis_result:
+            messagebox.showwarning("Export", "Exécutez d'abord l'analyse.")
+            return
+        if self.group_analysis_result.stats is None or self.group_analysis_result.stats.empty:
+            messagebox.showwarning("Export", "Aucun test statistique disponible.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exporter les tests",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        group_analysis.export_stats_to_csv(self.group_analysis_result, path)
+        messagebox.showinfo("Export tests", f"Table des tests sauvegardée dans {path}")
+
+    def _group_export_plot(self):
+        if not self.group_analysis_result:
+            messagebox.showwarning("Export", "Aucun graphique à exporter.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exporter le graphique",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")],
+        )
+        if not path:
+            return
+        self.ga_plot_figure.savefig(path, dpi=200, bbox_inches="tight")
+        messagebox.showinfo("Export figure", f"Graphique sauvegardé dans {path}")
+
     def _setup_user_assistant(self):
         """Initialise l'assistant utilisateur."""
         try:
@@ -5916,6 +7651,15 @@ Licence : MIT
         except Exception:
             pass
     
+    def _shutdown_bridge_executor(self) -> None:
+        if self._bridge_executor is None:
+            return
+        try:
+            self._bridge_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self._bridge_executor = None
+
     def _update_loading_message(self, message):
         """Met à jour le message de chargement."""
         if hasattr(self, 'loading_window') and self.loading_window.winfo_exists():
@@ -10016,6 +11760,8 @@ Date: 2025-09-09
         bridge_result,
         n_channels: int,
         n_points: int,
+        baseline_ms: float = 0.0,
+        filter_ms: float = 0.0,
     ) -> None:
         if self._telemetry_path is None:
             return
@@ -10040,6 +11786,8 @@ Date: 2025-09-09
                             "bytes_read",
                             "channels",
                             "points",
+                            "baseline_ms",
+                            "filter_ms",
                         ]
                     )
                 writer.writerow(
@@ -10054,6 +11802,8 @@ Date: 2025-09-09
                         bytes_read,
                         n_channels,
                         n_points,
+                        f"{baseline_ms:.3f}",
+                        f"{filter_ms:.3f}",
                     ]
                 )
         except Exception:
@@ -10461,16 +12211,20 @@ Date: 2025-09-09
         before_row.pack(fill=tk.X, pady=2)
         ttk.Label(before_row, text="Dossier EDF AVANT:").pack(side=tk.LEFT)
         self.before_dir_var = tk.StringVar()
-        ttk.Entry(before_row, textvariable=self.before_dir_var, width=50).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
-        ttk.Button(before_row, text="Parcourir", command=lambda: self._browse_dir_to_var(self.before_dir_var, "Sélectionner dossier EDF AVANT")).pack(side=tk.LEFT)
+        self.spag_before_entry = ttk.Entry(before_row, textvariable=self.before_dir_var, width=50)
+        self.spag_before_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        self.spag_before_btn = ttk.Button(before_row, text="Parcourir", command=lambda: self._browse_dir_to_var(self.before_dir_var, "Sélectionner dossier EDF AVANT"))
+        self.spag_before_btn.pack(side=tk.LEFT)
 
         # Dossier APRÈS
         after_row = ttk.Frame(self.spaghetti_frame)
         after_row.pack(fill=tk.X, pady=2)
         ttk.Label(after_row, text="Dossier EDF APRÈS:").pack(side=tk.LEFT)
         self.after_dir_var = tk.StringVar()
-        ttk.Entry(after_row, textvariable=self.after_dir_var, width=50).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
-        ttk.Button(after_row, text="Parcourir", command=lambda: self._browse_dir_to_var(self.after_dir_var, "Sélectionner dossier EDF APRÈS")).pack(side=tk.LEFT)
+        self.spag_after_entry = ttk.Entry(after_row, textvariable=self.after_dir_var, width=50)
+        self.spag_after_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        self.spag_after_btn = ttk.Button(after_row, text="Parcourir", command=lambda: self._browse_dir_to_var(self.after_dir_var, "Sélectionner dossier EDF APRÈS"))
+        self.spag_after_btn.pack(side=tk.LEFT)
 
         # (Supprimé) Sélecteurs rapides de bandes et stades — on garde uniquement la table bande→stades
 
@@ -10512,7 +12266,7 @@ Date: 2025-09-09
             ttk.Label(mapping_table, text=band, width=12, anchor='w').grid(row=i, column=0, sticky='w', padx=(0,6), pady=2)
             self.spag_band_stage_vars[band] = {}
             for j, (st_code, _st_label) in enumerate(stage_cols, start=1):
-                var = tk.BooleanVar(value=True)
+                var = tk.BooleanVar(value=False)
                 self.spag_band_stage_vars[band][st_code] = var
                 cb = ttk.Checkbutton(mapping_table, variable=var)
                 cb.grid(row=i, column=j, sticky='n', pady=2)
@@ -10521,6 +12275,150 @@ Date: 2025-09-09
             row_ctrl.grid(row=i, column=6, sticky='n')
             ttk.Button(row_ctrl, text="✓", width=2, command=lambda b=band: self._toggle_band_stage_row(b, True)).pack(side=tk.LEFT, padx=(0,2))
             ttk.Button(row_ctrl, text="–", width=2, command=lambda b=band: self._toggle_band_stage_row(b, False)).pack(side=tk.LEFT, padx=(2,0))
+
+        # Saisie avancée: combinaisons par canal
+        adv_row = ttk.Frame(self.spaghetti_frame)
+        adv_row.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(adv_row, text="Combinaisons par canal (ex: C3:Delta_R; F3:Theta_N3)").pack(side=tk.LEFT)
+        self.spag_combo_spec_var = tk.StringVar()
+        self.spag_combo_entry = ttk.Entry(adv_row, textvariable=self.spag_combo_spec_var, width=60)
+        self.spag_combo_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+
+        # Sélecteur visuel des combinaisons
+        combos_frame = ttk.LabelFrame(self.spaghetti_frame, text="Sélection combinaisons Canal × Bande × Stade")
+        combos_frame.pack(fill=tk.X, padx=8, pady=(6, 6))
+        row1 = ttk.Frame(combos_frame)
+        row1.pack(fill=tk.X, pady=4)
+        ttk.Label(row1, text="Canal:").pack(side=tk.LEFT)
+        # Liste de canaux candidates
+        channel_choices = []
+        try:
+            if hasattr(self, 'batch_config') and self.batch_config.get('selected_channels'):
+                channel_choices = list(self.batch_config.get('selected_channels'))
+        except Exception:
+            channel_choices = []
+        if not channel_choices:
+            channel_choices = ["C3", "C4", "F3", "F4", "O1", "O2"]
+        self.spag_combo_ch = ttk.Combobox(row1, values=channel_choices, width=10, state='readonly')
+        self.spag_combo_ch.pack(side=tk.LEFT, padx=(6,10))
+        try:
+            self.spag_combo_ch.set("")
+        except Exception:
+            pass
+
+        ttk.Label(row1, text="Bande:").pack(side=tk.LEFT)
+        band_choices = ["LowDelta","Delta","Theta","Alpha","Sigma","Beta","Gamma"]
+        self.spag_combo_band = ttk.Combobox(row1, values=band_choices, width=10, state='readonly')
+        self.spag_combo_band.pack(side=tk.LEFT, padx=(6,10))
+        try:
+            self.spag_combo_band.set("")
+        except Exception:
+            pass
+
+        ttk.Label(row1, text="Stade:").pack(side=tk.LEFT)
+        stage_choices = ["W","N1","N2","N3","R"]
+        self.spag_combo_stage = ttk.Combobox(row1, values=stage_choices, width=8, state='readonly')
+        self.spag_combo_stage.pack(side=tk.LEFT, padx=(6,10))
+        try:
+            self.spag_combo_stage.set("")
+        except Exception:
+            pass
+
+        ttk.Button(row1, text="Ajouter", command=self._add_spag_combo).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(combos_frame)
+        row2.pack(fill=tk.BOTH, pady=(4,2))
+        self.spag_combo_tree = ttk.Treeview(row2, columns=("Channel","Band","Stage"), show='headings', height=4)
+        self.spag_combo_tree.heading("Channel", text="Canal")
+        self.spag_combo_tree.heading("Band", text="Bande")
+        self.spag_combo_tree.heading("Stage", text="Stade")
+        self.spag_combo_tree.column("Channel", width=80)
+        self.spag_combo_tree.column("Band", width=90)
+        self.spag_combo_tree.column("Stage", width=80)
+        self.spag_combo_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        btns = ttk.Frame(row2)
+        btns.pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Supprimer", command=self._remove_spag_combo).pack(fill=tk.X, pady=(0,4))
+        ttk.Button(btns, text="Vider", command=self._clear_spag_combos).pack(fill=tk.X)
+
+        self.spag_combo_list = []
+
+        # Clustering des sujets pour les spaghetti
+        clustering_frame = ttk.LabelFrame(self.spaghetti_frame, text="Clustering des sujets (Spaghetti)")
+        clustering_frame.pack(fill=tk.BOTH, padx=8, pady=(0, 8))
+
+        pool_column = ttk.Frame(clustering_frame)
+        pool_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8), pady=6)
+        ttk.Label(pool_column, text="Sujets disponibles").pack(anchor='w')
+        pool_list_frame = ttk.Frame(pool_column)
+        pool_list_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 4))
+        self.spag_subject_listbox = tk.Listbox(pool_list_frame, selectmode=tk.EXTENDED, height=7, exportselection=False)
+        pool_scroll = ttk.Scrollbar(pool_list_frame, orient=tk.VERTICAL, command=self.spag_subject_listbox.yview)
+        self.spag_subject_listbox.configure(yscrollcommand=pool_scroll.set)
+        self.spag_subject_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pool_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        ttk.Button(pool_column, text="Actualiser", command=self._refresh_spag_subject_pool).pack(anchor='e')
+
+        control_column = ttk.Frame(clustering_frame)
+        control_column.pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=6)
+        ttk.Button(control_column, text="Ajouter → A", command=lambda: self._assign_subjects_to_cluster('A')).pack(fill=tk.X, pady=2)
+        ttk.Button(control_column, text="Ajouter → B", command=lambda: self._assign_subjects_to_cluster('B')).pack(fill=tk.X, pady=2)
+        ttk.Separator(control_column, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        ttk.Button(control_column, text="Retirer de A", command=lambda: self._remove_subjects_from_cluster('A')).pack(fill=tk.X, pady=2)
+        ttk.Button(control_column, text="Retirer de B", command=lambda: self._remove_subjects_from_cluster('B')).pack(fill=tk.X, pady=2)
+        ttk.Separator(control_column, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Button(control_column, text="Tout réinitialiser", command=self._clear_spag_clusters).pack(fill=tk.X, pady=(0, 2))
+
+        clusters_column = ttk.Frame(clustering_frame)
+        clusters_column.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=6)
+
+        self.spag_cluster_listboxes = {}
+        for idx, cluster_id in enumerate(['A', 'B']):
+            cluster_frame = ttk.LabelFrame(clusters_column, text=self.spag_cluster_names.get(cluster_id, f"Cluster {cluster_id}"))
+            cluster_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0 if idx == 0 else 8, 0))
+
+            name_row = ttk.Frame(cluster_frame)
+            name_row.pack(fill=tk.X, padx=8, pady=(6, 4))
+            ttk.Label(name_row, text="Nom:").pack(side=tk.LEFT)
+            default_name = self.spag_cluster_names.get(cluster_id, f"Cluster {cluster_id}")
+            name_var = self.spag_cluster_name_vars.get(cluster_id)
+            if name_var is None:
+                name_var = tk.StringVar(value=default_name)
+                self.spag_cluster_name_vars[cluster_id] = name_var
+            else:
+                name_var.set(default_name)
+
+            def _make_name_callback(cid: str, frame: ttk.LabelFrame, var: tk.StringVar):
+                def _cb(*_args):
+                    self._on_spag_cluster_name_change(cid)
+                    try:
+                        frame.configure(text=var.get() or f"Cluster {cid}")
+                    except Exception:
+                        pass
+                return _cb
+
+            name_var.trace_add('write', _make_name_callback(cluster_id, cluster_frame, name_var))
+            ttk.Entry(name_row, textvariable=name_var, width=18).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+            list_frame = ttk.Frame(cluster_frame)
+            list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+            listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=7, exportselection=False)
+            scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=listbox.yview)
+            listbox.configure(yscrollcommand=scroll.set)
+            listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            self.spag_cluster_listboxes[cluster_id] = listbox
+
+        # Initialiser la liste des sujets si disponible
+        self._refresh_spag_subject_pool()
+
+        # Libellés personnalisés pour les groupes Before/After
+        labels_frame = ttk.LabelFrame(self.spaghetti_frame, text="Group labels")
+        labels_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Label(labels_frame, text="Before:").grid(row=0, column=0, sticky='w', padx=(8, 4), pady=6)
+        ttk.Entry(labels_frame, textvariable=self.spag_group_before_var, width=18).grid(row=0, column=1, sticky='w', pady=6)
+        ttk.Label(labels_frame, text="After:").grid(row=0, column=2, sticky='w', padx=(12, 4), pady=6)
+        ttk.Entry(labels_frame, textvariable=self.spag_group_after_var, width=18).grid(row=0, column=3, sticky='w', pady=6)
 
         # Appliquer l'état initial
         self._toggle_output_mode_ui()
@@ -10929,16 +12827,32 @@ Date: 2025-09-09
         try:
             if mode == 'spaghetti':
                 self.spaghetti_frame.pack_configure(fill=tk.X, padx=10, pady=(0,8))
-                # Désactiver saisie AV/PR si on utilise les fichiers détectés
-                state = 'disabled' if getattr(self, 'spag_use_detected_var', tk.BooleanVar(value=True)).get() else 'normal'
-                for child in self.spaghetti_frame.winfo_children():
-                    if isinstance(child, ttk.Frame):
-                        for w in child.winfo_children():
-                            try:
-                                if isinstance(w, ttk.Entry) or isinstance(w, ttk.Button):
-                                    w.configure(state=state)
-                            except Exception:
-                                pass
+                # Désactiver uniquement les champs dossiers AV/PR si on utilise les fichiers détectés
+                use_detected = getattr(self, 'spag_use_detected_var', tk.BooleanVar(value=True)).get()
+                state_dirs = 'disabled' if use_detected else 'normal'
+                try:
+                    if hasattr(self, 'spag_before_entry'):
+                        self.spag_before_entry.configure(state=state_dirs)
+                    if hasattr(self, 'spag_before_btn'):
+                        self.spag_before_btn.configure(state=state_dirs)
+                    if hasattr(self, 'spag_after_entry'):
+                        self.spag_after_entry.configure(state=state_dirs)
+                    if hasattr(self, 'spag_after_btn'):
+                        self.spag_after_btn.configure(state=state_dirs)
+                except Exception:
+                    pass
+                # Laisser actifs mapping bande→stade et combinaisons avancées
+                try:
+                    if hasattr(self, 'spag_combo_entry'):
+                        self.spag_combo_entry.configure(state='normal')
+                    if hasattr(self, 'spag_combo_ch'):
+                        self.spag_combo_ch.configure(state='readonly')
+                    if hasattr(self, 'spag_combo_band'):
+                        self.spag_combo_band.configure(state='readonly')
+                    if hasattr(self, 'spag_combo_stage'):
+                        self.spag_combo_stage.configure(state='readonly')
+                except Exception:
+                    pass
             else:
                 self.spaghetti_frame.pack_forget()
         except Exception:
@@ -10968,6 +12882,180 @@ Date: 2025-09-09
                         mapping[stage_code].set(bool(value))
         except Exception:
             pass
+
+    def _extract_subject_base(self, name: str) -> str:
+        """Retourne l'identifiant sujet de base (ex: S030) à partir d'un nom de fichier."""
+        if not name:
+            return ""
+        base = os.path.splitext(os.path.basename(str(name)))[0]
+        match = re.search(r'(S\d{2,3})', base.upper())
+        if match:
+            return match.group(1)
+        return base
+
+    def _collect_detected_subjects(self) -> List[str]:
+        """Collecte les sujets détectés via les fichiers importés."""
+        subjects: set[str] = set()
+        try:
+            if hasattr(self, 'batch_config'):
+                for file_info in self.batch_config.get('eeg_files', []):
+                    if not file_info:
+                        continue
+                    if file_info.get('selected', True) is False:
+                        continue
+                    base = self._extract_subject_base(file_info.get('name') or file_info.get('path'))
+                    if base:
+                        subjects.add(base)
+        except Exception:
+            pass
+        if not subjects:
+            try:
+                for path in getattr(self, 'detected_eeg_files', []):
+                    base = self._extract_subject_base(path)
+                    if base:
+                        subjects.add(base)
+            except Exception:
+                pass
+        return sorted(subjects)
+
+    def _refresh_spag_subject_pool(self, subjects: Optional[Iterable[str]] = None):
+        """Met à jour la liste des sujets disponibles et la synchro UI."""
+        try:
+            if subjects is None:
+                subjects = self._collect_detected_subjects()
+            subjects_list = sorted({str(s) for s in subjects if s})
+            self.spag_subjects = subjects_list
+            # Nettoyer les clusters si des sujets ont disparu
+            for subj in list(self.spag_clusters.keys()):
+                if subj not in subjects_list:
+                    self.spag_clusters.pop(subj, None)
+            self._sync_spag_cluster_ui()
+        except Exception:
+            pass
+
+    def _sync_spag_cluster_ui(self):
+        """Synchronise les listboxes de clustering avec l'état courant."""
+        if not hasattr(self, 'spag_subject_listbox') or self.spag_subject_listbox is None:
+            return
+        try:
+            self.spag_subject_listbox.delete(0, tk.END)
+        except Exception:
+            pass
+        for box in getattr(self, 'spag_cluster_listboxes', {}).values():
+            try:
+                box.delete(0, tk.END)
+            except Exception:
+                pass
+        try:
+            for subj in self.spag_subjects:
+                cluster_id = self.spag_clusters.get(subj)
+                if cluster_id and cluster_id in self.spag_cluster_listboxes:
+                    try:
+                        self.spag_cluster_listboxes[cluster_id].insert(tk.END, subj)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.spag_subject_listbox.insert(tk.END, subj)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _assign_subjects_to_cluster(self, cluster_id: str):
+        """Affecte les sujets sélectionnés au cluster donné."""
+        try:
+            if not self.spag_subject_listbox:
+                return
+            selection = [self.spag_subject_listbox.get(i) for i in self.spag_subject_listbox.curselection()]
+            if not selection:
+                return
+            for subj in selection:
+                self.spag_clusters[subj] = cluster_id
+            self._sync_spag_cluster_ui()
+        except Exception:
+            pass
+
+    def _remove_subjects_from_cluster(self, cluster_id: str):
+        """Retire les sujets sélectionnés du cluster pour les remettre en pool."""
+        try:
+            box = self.spag_cluster_listboxes.get(cluster_id)
+            if not box:
+                return
+            selection = [box.get(i) for i in box.curselection()]
+            if not selection:
+                return
+            for subj in selection:
+                self.spag_clusters.pop(subj, None)
+            self._sync_spag_cluster_ui()
+        except Exception:
+            pass
+
+    def _clear_spag_clusters(self):
+        """Réinitialise la configuration des clusters."""
+        try:
+            self.spag_clusters.clear()
+            self._sync_spag_cluster_ui()
+        except Exception:
+            pass
+
+    def _on_spag_cluster_name_change(self, cluster_id: str):
+        """Met à jour le nom du cluster depuis l'UI."""
+        try:
+            var = self.spag_cluster_name_vars.get(cluster_id)
+            if not var:
+                return
+            text = var.get().strip()
+            if not text:
+                text = f"Cluster {cluster_id}"
+            self.spag_cluster_names[cluster_id] = text
+        except Exception:
+            pass
+
+    def _get_spag_group_labels(self) -> Tuple[str, str]:
+        """Retourne les libellés personnalisés pour les groupes Before/After."""
+        before = self.spag_group_before_var.get().strip() if hasattr(self, 'spag_group_before_var') else ''
+        after = self.spag_group_after_var.get().strip() if hasattr(self, 'spag_group_after_var') else ''
+        if not before:
+            before = "Before"
+        if not after:
+            after = "After"
+        return before, after
+
+    def _get_spag_cluster_payload(self) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, str]]]:
+        """Retourne les clusters sujets→cluster et noms de clusters."""
+        clusters_payload: Dict[str, str] = {}
+        names_payload: Dict[str, str] = {}
+        try:
+            for subj, cid in getattr(self, 'spag_clusters', {}).items():
+                if cid:
+                    clusters_payload[str(subj)] = str(cid)
+        except Exception:
+            clusters_payload = {}
+        try:
+            cluster_ids = sorted(set(list(self.spag_cluster_names.keys()) + list(getattr(self, 'spag_cluster_name_vars', {}).keys())))
+        except Exception:
+            cluster_ids = ['A', 'B']
+        if not cluster_ids:
+            cluster_ids = ['A', 'B']
+        for cid in cluster_ids:
+            name = ''
+            try:
+                if hasattr(self, 'spag_cluster_name_vars') and cid in self.spag_cluster_name_vars:
+                    name = self.spag_cluster_name_vars[cid].get().strip()
+            except Exception:
+                name = ''
+            if not name and hasattr(self, 'spag_cluster_names'):
+                name = self.spag_cluster_names.get(cid, '')
+            if not name:
+                name = f"Cluster {cid}"
+            names_payload[cid] = name
+        if not clusters_payload:
+            clusters_value: Optional[Dict[str, str]] = None
+        else:
+            clusters_value = clusters_payload
+        names_value: Optional[Dict[str, str]] = names_payload if names_payload else None
+        return clusters_value, names_value
 
     def _run_batch_spaghetti(self):
         """Exécute la génération de graphiques spaghetti à partir d'EDF en lot (AVANT/APRÈS)."""
@@ -11069,6 +13157,33 @@ Date: 2025-09-09
             except Exception:
                 pass
 
+            # Combinaisons explicites parsées depuis le champ avancé
+            combos = self._parse_spag_combinations()
+            if combos:
+                try:
+                    # Étendre les sélections bandes/stades pour inclure celles des combinaisons
+                    add_bands = sorted({b for (_c, _s, b) in combos})
+                    add_stages = sorted({s for (_c, s, _b) in combos})
+                    for b in add_bands:
+                        if b not in sel_bands:
+                            sel_bands.append(b)
+                    for s in add_stages:
+                        if s not in sel_stages:
+                            sel_stages.append(s)
+                    # Forcer les canaux aux canaux explicitement demandés si aucun autre canal n'est sélectionné
+                    add_channels = sorted({c for (c, _s, _b) in combos})
+                    if not selected_channels:
+                        selected_channels = list(add_channels)
+                    else:
+                        for c in add_channels:
+                            if c not in selected_channels:
+                                selected_channels.append(c)
+                except Exception:
+                    pass
+
+            clusters_payload, cluster_names_payload = self._get_spag_cluster_payload()
+            before_label, after_label = self._get_spag_group_labels()
+
             outputs = generate_spaghetti_from_edf_file_lists(
                 before_files=before_files,
                 after_files=after_files,
@@ -11078,7 +13193,12 @@ Date: 2025-09-09
                 selected_channels=selected_channels if selected_channels else None,
                 selected_subjects=None,
                 selected_band_stage_map=band_stage_map,
+                selected_combinations=combos,
                 edf_to_excel_map=edf_to_excel if edf_to_excel else None,
+                clusters=clusters_payload,
+                cluster_names=cluster_names_payload,
+                before_label=before_label,
+                after_label=after_label,
                 # passer la carte fine (actuellement même stades pour toutes les bandes sélectionnées)
                 epoch_len=30.0,
                 metric='AUC',
@@ -11098,6 +13218,127 @@ Date: 2025-09-09
             self._update_batch_status(f"Erreur spaghetti: {e}")
             self._log_batch(f"❌ Erreur spaghetti: {e}")
 
+    def _parse_spag_combinations(self):
+        """Parse la zone de texte des combinaisons et retourne une liste (Channel, Stage, Band).
+        Format attendu (séparateurs ';' ou ','): C3:Delta_R; F3:Theta_N3
+        Stades acceptés: W, N1, N2, N3, R (insensibles à la casse et accents ignorés pour REM/EVEIL).
+        Bandes mappées vers: LowDelta, Delta, Theta, Alpha, Sigma, Beta, Gamma.
+        """
+        # Priorité au sélecteur visuel s'il contient des entrées
+        try:
+            if hasattr(self, 'spag_combo_list') and self.spag_combo_list:
+                return list(self.spag_combo_list)
+        except Exception:
+            pass
+        try:
+            spec = self.spag_combo_spec_var.get().strip() if hasattr(self, 'spag_combo_spec_var') else ''
+        except Exception:
+            spec = ''
+        if not spec:
+            return []
+        # Helpers
+        def _norm_stage(s: str) -> str:
+            s2 = str(s).strip().upper()
+            mapping = {
+                'WAKE': 'W', 'AWAKE': 'W', 'EVEIL': 'W', 'ÉVEIL': 'W', 'W': 'W',
+                'REM': 'R', 'PARADOXAL': 'R', 'R': 'R',
+                'N1': 'N1', 'S1': 'N1',
+                'N2': 'N2', 'S2': 'N2',
+                'N3': 'N3', 'S3': 'N3', 'S4': 'N3'
+            }
+            return mapping.get(s2, s2)
+        def _norm_band(b: str) -> str:
+            b2 = str(b).strip().lower().replace('é', 'e').replace('è', 'e').replace('ê', 'e')
+            # Normaliser vers clés connues
+            if b2 in ['lowdelta', 'low_delta', 'low-delta', 'ldelta', 'ld']:
+                return 'LowDelta'
+            if b2 in ['delta', 'd']:
+                return 'Delta'
+            if b2 in ['theta', 't', 'thetaj', 'théta', 'thetal']:
+                return 'Theta'
+            if b2 in ['alpha', 'a']:
+                return 'Alpha'
+            if b2 in ['sigma', 's']:
+                return 'Sigma'
+            if b2 in ['beta', 'b']:
+                return 'Beta'
+            if b2 in ['gamma', 'g']:
+                return 'Gamma'
+            # Default: Title case
+            return b.strip().title()
+
+        combos = []
+        # Split by ; or ,
+        for item in [x for chunk in spec.split(';') for x in chunk.split(',')]:
+            it = item.strip()
+            if not it:
+                continue
+            if ':' not in it:
+                continue
+            ch, rest = it.split(':', 1)
+            ch = ch.strip()
+            if '_' in rest:
+                band_str, stage_str = rest.split('_', 1)
+            elif '-' in rest:
+                band_str, stage_str = rest.split('-', 1)
+            else:
+                # Si un seul token, ignorer
+                continue
+            band = _norm_band(band_str)
+            stage = _norm_stage(stage_str)
+            combos.append((ch, stage, band))
+        return combos
+
+    def _add_spag_combo(self):
+        try:
+            ch = self.spag_combo_ch.get().strip()
+            band = self.spag_combo_band.get().strip()
+            stage = self.spag_combo_stage.get().strip()
+            if not ch or not band or not stage:
+                return
+            item = (ch, stage, band)
+            if not hasattr(self, 'spag_combo_list'):
+                self.spag_combo_list = []
+            if item not in self.spag_combo_list:
+                self.spag_combo_list.append(item)
+                self.spag_combo_tree.insert('', 'end', values=(ch, band, stage))
+                # Mettre à jour la zone texte pour visibilité (optionnel)
+                try:
+                    txt = "; ".join([f"{c}:{b}_{s}" for (c,s,b) in self.spag_combo_list])
+                    self.spag_combo_spec_var.set(txt)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _remove_spag_combo(self):
+        try:
+            sel = self.spag_combo_tree.selection()
+            for iid in sel:
+                vals = self.spag_combo_tree.item(iid, 'values')
+                ch, band, stage = vals[0], vals[1], vals[2]
+                item = (str(ch), str(stage), str(band))
+                if hasattr(self, 'spag_combo_list') and item in self.spag_combo_list:
+                    self.spag_combo_list.remove(item)
+                self.spag_combo_tree.delete(iid)
+            # Sync texte
+            try:
+                txt = "; ".join([f"{c}:{b}_{s}" for (c,s,b) in getattr(self, 'spag_combo_list', [])])
+                self.spag_combo_spec_var.set(txt)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _clear_spag_combos(self):
+        try:
+            self.spag_combo_list = []
+            for iid in self.spag_combo_tree.get_children():
+                self.spag_combo_tree.delete(iid)
+            self.spag_combo_spec_var.set("")
+        except Exception:
+            pass
+
     def _validate_batch_config(self):
         """Valide la configuration avant de démarrer le traitement."""
         errors = []
@@ -11111,8 +13352,15 @@ Date: 2025-09-09
         if not self.batch_config['eeg_files']:
             errors.append("Aucun fichier EEG détecté")
         
-        if not any(var.get() for var in self.channel_vars.values()):
-            errors.append("Aucun canal sélectionné")
+        # Vérifier canaux: accepter soit les canaux cochés, soit des combinaisons explicites
+        has_checked_channels = any(var.get() for var in self.channel_vars.values()) if hasattr(self, 'channel_vars') else False
+        combos_ok = False
+        try:
+            combos_ok = bool(self._parse_spag_combinations())
+        except Exception:
+            combos_ok = False
+        if not (has_checked_channels or combos_ok):
+            errors.append("Aucun canal sélectionné (aucune combinaison Canal×Bande×Stade fournie)")
         
         if errors:
             messagebox.showerror("Configuration Invalide", "\n".join(errors))
@@ -12574,13 +14822,29 @@ Date: 2025-09-09
         file_path = selection.edf_path
         selected_mode = (selection.mode or "raw").lower()
         precompute_action = (selection.precompute_action or "existing")
-        ms_path_input = selection.ms_path
+        ms_path_input = getattr(selection, "source_path", None)
+        if ms_path_input is None:
+            ms_path_input = getattr(selection, "ms_path", None)
+
+        is_lazy_mode = selected_mode in {"raw", "lazy"}
+        selected_mode_resolved = "lazy" if is_lazy_mode else selected_mode
+        if selected_mode_resolved != selected_mode:
+            logging.info(f"[OPEN] Mode résolu={selected_mode_resolved} (alias de {selected_mode})")
+        selected_mode = selected_mode_resolved
 
         logging.info(f"[OPEN] Mode choisi={selected_mode}")
         logging.info(f"[OPEN] EDF path={file_path}")
         if selected_mode == "precomputed":
             logging.info(f"[OPEN] Zarr (input)={ms_path_input}")
             logging.info(f"[OPEN] Action={precompute_action}")
+
+        # Mode checkpoint: impose expected visualization backend (lazy/hybrid, etc.)
+        try:
+            telemetry.mark_mode(selected_mode, source="EEGAnalysisStudio.load_edf_file")
+        except Exception:
+            # Re-raise after logging so the exception surfaces to the caller/UI
+            logging.exception("Checkpoint mode violation detected")
+            raise
 
         try:
             print(f"🧭 Mode choisi: {selected_mode}")
@@ -12597,13 +14861,21 @@ Date: 2025-09-09
             message="Ouverture du fichier EDF..."
         )
         
+        # Créer un sample de télémetrie pour le chargement
+        load_sample = telemetry.new_sample({
+            "channel": "load_edf",
+            "dataset_id": str(Path(file_path).stem),
+            "notes": f"mode={selected_mode}",
+        })
+        
         try:
             print(f"📁 Chargement du fichier: {os.path.basename(file_path)}")
             self._update_loading_message("Lecture du fichier EDF...")
             self.root.update()
             
-            # Chargement du fichier
-            self.raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+            # Chargement du fichier avec mesure du temps
+            with telemetry.measure(load_sample, "load_edf_ms"):
+                self.raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
             self.sfreq = self.raw.info['sfreq']
             logging.info(f"[OPEN] EDF chargé: n_channels={len(self.raw.ch_names)}, fs={self.sfreq}")
             
@@ -12625,13 +14897,15 @@ Date: 2025-09-09
             self._update_loading_message("Création des dérivations...")
             self.root.update()
             
-            # Création des dérivations
-            self.create_derivations()
-            
-            self._update_loading_message("Sélection des canaux...")
-            self.root.update()
-            
-            # Configuration des canaux par défaut selon l'ordre demandé
+            # Création des dérivations avec mesure du temps
+            with telemetry.measure(load_sample, "prepare_data_ms"):
+                # Création des dérivations
+                self.create_derivations()
+                
+                self._update_loading_message("Sélection des canaux...")
+                self.root.update()
+                
+                # Configuration des canaux par défaut selon l'ordre demandé
             # Mapper les noms demandés vers les vrais canaux disponibles dans le fichier EDF
             channel_mapping = {
                 # EEG différentiels (mapper vers les vrais noms disponibles)
@@ -12703,10 +14977,13 @@ Date: 2025-09-09
             
             self._update_loading_message("Mise à jour de l'affichage...")
             self.root.update()
+            
+            # Fin de la mesure de préparation des données
+            # (sortie du contexte with telemetry.measure)
 
             ms_path_obj = Path(ms_path_input) if ms_path_input else None
             self.data_bridge = None
-            self.data_mode = "raw"
+            self.data_mode = "lazy" if selected_mode == "lazy" else "raw"
 
             # === GESTION DU MODE PRÉ-CALCULÉ ===
             if selected_mode == "precomputed":
@@ -12912,10 +15189,10 @@ Date: 2025-09-09
                         self.root.update()
                         
                         from core.providers import PrecomputedProvider
-                        from concurrent.futures import ThreadPoolExecutor
-                        
+                        self._shutdown_bridge_executor()
                         provider = PrecomputedProvider(ms_path_obj)
                         executor = ThreadPoolExecutor(max_workers=2)
+                        self._bridge_executor = executor
                         self.data_bridge = DataBridge(provider, executor=executor)
                         self.data_mode = "precomputed"
                         
@@ -12940,6 +15217,7 @@ Date: 2025-09-09
                             f"{str(e)}\n\nLe mode standard sera utilisé.",
                             parent=self.root,
                         )
+                        self._shutdown_bridge_executor()
                         self.data_bridge = None
                         self.data_mode = "raw"
                         selected_mode = "raw"
@@ -12950,11 +15228,26 @@ Date: 2025-09-09
                             self.update_plot()
                         except Exception:
                             pass
-            else:
-                # Mode standard
-                self.data_bridge = None
-                self.data_mode = "raw"
-                ms_path_obj = None
+                elif selected_mode == "lazy":
+                    try:
+                        self._update_loading_message("🧠 Initialisation du mode Lazy...")
+                        self.root.update()
+                    except Exception:
+                        pass
+
+                    self._shutdown_bridge_executor()
+                    lazy_provider = LazyProvider(self.raw)
+                    executor = ThreadPoolExecutor(max_workers=4)
+                    self._bridge_executor = executor
+                    self.data_bridge = DataBridge(lazy_provider, executor=executor)
+                    self.data_mode = "lazy"
+                    logging.info("[OPEN] Mode Lazy activé (calcul à la volée)")
+                else:
+                    # Mode standard sans bridge
+                    self._shutdown_bridge_executor()
+                    self.data_bridge = None
+                    self.data_mode = "raw"
+                    ms_path_obj = None
 
             # Mise à jour de l'interface
             self.update_time_scale()
@@ -12972,7 +15265,12 @@ Date: 2025-09-09
             # Attendre un peu pour que l'utilisateur voie "Terminé!"
             self.root.after(500, self._hide_loading_bar)
             
-            mode_msg = "⚡ Navigation Rapide" if self.data_mode == "precomputed" else "📂 Mode Standard"
+            if self.data_mode == "precomputed":
+                mode_msg = "⚡ Navigation Rapide"
+            elif self.data_mode == "lazy":
+                mode_msg = "🧠 Mode Lazy (calcul à la volée)"
+            else:
+                mode_msg = "📂 Mode Standard"
             messagebox.showinfo(
                 "✅ Succès",
                 f"Fichier chargé: {os.path.basename(file_path)}\n\nMode: {mode_msg}",
@@ -12980,9 +15278,24 @@ Date: 2025-09-09
             )
             logging.info(f"[OPEN] Popup succès affiché: {os.path.basename(file_path)} | mode={mode_msg}")
             
+            # Commiter le sample de télémetrie si disponible
+            try:
+                if load_sample:
+                    load_sample.setdefault("total_ms", 0.0)
+                    telemetry.commit(load_sample)
+            except Exception:
+                pass
+            
         except Exception as e:
             # Cacher la barre de chargement en cas d'erreur
             self._hide_loading_bar()
+            
+            # Commiter le sample de télémetrie même en cas d'erreur
+            try:
+                if load_sample:
+                    telemetry.commit(load_sample)
+            except Exception:
+                pass
             
             print(f"❌ Erreur lors du chargement: {e}")
             messagebox.showerror("Erreur", f"Erreur lors du chargement: {str(e)}", parent=self.root)
@@ -13204,6 +15517,200 @@ Date: 2025-09-09
             self.current_time = min(max_time, self.current_time + self.duration)
             self.time_var.set(self.current_time)
         self.update_plot()
+
+    # ------------------------------------------------------------------
+    # Lazy preprocessing helpers
+    # ------------------------------------------------------------------
+    def _snapshot_processing_config(self) -> Dict[str, Any]:
+        plotter = getattr(self, 'psg_plotter', None)
+        baseline_enabled = bool(getattr(plotter, 'baseline_enabled', True)) if plotter else True
+        filter_enabled = bool(getattr(plotter, 'global_filter_enabled', True)) if plotter else True
+        params_src = getattr(plotter, 'filter_params_by_channel', {}) or {}
+        params_copy = {ch: dict(cfg) for ch, cfg in params_src.items()}
+        return {
+            "baseline_enabled": baseline_enabled,
+            "filter_enabled": filter_enabled,
+            "params": params_copy,
+        }
+
+    @staticmethod
+    def _downsample_for_processing(array: np.ndarray, target_len: int) -> Tuple[np.ndarray, int]:
+        if target_len <= 0 or array.size <= target_len:
+            return array.astype(np.float32, copy=False), 1
+        bin_size = int(math.ceil(array.size / float(target_len)))
+        if bin_size <= 1:
+            return array.astype(np.float32, copy=False), 1
+        usable = array[: (array.size // bin_size) * bin_size]
+        down = usable.reshape(-1, bin_size).mean(axis=1).astype(np.float32, copy=False)
+        if usable.size < array.size:
+            remainder_mean = float(np.mean(array[usable.size :], dtype=np.float32))
+            down = np.concatenate([down, np.array([remainder_mean], dtype=np.float32)])
+        return down, bin_size
+
+    def _resolve_channel_filter(self, channel: str, config: Dict[str, Any]) -> Dict[str, float]:
+        params = config["params"].get(channel)
+        if params is None:
+            stype = cesa_detect_signal_type(channel)
+            presets = cesa_get_filter_presets(stype)
+            params = {
+                "enabled": True,
+                "low": presets.get("low", 0.0),
+                "high": presets.get("high", 0.0),
+                "amplitude": presets.get("amplitude", 100.0),
+            }
+        return dict(params)
+
+    def _build_processed_key(
+        self,
+        channel: str,
+        start_idx: int,
+        end_idx: int,
+        plot_width_px: int,
+        fs: float,
+        data_len: int,
+        config: Dict[str, Any],
+    ) -> Tuple:
+        params = self._resolve_channel_filter(channel, config)
+        filter_sig = (
+            bool(config["filter_enabled"] and params.get("enabled", False)),
+            float(params.get("low", 0.0)),
+            float(params.get("high", 0.0)),
+            float(params.get("amplitude", 100.0)),
+        )
+        return (
+            channel,
+            int(start_idx),
+            int(end_idx),
+            int(plot_width_px),
+            round(float(fs), 4),
+            int(data_len),
+            bool(config["baseline_enabled"]),
+            filter_sig,
+        )
+
+    def _process_channel_window(
+        self,
+        channel: str,
+        data: np.ndarray,
+        fs: float,
+        target_len: int,
+        config: Dict[str, Any],
+    ) -> Tuple[np.ndarray, float, float, float]:
+        y = np.asarray(data, dtype=np.float32)
+        downsampled, bin_size = self._downsample_for_processing(y, target_len)
+        if bin_size <= 0:
+            bin_size = 1
+        effective_fs = fs / bin_size
+        baseline_ms = 0.0
+        filter_ms = 0.0
+        params = self._resolve_channel_filter(channel, config)
+        stype = cesa_detect_signal_type(channel)
+
+        try:
+            if config["baseline_enabled"] and stype in ("eeg", "eog", "ecg", "emg"):
+                t0 = time.perf_counter()
+                downsampled = cesa_apply_baseline_correction(downsampled, window_duration=30.0, sfreq=effective_fs)
+                baseline_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:
+            baseline_ms = 0.0
+
+        try:
+            if config["filter_enabled"] and params.get("enabled", False):
+                t0 = time.perf_counter()
+                downsampled = cesa_apply_filter(
+                    downsampled,
+                    sfreq=effective_fs,
+                    filter_order=4,
+                    low=params.get("low", 0.0),
+                    high=params.get("high", 0.0),
+                )
+                filter_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:
+            filter_ms = 0.0
+
+        try:
+            amp = float(params.get("amplitude", 100.0))
+            downsampled = downsampled * (amp / 100.0)
+        except Exception:
+            pass
+
+        return downsampled.astype(np.float32, copy=False), effective_fs, baseline_ms, filter_ms
+
+    def _submit_processing_task(
+        self,
+        generation: int,
+        key: Tuple,
+        channel: str,
+        data: np.ndarray,
+        fs: float,
+        target_len: int,
+        config: Dict[str, Any],
+    ) -> None:
+        data_copy = np.array(data, dtype=np.float32, copy=True)
+
+        def _task():
+            result = self._process_channel_window(channel, data_copy, fs, target_len, config)
+            return generation, key, channel, result
+
+        future = self._preprocess_executor.submit(_task)
+
+        def _callback(fut: Any) -> None:
+            try:
+                generation_result, cache_key, ch, result = fut.result()
+            except Exception:
+                return
+            if generation_result != self._processing_generation:
+                return
+            if not isinstance(result, tuple):
+                return
+            processed_data, effective_fs, baseline_ms, filter_ms = result
+            with self._processed_lock:
+                self._processed_window_cache[cache_key] = (
+                    processed_data,
+                    effective_fs,
+                    {"baseline_ms": baseline_ms, "filter_ms": filter_ms},
+                )
+                while len(self._processed_window_cache) > self._processed_window_limit:
+                    try:
+                        self._processed_window_cache.popitem(last=False)
+                    except Exception:
+                        break
+            self.root.after(0, self._apply_cached_processed_signals)
+
+        future.add_done_callback(_callback)
+
+    def _apply_cached_processed_signals(self) -> None:
+        """Apply cached processed signals to plotter if generation matches."""
+        if self._processing_generation != self._plot_update_gen:
+            return
+        try:
+            plotter = getattr(self, 'psg_plotter', None)
+            if plotter is None:
+                return
+            window_sig = self._current_window_signature
+            if window_sig is None:
+                return
+            config = self._snapshot_processing_config()
+            ready_signals = {}
+            total_baseline_ms = 0.0
+            total_filter_ms = 0.0
+            with self._processed_lock:
+                for ch in self._expected_channels:
+                    if ch not in self._channel_processing_map:
+                        continue
+                    key = self._channel_processing_map[ch]
+                    if key not in self._processed_window_cache:
+                        continue
+                    processed_data, effective_fs, metrics = self._processed_window_cache[key]
+                    ready_signals[ch] = (processed_data, effective_fs)
+                    total_baseline_ms += metrics.get("baseline_ms", 0.0)
+                    total_filter_ms += metrics.get("filter_ms", 0.0)
+            if ready_signals:
+                plotter.update_preprocessed_signals(ready_signals)
+                self._last_baseline_ms = total_baseline_ms
+                self._last_filter_ms = total_filter_ms
+        except Exception:
+            pass
     
     def update_plot(self, *args):
         """Met à jour l'affichage principal en rafraîchissant la vue PSG intégrée."""
@@ -13219,9 +15726,11 @@ Date: 2025-09-09
             # Debounce + thread offload
             self._plot_update_gen += 1
             current_gen = int(self._plot_update_gen)
+            self._processing_generation = current_gen
 
             plot_width_px = self._get_plot_width_px()
             use_bridge = getattr(self, 'data_bridge', None) is not None
+            is_lazy = getattr(self, 'data_mode', 'raw') == 'lazy'
             token = object()
             self._active_plot_token = token
 
@@ -13275,6 +15784,7 @@ Date: 2025-09-09
                     bridge_result = None
                     extract_ms = 0.0
                     _t_extract0 = None
+                    
                     if use_bridge:
                         try:
                             import time as _time
@@ -13302,6 +15812,26 @@ Date: 2025-09-09
                                 extract_ms = (_time.perf_counter() - _t_extract0) * 1000.0
                             except Exception:
                                 extract_ms = 0.0
+
+                    # Ensure we have raw signals for preprocessing in lazy mode
+                    raw_signals_for_preprocessing = {}
+                    if is_lazy:
+                        if use_bridge and signals:
+                            # Bridge provides envelopes, we need raw data for preprocessing
+                            # So we extract raw data separately
+                            try:
+                                for ch in selected:
+                                    try:
+                                        arr = self.raw.get_data(picks=[ch], start=start_idx, stop=end_idx)[0]
+                                        arr = self._to_microvolts_and_sanitize(arr)
+                                        raw_signals_for_preprocessing[ch] = (arr, fs)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                raw_signals_for_preprocessing = {}
+                        elif not use_bridge:
+                            # We will get raw signals below, wait for that
+                            pass
 
                     if not signals:
                         try:
@@ -13332,6 +15862,9 @@ Date: 2025-09-09
                                             pass
                                 data_uv = self._to_microvolts_and_sanitize(arr)
                                 signals[ch] = (data_uv, fs)
+                                # Store raw signals for preprocessing in lazy mode
+                                if is_lazy and ch not in raw_signals_for_preprocessing:
+                                    raw_signals_for_preprocessing[ch] = (data_uv, fs)
                             except Exception:
                                 continue
                         if _t_extract0 is not None:
@@ -13340,6 +15873,25 @@ Date: 2025-09-09
                                 extract_ms = (_time.perf_counter() - _t_extract0) * 1000.0
                             except Exception:
                                 extract_ms = 0.0
+                    
+                    # Submit async preprocessing tasks for lazy mode if we have raw signals
+                    if is_lazy and raw_signals_for_preprocessing:
+                        config = self._snapshot_processing_config()
+                        target_processing_len = max(300, int(plot_width_px * 1.2))
+                        self._expected_channels = set(selected)
+                        self._channel_processing_map = {}
+                        self._current_window_signature = (int(start_idx), int(end_idx), int(plot_width_px))
+                        for ch in selected:
+                            if ch not in raw_signals_for_preprocessing:
+                                continue
+                            try:
+                                arr, fs_ch = raw_signals_for_preprocessing[ch]
+                                key = self._build_processed_key(ch, start_idx, end_idx, plot_width_px, fs_ch, len(arr), config)
+                                self._channel_processing_map[ch] = key
+                                if key not in self._processed_window_cache:
+                                    self._submit_processing_task(current_gen, key, ch, arr, fs_ch, target_processing_len, config)
+                            except Exception:
+                                pass
 
                     # Build hypnogram quickly with caching
                     hypnogram = self._psg_cached_hypnogram
@@ -13394,7 +15946,93 @@ Date: 2025-09-09
                                     _t_draw0 = _time.perf_counter()
                                 except Exception:
                                     pass
-                                self.psg_plotter.update_signals(signals)
+                                # Build final signals dict: use preprocessed when available, fallback to raw
+                                final_signals = {}
+                                total_baseline_ms = 0.0
+                                total_filter_ms = 0.0
+                                
+                                # Start with raw signals as base
+                                if signals:
+                                    final_signals = dict(signals)
+                                
+                                # In lazy mode, replace with preprocessed signals when available
+                                if is_lazy and hasattr(self, '_processed_window_cache'):
+                                    with self._processed_lock:
+                                        for ch in selected:
+                                            if ch not in self._channel_processing_map:
+                                                continue
+                                            key = self._channel_processing_map[ch]
+                                            if key not in self._processed_window_cache:
+                                                continue
+                                            try:
+                                                processed_data, effective_fs, metrics = self._processed_window_cache[key]
+                                                # Only use preprocessed if we have valid data
+                                                if processed_data is not None and len(processed_data) > 0:
+                                                    final_signals[ch] = (processed_data, effective_fs)
+                                                    total_baseline_ms += metrics.get("baseline_ms", 0.0)
+                                                    total_filter_ms += metrics.get("filter_ms", 0.0)
+                                            except Exception:
+                                                pass
+                                
+                                # Always ensure we have at least some signals to display
+                                if not final_signals and signals:
+                                    final_signals = dict(signals)
+                                
+                                # --- Correction affichage asynchrone ---
+                                # Si aucun signal prêt, réutiliser les précédents ou fallback brut
+                                if not final_signals:
+                                    if hasattr(self.psg_plotter, 'last_signals') and self.psg_plotter.last_signals:
+                                        final_signals = dict(self.psg_plotter.last_signals)
+                                    elif signals:
+                                        # Fallback sur les bruts disponibles
+                                        final_signals = dict(signals)
+                                        logging.warning("Aucun signal prêt : fallback sur les bruts disponibles")
+                                    else:
+                                        # Dernier recours : signaux vides (plotter gère cela)
+                                        final_signals = {}
+                                
+                                # Fusion progressive : conserver les anciens canaux tant que les nouveaux ne sont pas tous prêts
+                                if hasattr(self.psg_plotter, 'last_signals') and self.psg_plotter.last_signals:
+                                    fused_signals = dict(self.psg_plotter.last_signals)
+                                    # Mettre à jour avec les nouveaux signaux valides uniquement
+                                    for k, v in final_signals.items():
+                                        if v is not None and isinstance(v, tuple) and len(v) == 2:
+                                            arr, fs = v
+                                            if arr is not None and len(arr) > 0:
+                                                fused_signals[k] = v
+                                    final_signals = fused_signals
+                                # --- Fin correction ---
+                                
+                                # Update plotter - use preprocessed if we have any, otherwise regular update
+                                if is_lazy and (total_baseline_ms > 0 or total_filter_ms > 0):
+                                    # We have some preprocessed signals, check if we should use preprocessed update
+                                    has_any_preprocessed = any(
+                                        ch in self._channel_processing_map and 
+                                        self._channel_processing_map[ch] in self._processed_window_cache 
+                                        for ch in final_signals.keys()
+                                    )
+                                    if has_any_preprocessed:
+                                        try:
+                                            self.psg_plotter.update_preprocessed_signals(final_signals)
+                                            self._last_baseline_ms = total_baseline_ms
+                                            self._last_filter_ms = total_filter_ms
+                                        except Exception:
+                                            # Fallback to regular update if preprocessed fails
+                                            self.psg_plotter.update_signals(final_signals)
+                                    else:
+                                        self.psg_plotter.update_signals(final_signals)
+                                else:
+                                    # Not lazy or no preprocessing done, use regular update
+                                    if final_signals:
+                                        self.psg_plotter.update_signals(final_signals)
+                                    else:
+                                        # Last resort: empty dict (plotter handles this)
+                                        self.psg_plotter.update_signals({})
+                                
+                                # Sauvegarde pour le prochain cycle (après mise à jour du plotter)
+                                if hasattr(self.psg_plotter, 'last_signals') and final_signals:
+                                    self.psg_plotter.last_signals = dict(final_signals)
+                                
                                 # Invalidate backgrounds if limits changed or options changed
                                 try:
                                     # If autoscale/filter toggled in UI, force re-filter and reset blit
@@ -13418,10 +16056,17 @@ Date: 2025-09-09
                                     draw_ms = (_time.perf_counter() - _t_draw0) * 1000.0
                                 p = getattr(self.psg_plotter, '_perf_last', {})
                                 filter_ms = float(p.get('filter_ms', 0.0))
+                                baseline_ms = float(p.get('baseline_ms', 0.0))
+                                if is_lazy and hasattr(self, '_last_baseline_ms'):
+                                    baseline_ms = self._last_baseline_ms
+                                if is_lazy and hasattr(self, '_last_filter_ms'):
+                                    filter_ms = self._last_filter_ms
                                 n_channels = int(p.get('n_channels', 0))
                                 n_points = int(p.get('n_points', 0))
                                 fps = 1000.0 / max(total_ms, 1e-3)
                                 action_label = "bridge" if bridge_result else "raw"
+                                if is_lazy:
+                                    action_label = "lazy"
                                 self._update_performance_feedback(
                                     total_ms=total_ms,
                                     fps=fps,
@@ -13436,6 +16081,8 @@ Date: 2025-09-09
                                     bridge_result=bridge_result,
                                     n_channels=n_channels,
                                     n_points=n_points,
+                                    baseline_ms=baseline_ms,
+                                    filter_ms=filter_ms,
                                 )
                                 try:
                                     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]

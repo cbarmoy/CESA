@@ -15,8 +15,8 @@ from core.providers import PrecomputedProvider, SignalProvider
 @dataclass(frozen=True)
 class ModeSelection:
     mode: str
-    provider: SignalProvider
-    ms_path: Path
+    provider: Optional[SignalProvider]
+    source_path: Optional[Path]
 
 
 class ModeSelector:
@@ -36,14 +36,13 @@ class ModeSelector:
     def choose(self) -> ModeSelection:
         if self._default_ms_path is not None:
             provider = PrecomputedProvider(self._default_ms_path)
-            return ModeSelection(mode="precomputed", provider=provider, ms_path=self._default_ms_path)
+            return ModeSelection(mode="precomputed", provider=provider, source_path=self._default_ms_path)
 
         mode, path = self._show_dialog()
-        if mode == "precomputed" and path:
+        if mode == "precomputed" and path is not None:
             provider = PrecomputedProvider(path)
-            return ModeSelection(mode="precomputed", provider=provider, ms_path=path)
-        else:
-            raise RuntimeError(f"Mode {mode} not supported in choose()")
+            return ModeSelection(mode="precomputed", provider=provider, source_path=path)
+        return ModeSelection(mode=mode, provider=None, source_path=path)
     
     def get_selection(self) -> tuple[Optional[str], Optional[Path]]:
         """
@@ -103,24 +102,32 @@ class ModeSelector:
         fast_desc.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         # Cadre pour Mode Standard
-        standard_frame = ttk.LabelFrame(container, text="📂 Mode Standard", padding=10)
+        standard_frame = ttk.LabelFrame(container, text="📂 Modes dynamiques", padding=10)
         standard_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 16))
-        
-        raw_radio = ttk.Radiobutton(
-            standard_frame,
-            text="Chargement classique",
-            value="raw",
-            variable=mode_var,
-        )
-        raw_radio.grid(row=0, column=0, columnspan=3, sticky="w")
-        
-        raw_desc = ttk.Label(
-            standard_frame,
-            text="• Chargement direct sans préparation\n• Adapté aux fichiers courts ou analyse ponctuelle",
-            foreground="#6b7280",
-            font=("Segoe UI", 8)
-        )
-        raw_desc.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        options: list[tuple[str, str, str]] = [
+            ("Chargement classique", "raw", "• Chargement direct sans préparation\n• Adapté aux fichiers courts ou analyse ponctuelle"),
+        ]
+        if self._lazy_available:
+            options.insert(0, (
+                "Calcul à la volée (Lazy)",
+                "lazy",
+                "• Min/Max calculés à la demande\n• Idéal pour tester sans pré-calcul\n• Peut prendre quelques secondes la première fois",
+            ))
+
+        start_row = 0
+        for label, value, desc in options:
+            ttk.Radiobutton(standard_frame, text=label, value=value, variable=mode_var).grid(
+                row=start_row, column=0, columnspan=3, sticky="w"
+            )
+            ttk.Label(
+                standard_frame,
+                text=desc,
+                foreground="#6b7280" if value == "raw" else "#2563eb",
+                font=("Segoe UI", 8),
+                justify="left",
+            ).grid(row=start_row + 1, column=0, columnspan=3, sticky="w", pady=(4, 4))
+            start_row += 2
 
         ttk.Separator(container, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", pady=12)
 
@@ -164,43 +171,38 @@ class ModeSelector:
         def _confirm() -> None:
             nonlocal resolved_path, resolved_mode
             selected = mode_var.get()
-            
-            # Mode raw: pas besoin de chemin
+
             if selected == "raw":
                 resolved_mode = "raw"
                 resolved_path = None
                 dialog.destroy()
                 return
-            
-            # Mode lazy: pas encore disponible
+
             if selected == "lazy":
-                messagebox.showinfo(
-                    "Mode indisponible",
-                    "Le mode Lazy n'est pas encore disponible. Merci d'utiliser la Navigation Rapide ou le Mode Standard.",
-                    parent=dialog,
-                )
+                resolved_mode = "lazy"
+                resolved_path = None
+                dialog.destroy()
                 return
 
-            # Mode precomputed: le chemin est optionnel !
-            # Si vide, CESA proposera de créer le fichier automatiquement
-            value = path_var.get().strip()
-            
-            if value:
-                # Un chemin a été fourni, vérifier qu'il existe
-                candidate = Path(value)
-                if not candidate.exists():
-                    error_var.set("Dossier introuvable. Laissez vide pour créer automatiquement.")
-                    return
-                # Vérifier que c'est bien un dossier Zarr valide
-                if not (candidate / ".zgroup").exists() and not (candidate / "levels").exists():
-                    error_var.set("Ce dossier ne semble pas être un fichier de navigation rapide valide.\nLaissez vide pour en créer un nouveau.")
-                    return
-                resolved_path = candidate
-            else:
-                # Chemin vide = CESA créera automatiquement
-                resolved_path = None
+            if selected == "precomputed":
+                value = path_var.get().strip()
+                if value:
+                    candidate = Path(value)
+                    if not candidate.exists():
+                        error_var.set("Dossier introuvable. Laissez vide pour créer automatiquement.")
+                        return
+                    if not (candidate / ".zattrs").exists() and not (candidate / "levels").exists():
+                        error_var.set("Ce dossier ne semble pas être un fichier de navigation rapide valide.\nLaissez vide pour en créer un nouveau.")
+                        return
+                    resolved_path = candidate
+                else:
+                    resolved_path = None
+                resolved_mode = "precomputed"
+                dialog.destroy()
+                return
 
-            resolved_mode = "precomputed"
+            resolved_mode = selected
+            resolved_path = path_var.get().strip() or None
             dialog.destroy()
 
         buttons = ttk.Frame(container)

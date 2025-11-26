@@ -24,6 +24,7 @@ Licence: MIT
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
@@ -145,6 +146,75 @@ class RenormalizationResult:
             "window_samples": self.window_samples,
             "step_samples": self.step_samples,
             "scales": self.scales,
+        }
+
+
+@dataclass
+class MultiscaleEntropyConfig:
+    """Configuration container for multiscale entropy (MSE).
+
+    Parameters
+    ----------
+    m : int
+        Embedding dimension (pattern length). Classical MSE uses ``m = 2``.
+    r : float
+        Relative tolerance applied to the channel standard deviation.
+    scales : Sequence[int]
+        Positive integers describing each coarse-graining scale.
+    max_samples : Optional[int]
+        Optional cap on the number of samples to speed-up experiments.
+    return_intermediate : bool
+        Whether to keep the coarse-grained signals in the result payload.
+    """
+
+    m: int = 2
+    r: float = 0.2
+    scales: Sequence[int] = field(default_factory=lambda: tuple(range(1, 21)))
+    max_samples: Optional[int] = 200_000
+    max_pattern_length: int = 5000
+    return_intermediate: bool = False
+
+    def __post_init__(self) -> None:
+        if self.m < 1:
+            raise ValueError("`m` must be >= 1 for multiscale entropy")
+        if self.r <= 0:
+            raise ValueError("`r` must be strictly positive")
+        if not self.scales:
+            raise ValueError("`scales` must contain at least one element")
+
+        processed_scales = sorted({int(scale) for scale in self.scales if int(scale) > 0})
+        if not processed_scales:
+            raise ValueError("All `scales` must be strictly positive integers")
+        self.scales = tuple(processed_scales)
+
+        if self.max_samples is not None and self.max_samples <= 0:
+            raise ValueError("`max_samples`, when provided, must be > 0")
+        if self.max_pattern_length <= self.m + 1:
+            raise ValueError("`max_pattern_length` must be greater than `m + 1`")
+
+
+@dataclass
+class MultiscaleEntropyResult:
+    """Detailed container storing the outcome of multiscale entropy."""
+
+    entropy_by_scale: Dict[int, float]
+    channel_entropy: Dict[str, Dict[int, float]]
+    sample_entropy_by_scale: Dict[int, Dict[str, object]]
+    coarse_grained_signals: Optional[Dict[int, np.ndarray]]
+    config: MultiscaleEntropyConfig
+    channel_names: Optional[Tuple[str, ...]]
+    sampling_frequency: float
+    processed_samples: int
+
+    def summary(self) -> Dict[str, object]:
+        """Concise, serialisable snapshot that can be logged or exported."""
+
+        return {
+            "entropy_by_scale": self.entropy_by_scale,
+            "channel_entropy": self.channel_entropy,
+            "scales": list(self.config.scales),
+            "sampling_frequency": self.sampling_frequency,
+            "processed_samples": self.processed_samples,
         }
 
 
@@ -319,6 +389,171 @@ def compute_entropy_from_raw(
     data, _ = raw.get_data(picks=picks, return_times=True)
     selected_names = [raw.info["ch_names"][p] for p in picks]
     return compute_renormalized_entropy(data, raw.info["sfreq"], selected_names, config=config)
+
+
+# =============================================================================
+# Multiscale entropy API
+# =============================================================================
+
+def compute_multiscale_entropy(
+    data: np.ndarray,
+    sfreq: float,
+    channel_names: Optional[Sequence[str]] = None,
+    config: Optional[MultiscaleEntropyConfig] = None,
+    *,
+    progress_label: Optional[str] = None,
+) -> MultiscaleEntropyResult:
+    """Compute multiscale entropy (MSE) on multichannel signals.
+
+    The implementation strictly follows Costa et al. (2002): each scale
+    performs coarse-graining followed by a Sample Entropy (SampEn) estimation.
+    Numerous runtime checkpoints are emitted via ``print`` to help trace the
+    computation path when experimenting with real EEG recordings.
+    """
+
+    prefix = f"[{progress_label}] " if progress_label else ""
+
+    def _log(msg: str) -> None:
+        print(f"{prefix}{msg}", flush=True)
+
+    if sfreq <= 0:
+        raise ValueError("`sfreq` must be strictly positive")
+
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    elif data.ndim != 2:
+        raise ValueError("`data` must be 1D or 2D (channels x samples)")
+
+    cfg = config or MultiscaleEntropyConfig()
+    n_channels, n_samples = data.shape
+    if n_channels == 0 or n_samples == 0:
+        raise ValueError("`data` must contain at least one channel and one sample")
+
+    if channel_names is not None and len(channel_names) != n_channels:
+        raise ValueError("Length of `channel_names` must match the number of channels")
+
+    label_sequence = (
+        tuple(channel_names) if channel_names is not None else tuple(f"ch{idx}" for idx in range(n_channels))
+    )
+
+    trimmed_samples = n_samples
+    if cfg.max_samples is not None and n_samples > cfg.max_samples:
+        trimmed_samples = cfg.max_samples
+        _log(
+            f"⚠️ CHECKPOINT MSE: truncating signal from {n_samples} to {trimmed_samples} samples "
+            f"to satisfy max_samples={cfg.max_samples}"
+        )
+        data = data[:, : trimmed_samples]
+
+    _log(
+        f"🔍 CHECKPOINT MSE: validated input "
+        f"(channels={n_channels}, samples={data.shape[1]}, fs={sfreq} Hz, scales={cfg.scales})"
+    )
+
+    entropy_by_scale: Dict[int, float] = {}
+    channel_entropy: Dict[str, Dict[int, float]] = {name: {} for name in label_sequence}
+    per_scale_details: Dict[int, Dict[str, object]] = {}
+    stored_signals: Dict[int, np.ndarray] = {}
+
+    for idx, scale in enumerate(cfg.scales, start=1):
+        _log(f"⏩ CHECKPOINT MSE: starting scale τ={scale} ({idx}/{len(cfg.scales)})")
+        coarse = _coarse_grain_signal(data, scale)
+        _log(
+            f"🧱 CHECKPOINT MSE: coarse-graining done for τ={scale} "
+            f"(coarse_samples={coarse.shape[1]})"
+        )
+
+        if coarse.shape[1] <= cfg.m + 1:
+            _log(
+                f"⚠️ CHECKPOINT MSE: insufficient samples ({coarse.shape[1]}) for τ={scale}, "
+                f"requires > {cfg.m + 1}"
+            )
+            entropy_by_scale[scale] = math.nan
+            per_scale_details[scale] = {
+                "status": "insufficient_samples",
+                "coarse_samples": coarse.shape[1],
+            }
+            continue
+
+        per_channel_results = []
+        channel_details: Dict[str, Dict[str, object]] = {}
+
+        for ch_idx, ch_name in enumerate(label_sequence):
+            entropy_value, detail = _compute_sample_entropy(
+                coarse[ch_idx],
+                cfg.m,
+                cfg.r,
+                max_points=cfg.max_pattern_length,
+                channel_name=ch_name,
+            )
+            channel_entropy[ch_name][scale] = entropy_value
+            per_channel_results.append(entropy_value)
+            channel_details[ch_name] = detail
+
+        aggregated_entropy = float(np.nanmean(per_channel_results)) if per_channel_results else math.nan
+        entropy_by_scale[scale] = aggregated_entropy
+        per_scale_details[scale] = {
+            "status": "ok",
+            "channel_details": channel_details,
+            "mean_entropy": aggregated_entropy,
+            "coarse_samples": coarse.shape[1],
+        }
+
+        _log(f"✅ CHECKPOINT MSE: finished τ={scale} | mean SampEn={aggregated_entropy:.4f}")
+
+        if cfg.return_intermediate:
+            stored_signals[scale] = coarse.copy()
+
+    _log("🏁 CHECKPOINT MSE: multiscale entropy pipeline completed")
+
+    result = MultiscaleEntropyResult(
+        entropy_by_scale=entropy_by_scale,
+        channel_entropy=channel_entropy,
+        sample_entropy_by_scale=per_scale_details,
+        coarse_grained_signals=stored_signals if cfg.return_intermediate else None,
+        config=cfg,
+        channel_names=tuple(label_sequence),
+        sampling_frequency=sfreq,
+        processed_samples=data.shape[1],
+    )
+
+    return result
+
+
+def compute_multiscale_entropy_from_raw(
+    raw,  # type: ignore[valid-type]
+    channel_names: Iterable[str],
+    config: Optional[MultiscaleEntropyConfig] = None,
+    *,
+    progress_label: Optional[str] = None,
+) -> MultiscaleEntropyResult:
+    """Convenience wrapper mirroring :func:`compute_entropy_from_raw`."""
+
+    try:
+        import mne  # type: ignore
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ImportError("mne must be installed to use `compute_multiscale_entropy_from_raw`") from exc
+
+    picks = mne.pick_channels(raw.info["ch_names"], include=list(channel_names))
+    if len(picks) == 0:
+        raise ValueError("None of the requested channels are present in the Raw object")
+
+    data, _ = raw.get_data(picks=picks, return_times=True)
+    selected_names = [raw.info["ch_names"][p] for p in picks]
+
+    prefix = f"[{progress_label}] " if progress_label else ""
+    print(
+        f"{prefix}📡 CHECKPOINT MSE: extracted {len(selected_names)} channels from Raw for analysis",
+        flush=True,
+    )
+
+    return compute_multiscale_entropy(
+        data,
+        raw.info["sfreq"],
+        selected_names,
+        config=config,
+        progress_label=progress_label,
+    )
 
 
 # =============================================================================
@@ -520,11 +755,136 @@ def _symmetrise(matrix: np.ndarray) -> np.ndarray:
     return 0.5 * (matrix + matrix.T)
 
 
+def _coarse_grain_signal(data: np.ndarray, scale: int) -> np.ndarray:
+    """Average the signal over non-overlapping blocks of length ``scale``."""
+
+    if scale <= 1:
+        return np.asarray(data, dtype=np.float64)
+
+    n_channels, n_samples = data.shape
+    usable = (n_samples // scale) * scale
+    if usable == 0:
+        return np.asarray(data[:, :0], dtype=np.float64)
+
+    trimmed = data[:, :usable]
+    reshaped = trimmed.reshape(n_channels, -1, scale)
+    coarse = reshaped.mean(axis=2, dtype=np.float64)
+    return coarse
+
+
+def _compute_sample_entropy(
+    signal: np.ndarray,
+    m: int,
+    r: float,
+    *,
+    max_points: Optional[int] = None,
+    channel_name: Optional[str] = None,
+) -> Tuple[float, Dict[str, object]]:
+    """Compute Sample Entropy for a 1D signal with verbose checkpoints."""
+
+    series = np.asarray(signal, dtype=np.float64)
+    n = series.size
+    checkpoint_prefix = f"[{channel_name}]" if channel_name is not None else ""
+    detail: Dict[str, object] = {
+        "channel": channel_name,
+        "signal_length": n,
+        "m": m,
+        "r": r,
+    }
+
+    if max_points is not None and max_points > 0 and n > max_points:
+        idx = np.linspace(0, n - 1, max_points, dtype=int)
+        series = series[idx]
+        n = series.size
+        detail["downsampled_to"] = n
+        print(
+            f"⚖️ CHECKPOINT SampEn {checkpoint_prefix}: downsampling series to {n} samples "
+            f"for memory safety",
+            flush=True,
+        )
+
+    if n <= m + 1:
+        print(f"⚠️ CHECKPOINT SampEn {checkpoint_prefix}: insufficient length ({n})", flush=True)
+        detail["status"] = "insufficient_length"
+        return math.nan, detail
+
+    std = float(np.std(series))
+    tolerance = r * std if std > 0 else r * 1e-12
+    detail["tolerance"] = tolerance
+
+    patterns_m = _extract_pattern_matrix(series, m)
+    patterns_m1 = _extract_pattern_matrix(series, m + 1)
+    detail["patterns_m"] = patterns_m.shape[0]
+    detail["patterns_m1"] = patterns_m1.shape[0]
+
+    print(
+        f"🧮 CHECKPOINT SampEn {checkpoint_prefix}: "
+        f"patterns(m)={patterns_m.shape[0]}, patterns(m+1)={patterns_m1.shape[0]}, tol={tolerance:.3e}",
+        flush=True,
+    )
+
+    matches_m = _count_pattern_matches(patterns_m, tolerance)
+    matches_m1 = _count_pattern_matches(patterns_m1, tolerance)
+    detail["matches_m"] = matches_m
+    detail["matches_m1"] = matches_m1
+
+    print(
+        f"📊 CHECKPOINT SampEn {checkpoint_prefix}: matches(m)={matches_m}, matches(m+1)={matches_m1}",
+        flush=True,
+    )
+
+    if matches_m == 0 or matches_m1 == 0:
+        detail["status"] = "no_matches"
+        print(f"⚠️ CHECKPOINT SampEn {checkpoint_prefix}: zero matches, entropy=inf", flush=True)
+        return math.inf, detail
+
+    ratio = matches_m1 / matches_m
+    entropy_value = float(-math.log(ratio))
+    detail["status"] = "ok"
+
+    print(
+        f"✅ CHECKPOINT SampEn {checkpoint_prefix}: SampEn={entropy_value:.4f}",
+        flush=True,
+    )
+
+    return entropy_value, detail
+
+
+def _extract_pattern_matrix(signal: np.ndarray, length: int) -> np.ndarray:
+    """Return a matrix of all consecutive patterns of size ``length``."""
+
+    if signal.size < length:
+        return np.empty((0, length), dtype=np.float64)
+
+    windows = np.lib.stride_tricks.sliding_window_view(signal, length)
+    return np.asarray(windows, dtype=np.float64)
+
+
+def _count_pattern_matches(patterns: np.ndarray, tolerance: float) -> int:
+    """Count pattern pairs whose Chebyshev distance is below ``tolerance``."""
+
+    n_patterns = patterns.shape[0]
+    if n_patterns <= 1:
+        return 0
+
+    diffs = np.abs(patterns[:, None, :] - patterns[None, :, :])
+    chebyshev = np.max(diffs, axis=2)
+    mask = chebyshev <= tolerance
+
+    # Remove self-comparisons; symmetric pairs are counted twice which is OK
+    total_matches = int(np.sum(mask) - n_patterns)
+    return max(total_matches, 0)
+
+
 __all__ = [
     "RenormalizedEntropyConfig",
     "RenormalizationResult",
     "compute_renormalized_entropy",
     "compute_entropy_from_raw",
+    "MultiscaleEntropyConfig",
+    "MultiscaleEntropyResult",
+    "compute_multiscale_entropy",
+    "compute_multiscale_entropy_from_raw",
 ]
 
 

@@ -12,7 +12,7 @@ Fonctionnalités:
   • Bootstrap CI sur median(diff)
   • Z robuste basé sur MAD des différences
 - Décision par méthode: augmentation / diminution / stagnation
-- Consensus ≥ 2/3: annotation "★" sur le graphique
+- Consensus ≥ 2/3: annotation "*" sur le graphique
 - Tableau latéral intégré (médianes avant/après, D_obs, p, CI, Z, décisions, consensus)
 - Export CSV des données utilisées pour chaque graphique
 
@@ -30,7 +30,7 @@ import os
 import glob
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,7 @@ from matplotlib.lines import Line2D
 import seaborn as sns
 import logging
 import time
+from scipy import stats as scipy_stats
  
 try:
     import mne  # type: ignore
@@ -408,16 +409,22 @@ def _format_num(x: float) -> str:
         return ""
 
 
-def _build_table_rows(plot_data: pd.DataFrame, metric: str, band: str, stats_df: Optional[pd.DataFrame]) -> Tuple[List[str], List[List[str]], List[Dict[str, str]]]:
+def _build_table_rows(
+    plot_data: pd.DataFrame, 
+    metric: str, 
+    band: str, 
+    stats_df: Optional[pd.DataFrame],
+    subject_colors: Optional[Dict[Any, Tuple[float, float, float]]] = None
+) -> Tuple[List[str], List[List[str]], List[Dict[str, Any]]]:
     headers = [
-        'Sujet', 'Bande', 'Canal', 'Med. avant', 'Med. après', 'D_obs',
-        'p (Perm.)', 'CI (Boot.)', 'Z',
-        'Perm', 'Boot', 'Zsc', 'Cons.'
+        'Subject', 'Band', 'Channel', 'Median Before', 'Median After', 'Diff',
+        'p (Perm.)', 'CI (Boot)', 'Z',
+        'Perm', 'Boot', 'Zsc', 'Sig', 'Consensus'
     ]
     subjects = plot_data['Subject_Base'].unique().tolist()
     channel = plot_data['Channel'].iloc[0] if 'Channel' in plot_data.columns else ''
     table_rows: List[List[str]] = []
-    style_meta: List[Dict[str, str]] = []
+    style_meta: List[Dict[str, Any]] = []
     for subj in subjects:
         if stats_df is not None:
             # Utiliser toutes les valeurs par epoch disponibles du même band/canal/stage
@@ -441,22 +448,25 @@ def _build_table_rows(plot_data: pd.DataFrame, metric: str, band: str, stats_df:
         num_down = sum(d == 'diminution' for d in decs)
         if num_up >= 2:
             cons_dec = 'augmentation'
-            cons_text = '★↑'
+            cons_text = 'UP'
+            sig_flag = '*'
         elif num_down >= 2:
             cons_dec = 'diminution'
-            cons_text = '★↓'
+            cons_text = 'DN'
+            sig_flag = '*'
         else:
             cons_dec = 'stagnation' if all(d == 'stagnation' for d in decs) else 'mixte'
-            cons_text = '=' if cons_dec == 'stagnation' else '◦'
+            cons_text = '=' if cons_dec == 'stagnation' else '~'
+            sig_flag = ''
         
         def _sym(decision: str) -> str:
             d = str(decision)
             if d == 'augmentation':
-                return '↑'
+                return 'UP'
             if d == 'diminution':
-                return '↓'
+                return 'DN'
             if d == 'mixte':
-                return '◦'
+                return '~'
             return '='
         row = [
             subj,
@@ -471,10 +481,20 @@ def _build_table_rows(plot_data: pd.DataFrame, metric: str, band: str, stats_df:
             _sym(perm['decision']),
             _sym(boot['decision']),
             _sym(rz['decision']),
+            sig_flag,
             cons_text,
         ]
         table_rows.append(row)
-        style_meta.append({'perm': str(perm['decision']), 'boot': str(boot['decision']), 'z': str(rz['decision']), 'cons': cons_dec})
+        # Include subject color in style_meta
+        subj_color = subject_colors.get(subj) if subject_colors else None
+        style_meta.append({
+            'perm': str(perm['decision']), 
+            'boot': str(boot['decision']), 
+            'z': str(rz['decision']), 
+            'cons': cons_dec, 
+            'sig': sig_flag,
+            'subject_color': subj_color
+        })
     return headers, table_rows, style_meta
 
 
@@ -496,6 +516,10 @@ def create_spaghetti_plot(
     title_suffix: str = "",
     export_csv: bool = True,
     full_metrics: Optional[pd.DataFrame] = None,
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    before_label: str = "Before",
+    after_label: str = "After",
 ) -> Optional[str]:
     # Checkpoint: entrée
     try:
@@ -549,96 +573,419 @@ def create_spaghetti_plot(
         else:
             consensus_map[subject] = ('stagnation', False)
 
+    # Compute global and per-cluster means with Wilcoxon tests
+    # Collect before/after values per subject
+    subject_pairs: Dict[str, Tuple[float, float]] = {}
+    for subject in subjects_unique:
+        sd = plot_data[plot_data['Subject_Base'] == subject].sort_values('Group')
+        groups = sd['Group'].unique()
+        if len(groups) == 2 and 'AVANT' in [str(g).upper() for g in groups]:
+            before_val = sd[sd['Group'].str.upper() == 'AVANT'][metric].values
+            after_val = sd[sd['Group'].str.upper() == 'APRÈS'][metric].values
+            if len(before_val) > 0 and len(after_val) > 0:
+                subject_pairs[subject] = (float(before_val[0]), float(after_val[0]))
+
+    # Global statistics
+    global_stats = {'mean_before': np.nan, 'mean_after': np.nan, 'p_value': np.nan, 'label': 'Global Mean'}
+    if len(subject_pairs) >= 2:
+        before_vals = np.array([v[0] for v in subject_pairs.values()])
+        after_vals = np.array([v[1] for v in subject_pairs.values()])
+        global_stats['mean_before'] = float(np.mean(before_vals))
+        global_stats['mean_after'] = float(np.mean(after_vals))
+        try:
+            stat, pval = scipy_stats.wilcoxon(before_vals, after_vals, alternative='two-sided')
+            global_stats['p_value'] = float(pval)
+        except Exception:
+            global_stats['p_value'] = np.nan
+
+    # Per-cluster statistics
+    cluster_stats: Dict[str, Dict[str, Any]] = {}
+    normalized_clusters_temp: Dict[str, str] = {}
+    if clusters:
+        for key, cid in clusters.items():
+            if key is None or cid is None:
+                continue
+            k = str(key).strip().upper()
+            if not k:
+                continue
+            normalized_clusters_temp[k] = str(cid).strip().upper() or 'A'
+    
+    if normalized_clusters_temp:
+        cluster_pairs: Dict[str, List[Tuple[float, float]]] = {}
+        for subject, (bef, aft) in subject_pairs.items():
+            subj_key = str(subject).strip().upper()
+            cid = normalized_clusters_temp.get(subj_key, 'UNASSIGNED')
+            if cid != 'UNASSIGNED':
+                cluster_pairs.setdefault(cid, []).append((bef, aft))
+        
+        for cid, pairs in cluster_pairs.items():
+            if len(pairs) >= 2:
+                before_vals = np.array([p[0] for p in pairs])
+                after_vals = np.array([p[1] for p in pairs])
+                mean_before = float(np.mean(before_vals))
+                mean_after = float(np.mean(after_vals))
+                try:
+                    stat, pval = scipy_stats.wilcoxon(before_vals, after_vals, alternative='two-sided')
+                    p_value = float(pval)
+                except Exception:
+                    p_value = np.nan
+                cluster_label = f"Cluster {cid}"
+                if cluster_names and cid in cluster_names:
+                    cluster_label = str(cluster_names[cid])
+                cluster_stats[cid] = {
+                    'mean_before': mean_before,
+                    'mean_after': mean_after,
+                    'p_value': p_value,
+                    'label': cluster_label
+                }
+
     # Tracé
-    fig, (ax, ax_table) = plt.subplots(1, 2, figsize=(20, 10), dpi=300, gridspec_kw={'width_ratios': [2, 1]})
+    fig, (ax, ax_table) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 12),
+        dpi=300,
+        gridspec_kw={'height_ratios': [2.2, 1.0]},
+    )
     subjects = plot_data['Subject_Base'].unique()
-    colors = plt.cm.viridis(np.linspace(0, 1, max(1, len(subjects))))
-    subject_colors = dict(zip(subjects, colors))
+    subject_colors: Dict[Any, Tuple[float, float, float]] = {}
+    cluster_subjects: Dict[str, List[Any]] = {}
+    cluster_label_map: Dict[str, str] = {}
+    cluster_rep_colors: Dict[str, Tuple[float, float, float]] = {}
+
+    def _palette_for_cluster(cluster_id: str, size: int) -> List[Tuple[float, float, float]]:
+        if size <= 0:
+            return []
+        cid = str(cluster_id).upper()
+        if cid == 'A':
+            # Highly saturated red-orange palette with MAXIMUM differentiation
+            if size == 1:
+                return [(0.95, 0.15, 0.0)]  # Vivid red-orange
+            elif size == 2:
+                return [(0.85, 0.05, 0.05), (1.0, 0.50, 0.0)]  # Deep red to bright orange
+            elif size == 3:
+                return [(0.75, 0.0, 0.0), (0.95, 0.25, 0.0), (1.0, 0.55, 0.0)]  # Dark red, red-orange, orange
+            elif size == 4:
+                return [(0.65, 0.0, 0.0), (0.85, 0.10, 0.0), (0.95, 0.35, 0.0), (1.0, 0.60, 0.0)]
+            elif size == 5:
+                return [(0.60, 0.0, 0.0), (0.80, 0.05, 0.0), (0.95, 0.25, 0.0), (1.0, 0.45, 0.0), (1.0, 0.65, 0.0)]
+            else:
+                # For larger sets, create evenly spaced highly saturated colors
+                colors = []
+                for i in range(size):
+                    # Vary hue from deep red (0.6,0,0) to bright orange (1.0,0.7,0)
+                    ratio = i / max(1, size - 1)
+                    r = 0.60 + 0.40 * ratio
+                    g = 0.0 + 0.70 * ratio
+                    b = 0.0
+                    colors.append((r, g, b))
+                return colors
+        if cid == 'B':
+            # Highly saturated blue palette with MAXIMUM differentiation
+            if size == 1:
+                return [(0.0, 0.20, 0.95)]  # Vivid blue
+            elif size == 2:
+                return [(0.0, 0.10, 0.75), (0.0, 0.45, 1.0)]  # Deep blue to bright blue
+            elif size == 3:
+                return [(0.0, 0.05, 0.65), (0.0, 0.25, 0.85), (0.0, 0.50, 1.0)]  # Dark blue, medium blue, bright blue
+            elif size == 4:
+                return [(0.0, 0.0, 0.60), (0.0, 0.15, 0.75), (0.0, 0.35, 0.90), (0.0, 0.55, 1.0)]
+            elif size == 5:
+                return [(0.0, 0.0, 0.55), (0.0, 0.10, 0.70), (0.0, 0.25, 0.85), (0.0, 0.45, 0.95), (0.0, 0.60, 1.0)]
+            else:
+                # For larger sets, create evenly spaced highly saturated blues
+                colors = []
+                for i in range(size):
+                    # Vary brightness from dark blue (0,0,0.55) to bright blue (0,0.65,1.0)
+                    ratio = i / max(1, size - 1)
+                    r = 0.0
+                    g = 0.0 + 0.65 * ratio
+                    b = 0.55 + 0.45 * ratio
+                    colors.append((r, g, b))
+                return colors
+        if cid == 'UNASSIGNED':
+            return [(0.7, 0.7, 0.7)] * size
+        return list(sns.color_palette("husl", size))
+
+    normalized_clusters: Dict[str, str] = {}
+    if clusters:
+        for key, cid in clusters.items():
+            if key is None or cid is None:
+                continue
+            k = str(key).strip().upper()
+            if not k:
+                continue
+            normalized_clusters[k] = str(cid).strip().upper() or 'A'
+    if cluster_names:
+        for cid, name in cluster_names.items():
+            if name is None:
+                continue
+            cid_norm = str(cid).strip().upper()
+            label = str(name).strip()
+            if cid_norm and label:
+                cluster_label_map[cid_norm] = label
+    for default_id in ['A', 'B']:
+        cluster_label_map.setdefault(default_id, f"Cluster {default_id}")
+
+    if not normalized_clusters:
+        palette = plt.cm.viridis(np.linspace(0, 1, max(1, len(subjects))))
+        subject_colors = dict(zip(subjects, palette))
+        cluster_subjects['DEFAULT'] = list(subjects)
+        cluster_label_map.setdefault('DEFAULT', 'Subjects')
+        cluster_order = ['DEFAULT']
+    else:
+        for subject in subjects:
+            subj_key = str(subject).strip().upper()
+            cid = normalized_clusters.get(subj_key, 'UNASSIGNED')
+            cluster_subjects.setdefault(cid, []).append(subject)
+        if 'UNASSIGNED' in cluster_subjects:
+            cluster_label_map.setdefault('UNASSIGNED', 'Unassigned')
+        cluster_order: List[str] = []
+        for preferred in ['A', 'B']:
+            if preferred in cluster_subjects:
+                cluster_order.append(preferred)
+        for cid in sorted(cluster_subjects.keys()):
+            if cid not in cluster_order:
+                cluster_order.append(cid)
+        for cid in cluster_order:
+            members = sorted(cluster_subjects.get(cid, []), key=lambda s: str(s))
+            cluster_subjects[cid] = members
+            palette = _palette_for_cluster(cid, len(members))
+            if not palette:
+                palette = [(0.3, 0.3, 0.3)] * len(members)
+            for subj, color in zip(members, palette):
+                subject_colors[subj] = color
+            cluster_rep_colors[cid] = palette[min(len(palette) - 1, max(0, len(palette) // 2))]
+    if 'cluster_order' not in locals():
+        cluster_order = ['DEFAULT']
+
+    group_to_pos = {
+        'AVANT': 1,
+        'APRÈS': 2,
+        'APRES': 2,
+        'BEFORE': 1,
+        'AFTER': 2,
+    }
 
     for subject in subjects:
         sd = plot_data[plot_data['Subject_Base'] == subject].sort_values('Group')
-        x_positions = sd['Group'].map({'AVANT': 1, 'APRÈS': 2}).to_list()
+        x_positions = sd['Group'].apply(lambda g: group_to_pos.get(str(g).upper(), 1)).to_list()
         y_values = sd[metric].to_list()
         col = subject_colors[subject]
         is_sig = consensus_map.get(subject, ('stagnation', False))[1]
         marker = 'o'
-        size = 130
-        edge_w = 1.8
+        size = 200
+        edge_w = 2.8
         # Main subject markers
         ax.scatter(x_positions, y_values, color=col, s=size, alpha=0.85, edgecolors='black', linewidth=edge_w, marker=marker, zorder=3)
         # Transparent overlay for additional depth
-        ax.scatter(x_positions, y_values, color=col, s=60, alpha=0.28, edgecolors='none', linewidth=0, marker='o', zorder=4)
+        ax.scatter(x_positions, y_values, color=col, s=110, alpha=0.3, edgecolors='none', linewidth=0, marker='o', zorder=4)
         if len(sd) == 2:
-            ax.plot(x_positions, y_values, color=col, linewidth=2.5 if is_sig else 1.8, alpha=0.9 if is_sig else 0.7, zorder=2)
+            ax.plot(x_positions, y_values, color=col, linewidth=3.8 if is_sig else 3.0, alpha=0.92 if is_sig else 0.8, zorder=2)
             if is_sig:
-                # Étoile parfaitement centrée sur le point APRÈS
-                ax.text(2, y_values[-1], '★', ha='center', va='center', color='gold', fontsize=18, fontweight='bold', zorder=6)
+                # Find the After point (x=2) explicitly
+                after_idx = None
+                for idx, x in enumerate(x_positions):
+                    if x == 2:  # After position
+                        after_idx = idx
+                        break
+                if after_idx is not None:
+                    ax.scatter(
+                        [2.06],  # Slightly to the right of After position
+                        [y_values[after_idx]],
+                        marker='*',
+                        s=360,
+                        facecolors='#FFD700',
+                        edgecolors='black',
+                        linewidth=1.05,
+                        zorder=6,
+                    )
 
+    # Plot global and per-cluster mean lines
+    mean_lines_legend: List[Line2D] = []
+    
+    # Collect all mean y-positions for smart p-value placement
+    mean_y_positions: List[Tuple[str, float, Dict[str, Any]]] = []
+    
+    # Global mean line
+    if not np.isnan(global_stats['mean_before']) and not np.isnan(global_stats['mean_after']):
+        mean_x = [1, 2]
+        mean_y = [global_stats['mean_before'], global_stats['mean_after']]
+        line = ax.plot(mean_x, mean_y, color='black', linewidth=4.5, alpha=0.95, linestyle='--', 
+                       marker='D', markersize=10, markerfacecolor='white', markeredgecolor='black', 
+                       markeredgewidth=2.5, zorder=7, label=global_stats['label'])[0]
+        mean_lines_legend.append(line)
+        
+        mid_y = (global_stats['mean_before'] + global_stats['mean_after']) / 2
+        mean_y_positions.append(('global', mid_y, global_stats))
+    
+    # Per-cluster mean lines
+    cluster_colors_for_means = {
+        'A': '#ff3300',  # Bright red-orange for cluster A
+        'B': '#0044ff',  # Deep blue for cluster B
+    }
+    cluster_markers = {'A': 's', 'B': '^'}  # Square for A, triangle for B
+    
+    for cid in sorted(cluster_stats.keys()):
+        stats = cluster_stats[cid]
+        if not np.isnan(stats['mean_before']) and not np.isnan(stats['mean_after']):
+            mean_x = [1, 2]
+            mean_y = [stats['mean_before'], stats['mean_after']]
+            color = cluster_colors_for_means.get(cid, '#666666')
+            marker = cluster_markers.get(cid, 'o')
+            line = ax.plot(mean_x, mean_y, color=color, linewidth=4.0, alpha=0.90, linestyle='-.',
+                          marker=marker, markersize=9, markerfacecolor=color, markeredgecolor='black',
+                          markeredgewidth=2.0, zorder=7, label=stats['label'])[0]
+            mean_lines_legend.append(line)
+            
+            mid_y = (stats['mean_before'] + stats['mean_after']) / 2
+            mean_y_positions.append((cid, mid_y, stats))
+    
+    # Annotate p-values with smart spacing to avoid overlap
+    if mean_y_positions:
+        # Sort by y position
+        mean_y_positions.sort(key=lambda x: x[1])
+        ymin, ymax = ax.get_ylim()
+        y_range = ymax - ymin
+        min_spacing = 0.08 * y_range  # Minimum vertical spacing between labels
+        
+        adjusted_positions = []
+        for i, (label, y_pos, stats) in enumerate(mean_y_positions):
+            # Start with the actual position
+            adjusted_y = y_pos
+            
+            # Check overlap with previous labels and adjust
+            for prev_y in adjusted_positions:
+                if abs(adjusted_y - prev_y) < min_spacing:
+                    adjusted_y = prev_y + min_spacing
+            
+            adjusted_positions.append(adjusted_y)
+            
+            if not np.isnan(stats['p_value']):
+                p_text = f"p={stats['p_value']:.3f}"
+                if stats['p_value'] < 0.05:
+                    p_text += "*"
+                
+                if label == 'global':
+                    ax.text(1.5, adjusted_y, p_text, fontsize=9, ha='center', va='center', 
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', linewidth=1.5),
+                           fontweight='bold', zorder=8)
+                else:
+                    color = cluster_colors_for_means.get(label, '#666666')
+                    ax.text(1.5, adjusted_y, p_text, fontsize=8, ha='center', va='center',
+                           bbox=dict(boxstyle='round,pad=0.25', facecolor=color, edgecolor='black', 
+                                    linewidth=1.0, alpha=0.7),
+                           color='white', fontweight='bold', zorder=8)
 
     # Axes
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(['AVANT', 'APRÈS'], fontsize=12)
+    ax.set_xticklabels([before_label, after_label], fontsize=12)
     channel = plot_data['Channel'].iloc[0] if 'Channel' in plot_data.columns else ''
     stage = plot_data['stage'].iloc[0] if 'stage' in plot_data.columns else 'ALL'
     try:
         logging.info(f"[SPAG_PLOT_AX] channel={channel}, stage={stage}")
     except Exception:
         pass
-    ax.set_xlabel('Groupe', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Group', fontsize=14, fontweight='bold')
     if str(metric).upper() == 'AUC':
-        ax.set_ylabel(f"AUC relative (0–1) — {band}", fontsize=14, fontweight='bold')
+        ax.set_ylabel(f"Relative AUC (0–1) — {band}", fontsize=14, fontweight='bold')
     else:
         ax.set_ylabel(f"{metric} (a.u.) — {band}", fontsize=14, fontweight='bold')
-    ax.set_title(f"Canal {channel} — {band} — Stade {stage}{(' — ' + title_suffix) if title_suffix else ''}\n★: consensus (≥2/3)", fontsize=12, fontweight='bold')
+    ax.set_title(f"Channel {channel} — {band} — Stage {stage}{(' — ' + title_suffix) if title_suffix else ''}\n*: consensus (≥2/3)", fontsize=12, fontweight='bold')
     ax.grid(True, alpha=0.4, linestyle='--', linewidth=0.7, axis='y')
     ax.set_facecolor('#FAFAFA')
 
-    # Legend inside plot (top-left), only if ≤ 20 subjects
+    # Legend on the right side with better grouping
     try:
         if len(subjects) <= 20:
-            handles = [Line2D([0], [0], marker='o', color=subject_colors[s], label=str(s), markersize=4.5, linewidth=0) for s in subjects]
-            leg = ax.legend(handles=handles, title='Sujets', loc='upper left', frameon=True, fontsize=8, ncol=2 if len(subjects) > 10 else 1)
-            if leg and leg.get_frame():
-                leg.get_frame().set_alpha(0.85)
-                leg.get_frame().set_facecolor('white')
-    except Exception:
-        pass
-
-    # P-value annotation (median across subjects)
-    try:
-        # Recompute p-values as in consensus pass
-        pvals: List[float] = []
-        subjects_loop = plot_data['Subject_Base'].unique()
-        for subject in subjects_loop:
-            if full_metrics is not None and len(full_metrics) > 0:
-                filt = (full_metrics['Subject'].astype(str).str.contains(subject)) & (full_metrics['Band'] == band)
-                if 'Channel' in full_metrics.columns:
-                    filt = filt & (full_metrics['Channel'] == channel)
-                if 'stage' in full_metrics.columns and 'stage' in plot_data.columns:
-                    filt = filt & (full_metrics['stage'] == stage)
-                sub_df2 = full_metrics[filt]
+            if normalized_clusters:
+                handles: List[Line2D] = []
+                # First add mean lines if present
+                if mean_lines_legend:
+                    handles.append(Line2D([0], [0], color='none', label='── Means ──'))
+                    for mean_line in mean_lines_legend:
+                        handles.append(mean_line)
+                    handles.append(Line2D([0], [0], color='none', label=''))  # Separator
+                
+                # Then add clusters and subjects
+                handles.append(Line2D([0], [0], color='none', label='── Subjects ──'))
+                for cid in cluster_order:
+                    members = cluster_subjects.get(cid, [])
+                    if not members:
+                        continue
+                    representative = cluster_rep_colors.get(cid, subject_colors.get(members[0], (0.4, 0.4, 0.4)))
+                    cluster_label = cluster_label_map.get(cid, f"Cluster {cid}")
+                    handles.append(
+                        Line2D(
+                            [0], [0],
+                            marker='o',
+                            linestyle='',
+                            markerfacecolor=representative,
+                            markeredgecolor='black',
+                            label=cluster_label,
+                            markersize=6,
+                        )
+                    )
+                    for subj in members:
+                        color = subject_colors.get(subj, (0.3, 0.3, 0.3))
+                        handles.append(
+                            Line2D(
+                                [0], [0],
+                                marker='o',
+                                linestyle='',
+                                markerfacecolor=color,
+                                markeredgecolor='black',
+                                label=f"   {subj}",
+                                markersize=4.5,
+                            )
+                        )
+                leg = ax.legend(handles=handles, title='Legend', loc='center left', bbox_to_anchor=(1.02, 0.5), 
+                               frameon=True, fontsize=8, borderaxespad=0)
             else:
-                sub_df2 = plot_data[plot_data['Subject_Base'] == subject]
-            xb = sub_df2[sub_df2['Group'] == 'AVANT'][metric].dropna().to_numpy()
-            xa = sub_df2[sub_df2['Group'] == 'APRÈS'][metric].dropna().to_numpy()
-            pv = permutation_test_median_diff(xb, xa).get('p_value', np.nan)
-            if not np.isnan(pv):
-                pvals.append(float(pv))
-        if pvals:
-            p_med = float(np.median(pvals))
-            txt = f"p = {p_med:.3f}"
-            if p_med < 0.05:
-                txt += "*"
-            ymin, ymax = ax.get_ylim()
-            ax.text(1.5, ymax - 0.02 * (ymax - ymin), txt, ha='center', va='top', fontsize=11, fontstyle='italic')
+                handles = []
+                # First add mean lines if present
+                if mean_lines_legend:
+                    handles.append(Line2D([0], [0], color='none', label='── Means ──'))
+                    for mean_line in mean_lines_legend:
+                        handles.append(mean_line)
+                    handles.append(Line2D([0], [0], color='none', label=''))  # Separator
+                    handles.append(Line2D([0], [0], color='none', label='── Subjects ──'))
+                
+                # Then add subjects
+                for s in subjects:
+                    handles.append(
+                        Line2D(
+                            [0], [0],
+                            marker='o',
+                            linestyle='',
+                            markerfacecolor=subject_colors[s],
+                            markeredgecolor='black',
+                            label=str(s),
+                            markersize=4.5,
+                        )
+                    )
+                leg = ax.legend(
+                    handles=handles,
+                    title='Legend',
+                    loc='center left',
+                    bbox_to_anchor=(1.02, 0.5),
+                    frameon=True,
+                    fontsize=8,
+                    borderaxespad=0,
+                )
+            if leg and leg.get_frame():
+                leg.get_frame().set_alpha(0.95)
+                leg.get_frame().set_facecolor('white')
+                leg.get_frame().set_edgecolor('black')
+                leg.get_frame().set_linewidth(1.0)
     except Exception:
         pass
 
     # Tableau latéral
     ax_table.axis('off')
-    headers, rows, style_meta = _build_table_rows(plot_data, metric=metric, band=band, stats_df=stats_df)
+    headers, rows, style_meta = _build_table_rows(plot_data, metric=metric, band=band, stats_df=stats_df, subject_colors=subject_colors)
     table_data = [headers] + rows
-    table = ax_table.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.09, 0.09, 0.09, 0.11, 0.11, 0.09, 0.11, 0.14, 0.07, 0.09, 0.09, 0.09, 0.08])
+    table = ax_table.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.11, 0.09, 0.09, 0.11, 0.11, 0.09, 0.11, 0.14, 0.07, 0.09, 0.09, 0.09, 0.05, 0.08])
     table.auto_set_font_size(False)
     table.set_fontsize(6.5)
     table.scale(1, 1.45)
@@ -647,13 +994,22 @@ def create_spaghetti_plot(
         cell = table[(0, j)]
         cell.set_facecolor('#455A64')
         cell.set_text_props(weight='bold', color='white')
-    # Décisions colorées
+    # Décisions colorées and subject names colored by cluster
     for i, meta in enumerate(style_meta, start=1):
-        for col_idx, key in [(9, 'perm'), (10, 'boot'), (11, 'z'), (12, 'cons')]:
+        # Color decision cells
+        for col_idx, key in [(9, 'perm'), (10, 'boot'), (11, 'z'), (13, 'cons')]:
             cell = table[(i, col_idx)]
             cell.set_facecolor(_color_for_decision(meta[key]))
+        # Color subject name (column 0) based on cluster - use exact line color
+        if meta.get('subject_color'):
+            subject_cell = table[(i, 0)]
+            rgb = meta['subject_color']
+            # Use the exact line color as background for perfect match
+            subject_cell.set_facecolor(rgb)
+            # White text for maximum contrast on saturated colors
+            subject_cell.set_text_props(weight='bold', color='white')
 
-    ax_table.set_title('Intra-sujet (robuste) — flèches: ↑/↓/=', fontsize=11, fontweight='bold', pad=14)
+    ax_table.set_title('Robust intra-subject metrics — codes: UP/DN/=, * = significant', fontsize=11, fontweight='bold', pad=14)
 
     plt.tight_layout()
     os.makedirs(output_dir, exist_ok=True)
@@ -680,12 +1036,239 @@ def create_spaghetti_plot(
         except Exception:
             pass
 
-    return filepath
+    # Return filepath and cluster stats for CSV summary
+    return filepath, {'global': global_stats, 'clusters': cluster_stats}
 
 
 # =====================
 # API de génération
 # =====================
+
+def _compute_subject_decisions_for_combo(
+    plot_data: pd.DataFrame,
+    metric: str,
+    band: str,
+    stats_df: Optional[pd.DataFrame] = None,
+) -> Tuple[Dict[str, str], float]:
+    """
+    Calcule la décision par sujet (augmentation/diminution/stagnation) pour une combinaison donnée
+    et retourne également une p-value médiane intra-sujet (permutation test) pour le résumé global.
+    """
+    # Préparer base sujet
+    data = plot_data.copy()
+    if 'Subject_Base' not in data.columns:
+        data['Subject_Base'] = data['Subject'].astype(str).str.extract(r'(S\d+)')[0].fillna(data['Subject'].astype(str))
+
+    # Source pour stats per-epoch si fournie
+    stats_src: Optional[pd.DataFrame] = None
+    if stats_df is not None and len(stats_df) > 0:
+        stats_src = stats_df.copy()
+        stats_src['Subject_Base'] = stats_src['Subject'].astype(str).str.extract(r'(S\d+)')[0].fillna(stats_src['Subject'].astype(str))
+
+    decisions: Dict[str, str] = {}
+    pvals: List[float] = []
+    subjects_unique = data['Subject_Base'].unique()
+
+    # Canal et stade si disponibles (pour filtrage dans stats_src)
+    channel = data['Channel'].iloc[0] if 'Channel' in data.columns else None
+    stage = data['stage'].iloc[0] if 'stage' in data.columns else None
+
+    for subject in subjects_unique:
+        if stats_src is not None:
+            filt = (stats_src['Subject_Base'] == subject) & (stats_src['Band'] == band)
+            if channel is not None and 'Channel' in stats_src.columns:
+                filt = filt & (stats_src['Channel'] == channel)
+            if stage is not None and 'stage' in stats_src.columns and 'stage' in data.columns:
+                filt = filt & (stats_src['stage'] == stage)
+            sub_df = stats_src[filt]
+        else:
+            sub_df = data[data['Subject_Base'] == subject]
+
+        x_b = sub_df[sub_df['Group'] == 'AVANT'][metric].dropna().to_numpy()
+        x_a = sub_df[sub_df['Group'] == 'APRÈS'][metric].dropna().to_numpy()
+
+        perm = permutation_test_median_diff(x_b, x_a)
+        boot = bootstrap_ci_median_diff(x_b, x_a)
+        rz = robust_z_intrasubject(x_b, x_a)
+
+        decs = [perm['decision'], boot['decision'], rz['decision']]
+        num_up = sum(d == 'augmentation' for d in decs)
+        num_down = sum(d == 'diminution' for d in decs)
+        if num_up >= 2:
+            decisions[subject] = 'augmentation'
+        elif num_down >= 2:
+            decisions[subject] = 'diminution'
+        else:
+            decisions[subject] = 'stagnation'
+
+        pv = perm.get('p_value', np.nan)
+        if not np.isnan(pv):
+            pvals.append(float(pv))
+
+    p_med = float(np.median(pvals)) if pvals else float('nan')
+    return decisions, p_med
+
+
+def _export_summary_csv(
+    subjects_by_col_and_decision: Dict[str, Dict[str, List[str]]],
+    pvals_by_col: Dict[str, List[float]],
+    output_dir: str,
+    filename: str = "Resume_Comparaison_Bandes_Stades.csv",
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    global_mean_pvals: Optional[Dict[str, List[float]]] = None,
+    cluster_pvals: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    global_means: Optional[Dict[str, Tuple[float, float, float]]] = None,
+    cluster_means: Optional[Dict[str, Dict[str, Tuple[float, float, float]]]] = None,
+) -> Optional[str]:
+    """
+    Exporte un CSV récapitulatif avec:
+      - Colonne 0: Indicateur_Global
+      - Colonnes suivantes: canal_bande_stade (ex: F3_delta_N3)
+      - Ligne 1: tendance majoritaire + p-value Wilcoxon de la moyenne globale
+      - Lignes suivantes: augmentation / diminution / stagnation avec la liste des sujets
+      - Lignes additionnelles: moyennes before/after et pentes
+      - Si clusters fournis: lignes supplémentaires pour tendances par cluster avec p-values et moyennes
+    """
+    try:
+        # Ordonner colonnes par nom
+        cols = sorted(subjects_by_col_and_decision.keys())
+        header = ["Indicateur_Global"] + cols
+
+        def _trend_and_sig(col: str, subject_list: Optional[List[str]] = None, cluster_id: Optional[str] = None) -> str:
+            """Calcule la tendance pour un ensemble de sujets donné."""
+            buckets = subjects_by_col_and_decision.get(col, {})
+            
+            # Si liste de sujets fournie, filtrer pour ce sous-ensemble
+            if subject_list is not None:
+                subject_set = set(subject_list)
+                filtered_buckets = {
+                    k: [s for s in v if s in subject_set]
+                    for k, v in buckets.items()
+                }
+                counts = {k: len(set(v)) for k, v in filtered_buckets.items()}
+            else:
+                counts = {k: len(set(v)) for k, v in buckets.items()}
+            
+            # Assurer toutes les clés
+            for k in ['augmentation', 'diminution', 'stagnation']:
+                counts.setdefault(k, 0)
+            
+            # Tendance majoritaire
+            trend = max(counts.keys(), key=lambda k: counts[k]) if counts else 'stagnation'
+            
+            # P-value
+            if subject_list is None:
+                # Global: utiliser p-value Wilcoxon de la moyenne globale
+                if global_mean_pvals:
+                    p_list = global_mean_pvals.get(col, [])
+                    if p_list:
+                        p_med = float(np.median(p_list))
+                        if not np.isnan(p_med):
+                            return f"{trend} (p={p_med:.3f}{'*' if p_med < 0.05 else ''})"
+                return trend
+            elif cluster_id and cluster_pvals:
+                # Cluster: utiliser p-value Wilcoxon de la moyenne du cluster
+                cluster_p_list = cluster_pvals.get(col, {}).get(cluster_id, [])
+                if cluster_p_list:
+                    p_med = float(np.median(cluster_p_list))
+                    if not np.isnan(p_med):
+                        return f"{trend} (p={p_med:.3f}{'*' if p_med < 0.05 else ''})"
+                return trend
+            else:
+                # Pour les clusters sans p-values, juste la tendance
+                return trend
+
+        indicator_row = ["Tendance globale"] + [_trend_and_sig(c) for c in cols]
+        row_up = ["augmentation"] + [", ".join(sorted(set(subjects_by_col_and_decision.get(c, {}).get('augmentation', [])))) for c in cols]
+        row_down = ["diminution"] + [", ".join(sorted(set(subjects_by_col_and_decision.get(c, {}).get('diminution', [])))) for c in cols]
+        row_eq = ["stagnation"] + [", ".join(sorted(set(subjects_by_col_and_decision.get(c, {}).get('stagnation', [])))) for c in cols]
+
+        table = [header, indicator_row, row_up, row_down, row_eq]
+        
+        # Ajouter ligne vide + moyennes globales
+        if global_means:
+            table.append([""] * len(header))
+            # Mean Before
+            row_mean_before = ["Mean Before (global)"] + [
+                f"{global_means[c][0]:.4f}" if c in global_means else "" for c in cols
+            ]
+            table.append(row_mean_before)
+            # Mean After
+            row_mean_after = ["Mean After (global)"] + [
+                f"{global_means[c][1]:.4f}" if c in global_means else "" for c in cols
+            ]
+            table.append(row_mean_after)
+            # Slope (After - Before)
+            row_slope = ["Slope (Δ global)"] + [
+                f"{global_means[c][2]:.4f}" if c in global_means else "" for c in cols
+            ]
+            table.append(row_slope)
+
+        # Ajouter les tendances par cluster si disponibles
+        if clusters and len(clusters) > 0:
+            # Normaliser clusters
+            normalized_clusters: Dict[str, str] = {}
+            for key, cid in clusters.items():
+                if key is None or cid is None:
+                    continue
+                k = str(key).strip().upper()
+                if not k:
+                    continue
+                normalized_clusters[k] = str(cid).strip().upper() or 'A'
+            
+            # Grouper sujets par cluster
+            cluster_subjects: Dict[str, List[str]] = {}
+            for subject, cid in normalized_clusters.items():
+                cluster_subjects.setdefault(cid, []).append(subject)
+            
+            # Ajouter ligne vide de séparation
+            table.append([""] * len(header))
+            
+            # Pour chaque cluster, ajouter une ligne de tendance avec p-value et moyennes
+            for cid in sorted(cluster_subjects.keys()):
+                subjects_in_cluster = cluster_subjects[cid]
+                cluster_label = cluster_names.get(cid, f"Cluster {cid}") if cluster_names else f"Cluster {cid}"
+                
+                # Tendance + p-value
+                cluster_trend_row = [f"Tendance {cluster_label}"] + [
+                    _trend_and_sig(c, subjects_in_cluster, cluster_id=cid) for c in cols
+                ]
+                table.append(cluster_trend_row)
+                
+                # Moyennes du cluster si disponibles
+                if cluster_means and any(cid in cluster_means.get(c, {}) for c in cols):
+                    # Mean Before
+                    row_mean_before = [f"Mean Before ({cluster_label})"] + [
+                        f"{cluster_means[c][cid][0]:.4f}" if c in cluster_means and cid in cluster_means[c] else "" for c in cols
+                    ]
+                    table.append(row_mean_before)
+                    # Mean After
+                    row_mean_after = [f"Mean After ({cluster_label})"] + [
+                        f"{cluster_means[c][cid][1]:.4f}" if c in cluster_means and cid in cluster_means[c] else "" for c in cols
+                    ]
+                    table.append(row_mean_after)
+                    # Slope
+                    row_slope = [f"Slope (Δ {cluster_label})"] + [
+                        f"{cluster_means[c][cid][2]:.4f}" if c in cluster_means and cid in cluster_means[c] else "" for c in cols
+                    ]
+                    table.append(row_slope)
+
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, filename)
+        # Écriture CSV simple
+        with open(out_path, 'w', encoding='utf-8', newline='') as f:
+            import csv
+            writer = csv.writer(f)
+            for row in table:
+                writer.writerow(row)
+        try:
+            logging.info(f"[SPAG_SUMMARY_CSV] path={out_path}")
+        except Exception:
+            pass
+        return out_path
+    except Exception:
+        return None
 def _filter_metrics(
     metrics: pd.DataFrame,
     selected_bands: Optional[Iterable[str]] = None,
@@ -693,6 +1276,7 @@ def _filter_metrics(
     selected_channels: Optional[Iterable[str]] = None,
     selected_subjects: Optional[Iterable[str]] = None,
     selected_band_stage_map: Optional[Dict[str, Iterable[str]]] = None,
+    selected_combinations: Optional[Iterable[Tuple[str, str, str]]] = None,
 ) -> pd.DataFrame:
     df = metrics.copy()
     if selected_bands:
@@ -708,6 +1292,11 @@ def _filter_metrics(
         if allowed:
             allowed_set = set(allowed)
             df = df[df.apply(lambda r: (str(r['Band']), str(r['stage'])) in allowed_set, axis=1)]
+    # Filtrage explicite par combinaisons (Channel, stage, Band)
+    if selected_combinations:
+        allowed_combo = set((str(ch), str(st), str(b)) for ch, st, b in selected_combinations)
+        if 'stage' in df.columns:
+            df = df[df.apply(lambda r: (str(r['Channel']), str(r['stage']), str(r['Band'])) in allowed_combo, axis=1)]
     if selected_channels:
         df = df[df['Channel'].isin(list(selected_channels))]
     if selected_subjects:
@@ -746,28 +1335,91 @@ def generate_spaghetti_from_dataframe(
     selected_stages: Optional[Iterable[str]] = None,
     selected_channels: Optional[Iterable[str]] = None,
     selected_subjects: Optional[Iterable[str]] = None,
+    selected_combinations: Optional[Iterable[Tuple[str, str, str]]] = None,
     bands_mapping: Optional[Dict[str, Tuple[float, float]]] = None,
     total_range: Tuple[float, float] = (0.5, 100.0),
     metric: str = 'AUC',
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    before_label: str = "Before",
+    after_label: str = "After",
 ) -> List[str]:
     # Calcul des métriques à partir des FFT
     metrics = compute_band_metrics_from_fft(df_fft, bands=bands_mapping or DEFAULT_BANDS, total_range=total_range)
     # Filtrage
-    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects)
+    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects, None, selected_combinations)
     if len(metrics) == 0:
         return []
     # Préparer données pour graphes
     agg = _aggregate_for_plot(metrics, metric=metric)
     outputs: List[str] = []
+    # Accumulateur pour résumé global
+    subjects_acc: Dict[str, Dict[str, List[str]]]= {}
+    pvals_acc: Dict[str, List[float]] = {}
+    global_mean_pvals_acc: Dict[str, List[float]] = {}  # {col_key: [global_p_values]}
+    global_means_acc: Dict[str, Tuple[float, float, float]] = {}  # {col_key: (mean_before, mean_after, slope)}
+    cluster_pvals_acc: Dict[str, Dict[str, List[float]]] = {}  # {col_key: {cluster_id: [p_values]}}
+    cluster_means_acc: Dict[str, Dict[str, Tuple[float, float, float]]] = {}  # {col_key: {cluster_id: (before, after, slope)}}
     for ch, st, b in _make_combinations(agg):
         sub = agg[(agg['Channel'] == ch) & (agg['Band'] == b) & (agg['stage'] == st)]
         if len(sub) == 0:
             continue
-        # Passer les valeurs par epoch du même band/canal/stage comme source pour les stats
+        # Source per-epoch pour stats
         stats_src = metrics[(metrics['Channel'] == ch) & (metrics['Band'] == b) & (metrics['stage'] == st)]
-        out = create_spaghetti_plot(sub, metric=metric, band=b, output_dir=os.path.join(output_dir, f"{ch}"), title_suffix=f"Stage {st}", full_metrics=stats_src)
+
+        # Décisions par sujet pour cette combo
+        decisions_map, p_med = _compute_subject_decisions_for_combo(sub, metric=metric, band=b, stats_df=stats_src)
+        col_key = f"{str(ch)}_{str(b).lower()}_{str(st)}"  # Inclure le canal
+        bucket = subjects_acc.setdefault(col_key, {"augmentation": [], "diminution": [], "stagnation": []})
+        for subj, dec in decisions_map.items():
+            bucket.setdefault(dec, []).append(str(subj))
+        pvals_acc.setdefault(col_key, []).append(p_med)
+
+        out, mean_stats = create_spaghetti_plot(
+            sub,
+            metric=metric,
+            band=b,
+            output_dir=os.path.join(output_dir, f"{ch}"),
+            title_suffix="",
+            full_metrics=stats_src,
+            clusters=clusters,
+            cluster_names=cluster_names,
+            before_label=before_label,
+            after_label=after_label,
+        )
         if out:
             outputs.append(out)
+        
+        # Collecter les p-values et moyennes (globale et par cluster)
+        if mean_stats:
+            # Moyennes et p-value globale
+            if 'global' in mean_stats:
+                g_stats = mean_stats['global']
+                if not np.isnan(g_stats.get('p_value', np.nan)):
+                    global_mean_pvals_acc.setdefault(col_key, []).append(g_stats['p_value'])
+                if not np.isnan(g_stats.get('mean_before', np.nan)) and not np.isnan(g_stats.get('mean_after', np.nan)):
+                    mean_before = g_stats['mean_before']
+                    mean_after = g_stats['mean_after']
+                    slope = mean_after - mean_before
+                    global_means_acc[col_key] = (mean_before, mean_after, slope)
+            
+            # Moyennes et p-values par cluster
+            if 'clusters' in mean_stats:
+                cluster_pvals_acc.setdefault(col_key, {})
+                cluster_means_acc.setdefault(col_key, {})
+                for cid, stats in mean_stats['clusters'].items():
+                    if not np.isnan(stats.get('p_value', np.nan)):
+                        cluster_pvals_acc[col_key].setdefault(cid, []).append(stats['p_value'])
+                    if not np.isnan(stats.get('mean_before', np.nan)) and not np.isnan(stats.get('mean_after', np.nan)):
+                        mean_before = stats['mean_before']
+                        mean_after = stats['mean_after']
+                        slope = mean_after - mean_before
+                        cluster_means_acc[col_key][cid] = (mean_before, mean_after, slope)
+
+    # Exporter le résumé global dans le dossier principal
+    _export_summary_csv(subjects_acc, pvals_acc, output_dir=output_dir, clusters=clusters, cluster_names=cluster_names, 
+                       global_mean_pvals=global_mean_pvals_acc, cluster_pvals=cluster_pvals_acc,
+                       global_means=global_means_acc, cluster_means=cluster_means_acc)
     return outputs
 
 
@@ -782,6 +1434,10 @@ def generate_spaghetti_from_fft_csv(
     bands_mapping: Optional[Dict[str, Tuple[float, float]]] = None,
     total_range: Tuple[float, float] = (0.5, 45.0),
     metric: str = 'AUC',
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    before_label: str = "Before",
+    after_label: str = "After",
 ) -> List[str]:
     # Charger FFT CSV
     df_b = _load_fft_group(before_dir, 'AVANT')
@@ -797,6 +1453,10 @@ def generate_spaghetti_from_fft_csv(
         bands_mapping=bands_mapping,
         total_range=total_range,
         metric=metric,
+        clusters=clusters,
+        cluster_names=cluster_names,
+        before_label=before_label,
+        after_label=after_label,
     )
 
 
@@ -1069,6 +1729,7 @@ def generate_spaghetti_from_edf_dirs(
     selected_channels: Optional[Iterable[str]] = None,
     selected_subjects: Optional[Iterable[str]] = None,
     selected_band_stage_map: Optional[Dict[str, Iterable[str]]] = None,
+    selected_combinations: Optional[Iterable[Tuple[str, str, str]]] = None,
     bands_mapping: Optional[Dict[str, Tuple[float, float]]] = None,
     total_range: Tuple[float, float] = (0.5, 45.0),
     epoch_len: float = 30.0,
@@ -1077,6 +1738,10 @@ def generate_spaghetti_from_edf_dirs(
     n_perm: int = N_PERM,
     n_boot: int = N_BOOT,
     edf_to_excel_map: Optional[Dict[str, str]] = None,
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    before_label: str = "Before",
+    after_label: str = "After",
 ) -> List[str]:
     """
     Génère des graphiques spaghetti directement depuis des dossiers contenant des EDF.
@@ -1114,7 +1779,7 @@ def generate_spaghetti_from_edf_dirs(
         return []
 
     print(f"Chargement EDF AVANT: {len(edf_before)} fichiers; APRÈS: {len(edf_after)} fichiers")
-    # Calculer l'union des stades requis depuis la carte bande->stades
+    # Calculer l'union des stades requis depuis la carte bande->stades ou combinaisons explicites
     req_stages = None
     if selected_band_stage_map:
         req_set = set()
@@ -1122,6 +1787,8 @@ def generate_spaghetti_from_edf_dirs(
             for st in stages:
                 req_set.add(st)
         req_stages = sorted(req_set)
+    elif selected_combinations:
+        req_stages = sorted({st for (_ch, st, _b) in selected_combinations})
 
     df_b = _edf_to_metrics(edf_before, 'AVANT', selected_channels, mapping, epoch_len, total_range, edf_to_excel_map, req_stages) if edf_before else pd.DataFrame()
     df_a = _edf_to_metrics(edf_after, 'APRÈS', selected_channels, mapping, epoch_len, total_range, edf_to_excel_map, req_stages) if edf_after else pd.DataFrame()
@@ -1132,7 +1799,7 @@ def generate_spaghetti_from_edf_dirs(
         pass
 
     # Filtres
-    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects, selected_band_stage_map)
+    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects, selected_band_stage_map, selected_combinations)
     if len(metrics) == 0:
         print("Aucune donnée après filtrage.")
         return []
@@ -1146,6 +1813,12 @@ def generate_spaghetti_from_edf_dirs(
 
     # Génération des graphiques par combinaison Canal × Stade × Bande
     outputs: List[str] = []
+    subjects_acc: Dict[str, Dict[str, List[str]]] = {}
+    pvals_acc: Dict[str, List[float]] = {}
+    global_mean_pvals_acc: Dict[str, List[float]] = {}  # {col_key: [global_p_values]}
+    global_means_acc: Dict[str, Tuple[float, float, float]] = {}  # {col_key: (mean_before, mean_after, slope)}
+    cluster_pvals_acc: Dict[str, Dict[str, List[float]]] = {}  # {col_key: {cluster_id: [p_values]}}
+    cluster_means_acc: Dict[str, Dict[str, Tuple[float, float, float]]] = {}  # {col_key: {cluster_id: (before, after, slope)}}
     decisions_counter = {'augmentation': 0, 'diminution': 0, 'stagnation': 0}
     for ch, st, b in _make_combinations(agg):
         sub = agg[(agg['Channel'] == ch) & (agg['Band'] == b) & (agg['stage'] == st)]
@@ -1156,16 +1829,54 @@ def generate_spaghetti_from_edf_dirs(
         if len(sub) == 0:
             continue
         stats_src = metrics[(metrics['Channel'] == ch) & (metrics['Band'] == b) & (metrics['stage'] == st)]
-        out = create_spaghetti_plot(
+        # Décisions par sujet pour ce combo
+        decisions_map, p_med = _compute_subject_decisions_for_combo(sub, metric=metric, band=b, stats_df=stats_src)
+        col_key = f"{str(ch)}_{str(b).lower()}_{str(st)}"  # Inclure le canal
+        bucket = subjects_acc.setdefault(col_key, {"augmentation": [], "diminution": [], "stagnation": []})
+        for subj, dec in decisions_map.items():
+            bucket.setdefault(dec, []).append(str(subj))
+        pvals_acc.setdefault(col_key, []).append(p_med)
+
+        out, mean_stats = create_spaghetti_plot(
             sub,
             metric=metric,
             band=b,
             output_dir=os.path.join(output_dir, f"{ch}"),
-            title_suffix=f"Stage {st}",
+            title_suffix="",
             full_metrics=stats_src,
+            clusters=clusters,
+            cluster_names=cluster_names,
+            before_label=before_label,
+            after_label=after_label,
         )
         if out:
             outputs.append(out)
+        
+        # Collecter les p-values et moyennes (globale et par cluster)
+        if mean_stats:
+            # Moyennes et p-value globale
+            if 'global' in mean_stats:
+                g_stats = mean_stats['global']
+                if not np.isnan(g_stats.get('p_value', np.nan)):
+                    global_mean_pvals_acc.setdefault(col_key, []).append(g_stats['p_value'])
+                if not np.isnan(g_stats.get('mean_before', np.nan)) and not np.isnan(g_stats.get('mean_after', np.nan)):
+                    mean_before = g_stats['mean_before']
+                    mean_after = g_stats['mean_after']
+                    slope = mean_after - mean_before
+                    global_means_acc[col_key] = (mean_before, mean_after, slope)
+            
+            # Moyennes et p-values par cluster
+            if 'clusters' in mean_stats:
+                cluster_pvals_acc.setdefault(col_key, {})
+                cluster_means_acc.setdefault(col_key, {})
+                for cid, stats in mean_stats['clusters'].items():
+                    if not np.isnan(stats.get('p_value', np.nan)):
+                        cluster_pvals_acc[col_key].setdefault(cid, []).append(stats['p_value'])
+                    if not np.isnan(stats.get('mean_before', np.nan)) and not np.isnan(stats.get('mean_after', np.nan)):
+                        mean_before = stats['mean_before']
+                        mean_after = stats['mean_after']
+                        slope = mean_after - mean_before
+                        cluster_means_acc[col_key][cid] = (mean_before, mean_after, slope)
             # Résumé rapide: compter décisions consensus
             # Déterminer consensus global sur ce combo (majorité des sujets)
             sub_stats = []
@@ -1192,9 +1903,14 @@ def generate_spaghetti_from_edf_dirs(
                 maj = max(set(sub_stats), key=sub_stats.count)
                 decisions_counter[maj] += 1
 
-    print("\n=== RÉSUMÉ GLOBAL (consensus par combinaison) ===")
+    print("\n=== GLOBAL SUMMARY (consensus per combination) ===")
+    label_map = {'augmentation': 'increase', 'diminution': 'decrease', 'stagnation': 'stable'}
     for k, v in decisions_counter.items():
-        print(f"  {k}: {v}")
+        print(f"  {label_map.get(k, k)}: {v}")
+    # Export CSV summary (columns band_stage)
+    _export_summary_csv(subjects_acc, pvals_acc, output_dir=output_dir, clusters=clusters, cluster_names=cluster_names, 
+                       global_mean_pvals=global_mean_pvals_acc, cluster_pvals=cluster_pvals_acc,
+                       global_means=global_means_acc, cluster_means=cluster_means_acc)
     try:
         logging.info(f"[SPAG_DIRS_SUMMARY] {decisions_counter}")
     except Exception:
@@ -1211,6 +1927,7 @@ def generate_spaghetti_from_edf_file_lists(
     selected_channels: Optional[Iterable[str]] = None,
     selected_subjects: Optional[Iterable[str]] = None,
     selected_band_stage_map: Optional[Dict[str, Iterable[str]]] = None,
+    selected_combinations: Optional[Iterable[Tuple[str, str, str]]] = None,
     bands_mapping: Optional[Dict[str, Tuple[float, float]]] = None,
     total_range: Tuple[float, float] = (0.5, 45.0),
     epoch_len: float = 30.0,
@@ -1219,6 +1936,10 @@ def generate_spaghetti_from_edf_file_lists(
     n_perm: int = N_PERM,
     n_boot: int = N_BOOT,
     edf_to_excel_map: Optional[Dict[str, str]] = None,
+    clusters: Optional[Dict[str, str]] = None,
+    cluster_names: Optional[Dict[str, str]] = None,
+    before_label: str = "Before",
+    after_label: str = "After",
 ) -> List[str]:
     global RNG_SEED, N_PERM, N_BOOT
     RNG_SEED = int(rng_seed)
@@ -1236,6 +1957,8 @@ def generate_spaghetti_from_edf_file_lists(
             for st in stages:
                 req_set.add(st)
         req_stages = sorted(req_set)
+    elif selected_combinations:
+        req_stages = sorted({st for (_ch, st, _b) in selected_combinations})
 
     df_b = _edf_to_metrics(before_files, 'AVANT', selected_channels, mapping, epoch_len, total_range, edf_to_excel_map, req_stages) if before_files else pd.DataFrame()
     df_a = _edf_to_metrics(after_files, 'APRÈS', selected_channels, mapping, epoch_len, total_range, edf_to_excel_map, req_stages) if after_files else pd.DataFrame()
@@ -1244,7 +1967,7 @@ def generate_spaghetti_from_edf_file_lists(
         logging.info(f"[SPAG_LIST_METRICS] total_rows={len(metrics)}")
     except Exception:
         pass
-    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects, selected_band_stage_map)
+    metrics = _filter_metrics(metrics, selected_bands, selected_stages, selected_channels, selected_subjects, selected_band_stage_map, selected_combinations)
     if len(metrics) == 0:
         return []
     agg = _aggregate_for_plot(metrics, metric=metric)
@@ -1253,6 +1976,12 @@ def generate_spaghetti_from_edf_file_lists(
     except Exception:
         pass
     outputs: List[str] = []
+    subjects_acc: Dict[str, Dict[str, List[str]]] = {}
+    pvals_acc: Dict[str, List[float]] = {}
+    global_mean_pvals_acc: Dict[str, List[float]] = {}  # {col_key: [global_p_values]}
+    global_means_acc: Dict[str, Tuple[float, float, float]] = {}  # {col_key: (mean_before, mean_after, slope)}
+    cluster_pvals_acc: Dict[str, Dict[str, List[float]]] = {}  # {col_key: {cluster_id: [p_values]}}
+    cluster_means_acc: Dict[str, Dict[str, Tuple[float, float, float]]] = {}  # {col_key: {cluster_id: (before, after, slope)}}
     for ch, st, b in _make_combinations(agg):
         sub = agg[(agg['Channel'] == ch) & (agg['Band'] == b) & (agg['stage'] == st)]
         try:
@@ -1262,9 +1991,59 @@ def generate_spaghetti_from_edf_file_lists(
         if len(sub) == 0:
             continue
         stats_src = metrics[(metrics['Channel'] == ch) & (metrics['Band'] == b) & (metrics['stage'] == st)]
-        out = create_spaghetti_plot(sub, metric=metric, band=b, output_dir=os.path.join(output_dir, f"{ch}"), title_suffix=f"Stage {st}", full_metrics=stats_src)
+        # Décisions par sujet pour cette combo
+        decisions_map, p_med = _compute_subject_decisions_for_combo(sub, metric=metric, band=b, stats_df=stats_src)
+        col_key = f"{str(ch)}_{str(b).lower()}_{str(st)}"  # Inclure le canal
+        bucket = subjects_acc.setdefault(col_key, {"augmentation": [], "diminution": [], "stagnation": []})
+        for subj, dec in decisions_map.items():
+            bucket.setdefault(dec, []).append(str(subj))
+        pvals_acc.setdefault(col_key, []).append(p_med)
+
+        out, mean_stats = create_spaghetti_plot(
+            sub,
+            metric=metric,
+            band=b,
+            output_dir=os.path.join(output_dir, f"{ch}"),
+            title_suffix="",
+            full_metrics=stats_src,
+            clusters=clusters,
+            cluster_names=cluster_names,
+            before_label=before_label,
+            after_label=after_label,
+        )
         if out:
             outputs.append(out)
+        
+        # Collecter les p-values et moyennes (globale et par cluster)
+        if mean_stats:
+            # Moyennes et p-value globale
+            if 'global' in mean_stats:
+                g_stats = mean_stats['global']
+                if not np.isnan(g_stats.get('p_value', np.nan)):
+                    global_mean_pvals_acc.setdefault(col_key, []).append(g_stats['p_value'])
+                if not np.isnan(g_stats.get('mean_before', np.nan)) and not np.isnan(g_stats.get('mean_after', np.nan)):
+                    mean_before = g_stats['mean_before']
+                    mean_after = g_stats['mean_after']
+                    slope = mean_after - mean_before
+                    global_means_acc[col_key] = (mean_before, mean_after, slope)
+            
+            # Moyennes et p-values par cluster
+            if 'clusters' in mean_stats:
+                cluster_pvals_acc.setdefault(col_key, {})
+                cluster_means_acc.setdefault(col_key, {})
+                for cid, stats in mean_stats['clusters'].items():
+                    if not np.isnan(stats.get('p_value', np.nan)):
+                        cluster_pvals_acc[col_key].setdefault(cid, []).append(stats['p_value'])
+                    if not np.isnan(stats.get('mean_before', np.nan)) and not np.isnan(stats.get('mean_after', np.nan)):
+                        mean_before = stats['mean_before']
+                        mean_after = stats['mean_after']
+                        slope = mean_after - mean_before
+                        cluster_means_acc[col_key][cid] = (mean_before, mean_after, slope)
+    
+    # Exporter le résumé global dans le dossier principal
+    _export_summary_csv(subjects_acc, pvals_acc, output_dir=output_dir, clusters=clusters, cluster_names=cluster_names, 
+                       global_mean_pvals=global_mean_pvals_acc, cluster_pvals=cluster_pvals_acc,
+                       global_means=global_means_acc, cluster_means=cluster_means_acc)
     return outputs
 
 

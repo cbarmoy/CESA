@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CESA 0.0alpha3.0 - Release Preparation Script
+CESA 0.0alpha4.0 - Release Preparation Script
 =============================================
 
-Script de préparation de la release CESA (EEG Studio Analysis) 0.0alpha3.0.
+Script de préparation de la release CESA (EEG Studio Analysis) 0.0alpha4.0.
 Automatise les tâches de préparation pour la distribution.
 
 Fonctionnalités:
@@ -14,7 +14,7 @@ Fonctionnalités:
 - Préparation de l'archive de release
 
 Auteur: Côme Barmoy (IRBA)
-Version: 0.0alpha3.0
+Version: 0.0alpha4.0
 Date: 2025-11-01
 """
 
@@ -110,18 +110,18 @@ def generate_changelog():
             )
             git_info = f"\n### 📊 Derniers commits\n```\n{result.stdout}\n```"
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            git_info = "\n### 📊 Historique\n- Publication 0.0alpha3.0 - Première pré-release publique"
+            git_info = "\n### 📊 Historique\n- Publication 0.0alpha4.0 - Première pré-release publique"
 
-        changelog = f"""# CESA 0.0alpha3.0 - Changelog
+        changelog = f"""# CESA 0.0alpha4.0 - Changelog
 Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## Version 0.0alpha3.0 - Première pré-release
+## Version 0.0alpha4.0 - Première pré-release
 
 ### 🎉 Contenu principal
 - Consolidation de la documentation (`docs/`)
 - Déplacement de `requirements.txt` à la racine du projet
 - Ajout de la licence MIT et du fichier `.gitattributes`
-- Initialisation Git (`main` + tag `v0.0alpha3.0`)
+- Initialisation Git (`main` + tag `v0.0alpha4.0`)
 - Archivage des notes historiques (`archives/md-legacy-*.zip`)
 
 ### ⚙️ Infrastructure existante
@@ -154,7 +154,7 @@ RUN.bat
 {git_info}
 
 ---
-**CESA (Complex EEG Studio Analysis) 0.0alpha3.0**  
+**CESA (Complex EEG Studio Analysis) 0.0alpha4.0**  
 Développé par Côme Barmoy - Unité Neuropsychologie du Stress (IRBA)
 """
 
@@ -172,7 +172,7 @@ Développé par Côme Barmoy - Unité Neuropsychologie du Stress (IRBA)
 
 def prepare_release() -> bool:
     """Prépare la release complète avec toutes les validations."""
-    print("🚀 CESA 0.0alpha3.0 - Préparation de la release")
+    print("🚀 CESA 0.0alpha4.0 - Préparation de la release")
     print("=" * 60)
 
     # Tests de validation
@@ -193,7 +193,7 @@ def prepare_release() -> bool:
         print("\n📋 Instructions pour la distribution:")
         print("   1. Vérifier que tous les tests passent")
         print("   2. Tester l'application: python run.py")
-        print("   3. Créer le tag Git: git tag -a v0.0alpha3.0 -m 'Pre-release 0.0alpha3.0'")
+        print("   3. Créer le tag Git: git tag -a v0.0alpha4.0 -m 'Pre-release 0.0alpha4.0'")
         print("   4. Publier sur le dépôt")
         return True
     else:

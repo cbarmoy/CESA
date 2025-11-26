@@ -84,5 +84,5 @@ Le scoring est immédiatement affiché dans :
 
 ---
 
-*CESA – import Excel (pré-release 0.0alpha3.0)*
+*CESA – import Excel (pré-release 0.0alpha4.0)*
 

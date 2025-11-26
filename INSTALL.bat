@@ -1,19 +1,19 @@
 @echo off
 REM Forcer l'encodage UTF-8 pour afficher correctement les caracteres Unicode
 chcp 65001 >nul
-REM CESA 0.0alpha3.0 - Installation Complete
+REM CESA 0.0alpha4.0 - Installation Complete
 REM ========================================
-REM Installation automatique complete de CESA 0.0alpha3.0
+REM Installation automatique complete de CESA 0.0alpha4.0
 REM Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 
 echo.
 echo ========================================
-echo    CESA 0.0alpha3.0 - Installation Complete
+echo    CESA 0.0alpha4.0 - Installation Complete
 echo ========================================
 echo.
 echo Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 echo Auteur: Come Barmoy
-echo Version: 0.0alpha3.0
+echo Version: 0.0alpha4.0
 echo.
 echo ========================================
 echo.
@@ -211,7 +211,7 @@ if !errorlevel! neq 0 (
 echo.
 echo [6/7] Test de lancement d'CESA...
 
-echo [LANCEMENT] Test de lancement de CESA 0.0alpha3.0...
+echo [LANCEMENT] Test de lancement de CESA 0.0alpha4.0...
 echo    Veuillez patienter quelques secondes...
 echo.
 
@@ -240,18 +240,18 @@ echo [7/7] Creation du raccourci sur le bureau...
 REM Creer le raccourci sur le bureau
 set DESKTOP=%USERPROFILE%\Desktop
 set CURRENT_DIR=%~dp0
-set SHORTCUT_PATH=%DESKTOP%\CESA 0.0alpha3.0.lnk
+set SHORTCUT_PATH=%DESKTOP%\CESA 0.0alpha4.0.lnk
 
-echo [CREATION] Creation du raccourci CESA 0.0alpha3.0 sur le bureau...
+echo [CREATION] Creation du raccourci CESA 0.0alpha4.0 sur le bureau...
 echo    Chemin: %SHORTCUT_PATH%
 echo    Cible: %CURRENT_DIR%RUN.bat
 
 REM Creer le raccourci avec PowerShell
-powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0alpha3.0 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
+powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0alpha4.0 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
 
 if %errorlevel% == 0 (
     echo [OK] Raccourci cree avec succes sur le bureau
-    echo    Nom: CESA 0.0alpha3.0.lnk
+    echo    Nom: CESA 0.0alpha4.0.lnk
     echo    Cible: RUN.bat
 ) else (
     echo [ATTENTION] Erreur lors de la creation du raccourci
@@ -260,13 +260,13 @@ if %errorlevel% == 0 (
 
 echo.
 echo ========================================
-echo    Installation CESA 0.0alpha3.0 Terminee
+echo    Installation CESA 0.0alpha4.0 Terminee
 echo ========================================
 echo.
 echo [OK] Installation reussie avec succes!
 echo.
 echo [LANCEMENT] Pour lancer CESA:
-echo    1. Double-cliquez sur le raccourci "CESA 0.0alpha3.0" sur le bureau
+echo    1. Double-cliquez sur le raccourci "CESA 0.0alpha4.0" sur le bureau
 echo    2. Double-cliquez sur RUN.bat dans ce dossier
 echo    3. Ou utilisez: cd CESA && "%FOUND_PYTHON%" run.py
 echo.
@@ -281,7 +281,7 @@ echo Voulez-vous lancer CESA maintenant? (O/N)
 set /p LAUNCH_NOW=
 if /i "%LAUNCH_NOW%"=="O" (
     echo.
-    echo [LANCEMENT] Lancement de CESA 0.0alpha3.0...
+    echo [LANCEMENT] Lancement de CESA 0.0alpha4.0...
     echo.
     "%FOUND_PYTHON%" run.py
     if !errorlevel! neq 0 (

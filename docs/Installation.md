@@ -1,6 +1,6 @@
 # Installation et lancement
 
-Ce document regroupe les scénarios d'installation et les scripts de lancement de CESA `0.0alpha3.0`.
+Ce document regroupe les scénarios d'installation et les scripts de lancement de CESA `0.0alpha4.0`.
 
 ## 1. Pré-requis
 
@@ -118,5 +118,5 @@ python -m pip install mne scipy matplotlib pandas yasa xlrd openpyxl zarr numcod
 
 ---
 
-*CESA – installation & lancement (pré-release 0.0alpha3.0)*
+*CESA – installation & lancement (pré-release 0.0alpha4.0)*
 

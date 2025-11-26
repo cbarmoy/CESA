@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from core.multiscale import build_pyramid
+from core.telemetry import telemetry
 from CESA.eeg_studio_fixed import main as view_application
 
 
@@ -35,6 +36,17 @@ def _cmd_build_pyramid(args: argparse.Namespace) -> int:
 
 
 def _cmd_view(args: argparse.Namespace) -> int:
+    telemetry.configure(
+        profile_io=args.profile_io,
+        profile_render=bool(args.profile_render or args.fps),
+        track_fps=args.fps,
+        csv_path=args.telemetry_csv,
+    )
+    expected_modes = list(args.expect_modes or [])
+    if args.expect_lazy and "lazy" not in expected_modes:
+        expected_modes.append("lazy")
+    telemetry.expect_modes(expected_modes)
+    telemetry.set_dataset_id(Path(args.ms_path))
     return view_application(ms_path=args.ms_path)
 
 
@@ -81,6 +93,38 @@ def create_parser() -> argparse.ArgumentParser:
         "--ms-path",
         required=True,
         help="Dossier Zarr contenant la pyramide multiscale.",
+    )
+    view_parser.add_argument(
+        "--profile-io",
+        action="store_true",
+        help="Active le profiling des accès disque/chunks (télémetrie).",
+    )
+    view_parser.add_argument(
+        "--profile-render",
+        action="store_true",
+        help="Active la télémétrie pour les redraw (latence, FPS).",
+    )
+    view_parser.add_argument(
+        "--fps",
+        action="store_true",
+        help="Enregistre les FPS moyens (implique profile-render).",
+    )
+    view_parser.add_argument(
+        "--telemetry-csv",
+        default="logs/telemetry.csv",
+        help="Chemin du fichier CSV pour stocker la télémétrie (défaut: logs/telemetry.csv).",
+    )
+    view_parser.add_argument(
+        "--expect-mode",
+        action="append",
+        dest="expect_modes",
+        default=None,
+        help="Mode(s) attendu(s) (ex: lazy, hybrid) pour déclencher un checkpoint runtime.",
+    )
+    view_parser.add_argument(
+        "--expect-lazy",
+        action="store_true",
+        help="Déclenche un checkpoint qui échoue si la méthode lazy n'est pas utilisée.",
     )
     view_parser.set_defaults(func=_cmd_view)
 

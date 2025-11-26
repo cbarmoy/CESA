@@ -10,6 +10,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .store import MultiscaleStore, open_multiscale
+from .telemetry import telemetry
 
 
 EnvelopeArray = npt.NDArray[np.float32]
@@ -69,6 +70,8 @@ class PrecomputedProvider(SignalProvider):
         self._store: MultiscaleStore = open_multiscale(path)
         meta = self._store.metadata
 
+        telemetry.set_dataset_id(path)
+
         self._fs = meta.sampling_frequency
         self._channel_names = list(meta.channel_names)
         self._duration_seconds = meta.duration_seconds
@@ -114,15 +117,45 @@ class PrecomputedProvider(SignalProvider):
         level = self._store.select_level(samples_per_pixel)
         start_bin, stop_bin = self._store.samples_to_bins(level, start_sample, stop_sample)
 
+        telemetry.mark_mode("precomputed", source="PrecomputedProvider.get_envelopes")
+
+        chunk_bins = level.chunk_bins or max(1, int(level.bin_size))
+        chunk_start = start_bin // chunk_bins
+        chunk_stop = (max(stop_bin - 1, start_bin) // chunk_bins) + 1
+        chunk_count = max(1, chunk_stop - chunk_start)
+
+        base_sample = telemetry.new_sample(
+            {
+                "start_s": float(t0),
+                "duration_s": float(max(0.0, t1 - t0)),
+                "viewport_px": int(width_px),
+                "spp_screen": float(samples_per_pixel),
+                "level_k": int(level.bin_size),
+                "chunks_read": int(chunk_count),
+                "notes": "precomputed",
+            }
+        )
+
         signals: Dict[str, EnvelopeArray] = {}
         bytes_read = 0
         arr = level.dataset
 
         for channel_key in channels:
             chan_name, chan_index = self._resolve_channel(channel_key)
-            window = arr.oindex[chan_index, start_bin:stop_bin, :]
+            sample = telemetry.new_sample(base_sample)
+            sample["channel"] = chan_name
+
+            with telemetry.measure(sample, "io_ms"):
+                window = arr.oindex[chan_index, start_bin:stop_bin, :]
+
             window = np.asarray(window, dtype=np.float32, order="C")
-            bytes_read += int(window.nbytes)
+            window_bytes = int(window.nbytes)
+            bytes_read += window_bytes
+
+            if sample:
+                sample["bytes_read"] = window_bytes
+                telemetry.commit(sample)
+
             signals[chan_name] = window.reshape(-1)
 
         return EnvelopeBatch(

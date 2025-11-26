@@ -27,6 +27,8 @@ from __future__ import annotations
 from typing import Dict, Tuple, Optional, List, Any
 
 from datetime import datetime
+from collections import deque
+import time
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -40,6 +42,7 @@ from CESA.filters import (
     get_filter_presets as cesa_get_filter_presets,
 )
 from CESA.theme_manager import theme_manager
+from core.telemetry import telemetry
 
 
 Seconds = float
@@ -133,6 +136,8 @@ class PSGPlotter:
         if theme_name is not None:
             theme_manager.set_theme(theme_name)
         self.total_duration_s: Optional[float] = float(total_duration_s) if total_duration_s is not None else None
+        # Store last signals for progressive fusion during async preprocessing
+        self.last_signals: Dict[str, Signal] = {}
         # Initialize drawing/cache structures BEFORE first redraw
         # Store artists for efficient updates
         self._line_store: Dict[str, Dict[str, Any]] = {"eeg": {}, "eog": {}, "emg": {}, "ecg": {}}
@@ -144,9 +149,11 @@ class PSGPlotter:
         # Performance metrics (last frame)
         self._perf_last: Dict[str, float] = {
             "filter_ms": 0.0,
+            "baseline_ms": 0.0,
             "draw_ms": 0.0,
             "n_channels": 0.0,
             "n_points": 0.0,
+            "decim_ms": 0.0,
         }
         # Track window for background invalidation
         self._last_window: Optional[Tuple[float, float]] = None
@@ -163,6 +170,11 @@ class PSGPlotter:
         self._grid_on: bool = True
         self._high_contrast: bool = False
         self._nav_cb = None
+        # Telemetry helpers
+        self._frame_history: deque[float] = deque(maxlen=120)
+        self._fps_avg: float = 0.0
+        self._current_frame_sample: Optional[Dict[str, object]] = None
+        self._signals_preprocessed: bool = False
         # Build figure (triggers first redraw safely)
         self.figure: Figure = self._build_figure()
 
@@ -174,6 +186,13 @@ class PSGPlotter:
 
     def update_signals(self, signals: Dict[str, Signal]) -> None:
         """Replace current signals with a pre-sliced window and redraw."""
+        self._signals_preprocessed = False
+        self.signals = signals or {}
+        self._redraw()
+
+    def update_preprocessed_signals(self, signals: Dict[str, Signal]) -> None:
+        """Update signals already filtered/baselined externally."""
+        self._signals_preprocessed = True
         self.signals = signals or {}
         self._redraw()
 
@@ -328,16 +347,31 @@ class PSGPlotter:
 
     # ---------- Rendering ----------
     def _redraw(self, draw_only: bool = False) -> None:
+        frame_start = time.perf_counter()
         start_s = self.start_time_s
         end_s = self.start_time_s + self.duration_s
         # Reset perf counters for this frame
         try:
             self._perf_last["filter_ms"] = 0.0
+            self._perf_last.setdefault("baseline_ms", 0.0)
+            self._perf_last["baseline_ms"] = 0.0
             self._perf_last["draw_ms"] = 0.0
             self._perf_last["n_channels"] = 0
             self._perf_last["n_points"] = 0
+            self._perf_last["decim_ms"] = 0.0
         except Exception:
             pass
+
+        frame_sample = telemetry.new_sample(
+            {
+                "channel": "render",
+                "start_s": float(start_s),
+                "duration_s": float(self.duration_s),
+                "viewport_px": self._estimate_viewport_px(),
+                "notes": f"signals={len(self.signals)}",
+            }
+        )
+        self._current_frame_sample = frame_sample if frame_sample else None
 
         try:
             _log_checkpoint(f"🔍 CHECKPOINT REDRAW: window={start_s:.2f}-{end_s:.2f}s, draw_only={draw_only}, blit_ready={self._blit_ready}, invalidate_bg={self._invalidate_backgrounds}, autoscale={getattr(self, 'autoscale_enabled', True)}, filter={getattr(self, 'global_filter_enabled', True)}, baseline={getattr(self, 'baseline_enabled', True)}")
@@ -371,10 +405,20 @@ class PSGPlotter:
                 pass
 
         # Common X axis formatting: full duration for hypnogram, window for others
+        # Détecter si les limites X ont changé (pour invalider le blitting si nécessaire)
+        xlims_changed = False
         for ax in [self.ax_eeg, self.ax_eog, self.ax_emg, self.ax_ecg, self.ax_events]:
+            old_xlim = ax.get_xlim()
             ax.set_xlim(start_s, end_s)
+            new_xlim = ax.get_xlim()
+            if abs(old_xlim[0] - new_xlim[0]) > 0.01 or abs(old_xlim[1] - new_xlim[1]) > 0.01:
+                xlims_changed = True
             ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: _seconds_to_hhmmss(x)))
             _epoch_vlines(ax, start_s, end_s, self._get_epoch_len())
+        
+        # Invalider le blitting si les limites X ont changé
+        if xlims_changed:
+            self._invalidate_backgrounds = True
 
         # Only bottom axis with xlabel to save vertical space
         try:
@@ -387,45 +431,132 @@ class PSGPlotter:
 
         if not draw_only and self.figure.canvas is not None:
             try:
-                _t_draw0 = None
-                try:
-                    import time as _time
-                    _t_draw0 = _time.perf_counter()
-                except Exception:
-                    pass
-                # Always perform a full draw to avoid any ghosting when window/limits change,
-                # then refresh backgrounds for future blits. This remains fast thanks to
-                # decimation and artist reuse.
-                self.figure.canvas.draw()
-                # Refresh backgrounds after draw
-                try:
-                    canvas = self.figure.canvas
-                    for a in [self.ax_eeg, self.ax_eog, self.ax_emg, self.ax_ecg, self.ax_events, self.ax_hypno]:
-                        self._axis_backgrounds[a] = canvas.copy_from_bbox(a.bbox)
-                    self._blit_ready = True
-                    self._invalidate_backgrounds = False
-                    self._last_window = (start_s, end_s)
-                    _log_checkpoint("🔍 CHECKPOINT BLIT: backgrounds refreshed for all axes")
-                except Exception:
-                    pass
-                if _t_draw0 is not None:
+                _t_draw0 = time.perf_counter()
+                canvas = self.figure.canvas
+                
+                # Détecter si on peut utiliser le blitting
+                window_changed = self._last_window is None or abs(self._last_window[0] - start_s) > 0.01 or abs(self._last_window[1] - end_s) > 0.01
+                can_use_blit = (self._use_blit and self._blit_ready and not self._invalidate_backgrounds and 
+                               not window_changed and not xlims_changed and not self.autoscale_enabled)
+                
+                if can_use_blit:
+                    # Utiliser le blitting pour une mise à jour rapide
                     try:
-                        import time as _time
-                        self._perf_last["draw_ms"] = (_time.perf_counter() - _t_draw0) * 1000.0
-                        _log_checkpoint(f"⏱️ DRAW: draw_ms={self._perf_last['draw_ms']:.1f}ms")
+                        # Activer le mode blitting pour les axes
+                        for ax in [self.ax_eeg, self.ax_eog, self.ax_emg, self.ax_ecg]:
+                            if ax in self._axis_backgrounds:
+                                # Restaurer le background
+                                canvas.restore_region(self._axis_backgrounds[ax])
+                                # Dessiner seulement les éléments qui ont changé (lignes)
+                                renderer = canvas.get_renderer()
+                                ax.draw_artist(ax.patch)  # Fond de l'axe
+                                ax.draw_artist(ax.xaxis)  # Axe X
+                                ax.draw_artist(ax.yaxis)  # Axe Y
+                                # Dessiner toutes les lignes
+                                for line in ax.lines:
+                                    ax.draw_artist(line)
+                                # Dessiner les textes (labels de canaux)
+                                for txt in ax.texts:
+                                    ax.draw_artist(txt)
+                                # Dessiner la grille si visible
+                                if ax.xaxis._gridOnMajor:
+                                    for line in ax.xaxis.get_gridlines():
+                                        ax.draw_artist(line)
+                                if ax.yaxis._gridOnMajor:
+                                    for line in ax.yaxis.get_gridlines():
+                                        ax.draw_artist(line)
+                                # Blit la région de l'axe
+                                canvas.blit(ax.bbox)
+                        
+                        # Hypnogram et events nécessitent un redraw complet car ils changent souvent
+                        # (ils utilisent clear() donc pas de blitting possible)
+                        self.ax_hypno.draw(canvas.get_renderer())
+                        self.ax_events.draw(canvas.get_renderer())
+                        
+                        canvas.flush_events()
+                        try:
+                            self._perf_last["draw_ms"] = (time.perf_counter() - _t_draw0) * 1000.0
+                            _log_checkpoint(f"⏱️ DRAW (BLIT): draw_ms={self._perf_last['draw_ms']:.1f}ms")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # Fallback vers full draw si le blitting échoue
+                        try:
+                            _log_checkpoint(f"⚠️ BLIT failed: {e}, falling back to full draw")
+                        except Exception:
+                            pass
+                        can_use_blit = False
+                        self._blit_ready = False
+                        self._invalidate_backgrounds = True
+                
+                if not can_use_blit:
+                    # Full draw nécessaire (changement de fenêtre, limites, ou premier rendu)
+                    with telemetry.measure(frame_sample, "render_ms"):
+                        canvas.draw()
+                    # Refresh backgrounds après draw pour les futurs blits
+                    try:
+                        for a in [self.ax_eeg, self.ax_eog, self.ax_emg, self.ax_ecg]:
+                            self._axis_backgrounds[a] = canvas.copy_from_bbox(a.bbox)
+                        self._blit_ready = True
+                        self._invalidate_backgrounds = False
+                        self._last_window = (start_s, end_s)
+                        _log_checkpoint("🔍 CHECKPOINT BLIT: backgrounds refreshed for all axes")
                     except Exception:
                         pass
+                    if _t_draw0 is not None:
+                        try:
+                            self._perf_last["draw_ms"] = (time.perf_counter() - _t_draw0) * 1000.0
+                            _log_checkpoint(f"⏱️ DRAW (FULL): draw_ms={self._perf_last['draw_ms']:.1f}ms")
+                        except Exception:
+                            pass
             except Exception:
                 # Fallback: full redraw
                 try:
-                    self.figure.canvas.draw()
+                    with telemetry.measure(frame_sample, "render_ms"):
+                        self.figure.canvas.draw()
                 except Exception:
                     pass
+
+        frame_duration_s = max(0.0, time.perf_counter() - frame_start)
+        if frame_sample:
+            try:
+                frame_sample.setdefault("filter_ms", float(self._perf_last.get("filter_ms", 0.0)))
+                frame_sample.setdefault("decim_ms", float(self._perf_last.get("decim_ms", 0.0)))
+                frame_sample.setdefault("render_ms", float(self._perf_last.get("draw_ms", 0.0)))
+                frame_sample["viewport_px"] = frame_sample.get("viewport_px") or self._estimate_viewport_px()
+                existing = str(frame_sample.get("notes") or "")
+                extra = f"n_points={int(self._perf_last.get('n_points', 0.0))}" if self._perf_last.get("n_points") else ""
+                if extra:
+                    frame_sample["notes"] = ";".join(filter(None, [existing, extra]))
+                frame_sample["fps"] = self._update_fps(frame_duration_s)
+            except Exception:
+                pass
+            telemetry.commit(frame_sample)
+
+        self._current_frame_sample = None
 
     def _get_epoch_len(self) -> float:
         if self.hypnogram is None:
             return 30.0
         return float(self.hypnogram[1]) if len(self.hypnogram) > 1 else 30.0
+
+    def _estimate_viewport_px(self) -> int:
+        try:
+            canvas = self.figure.canvas
+            if canvas is None:
+                return 0
+            width, _ = canvas.get_width_height()
+            return int(width)
+        except Exception:
+            return 0
+
+    def _update_fps(self, frame_duration_s: float) -> float:
+        if frame_duration_s <= 0.0:
+            return self._fps_avg
+        self._frame_history.append(frame_duration_s)
+        avg_duration = sum(self._frame_history) / len(self._frame_history)
+        self._fps_avg = 1.0 / avg_duration if avg_duration > 0.0 else 0.0
+        return self._fps_avg
 
     # ---------- Individual Layers ----------
     def _plot_hypnogram(self, ax, start_s: Seconds, end_s: Seconds) -> None:
@@ -550,19 +681,33 @@ class PSGPlotter:
         except Exception:
             n_pixels = 800
 
+        target_processing_len = max(300, int(n_pixels * 1.2))
+
         for idx, ch_name in enumerate(channel_names):
             data_fs = self.signals.get(ch_name, None)
             if data_fs is None:
                 continue
             data, fs = data_fs
-            x, y = self._slice_and_process(ch_name, data, fs, start_s, end_s)
+            x, y = self._slice_and_process(
+                ch_name,
+                data,
+                fs,
+                start_s,
+                end_s,
+                target_len=target_processing_len,
+            )
             if x.size == 0:
                 continue
             # Decimate if too many points
             if x.size > n_pixels:
+                _t_dec = time.perf_counter()
                 step = max(1, int(np.floor(x.size / n_pixels)))
                 x = x[::step]
                 y = y[::step]
+                try:
+                    self._perf_last["decim_ms"] += (time.perf_counter() - _t_dec) * 1000.0
+                except Exception:
+                    pass
             xs.append(x)
             ys.append(y)
             used_names.append(ch_name)
@@ -684,6 +829,16 @@ class PSGPlotter:
             except Exception:
                 pass
 
+        frame_sample = self._current_frame_sample
+        if frame_sample:
+            try:
+                detail = f"{target_type}:{plotted}ch"
+                existing = str(frame_sample.get("notes") or "")
+                if detail not in existing:
+                    frame_sample["notes"] = ";".join(filter(None, [existing, detail]))
+            except Exception:
+                pass
+
         # For stacked view, we already set y-limits and removed y-ticks
 
     def _normalize_name(self, name: str) -> str:
@@ -799,7 +954,16 @@ class PSGPlotter:
             colors.append(shade(base, factor))
         return colors
 
-    def _slice_and_process(self, ch_name: str, data: np.ndarray, fs: float, start_s: Seconds, end_s: Seconds) -> Tuple[np.ndarray, np.ndarray]:
+    def _slice_and_process(
+        self,
+        ch_name: str,
+        data: np.ndarray,
+        fs: float,
+        start_s: Seconds,
+        end_s: Seconds,
+        *,
+        target_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if data is None or fs is None:
             return np.array([]), np.array([])
         data = np.asarray(data).astype(float).squeeze()
@@ -814,6 +978,18 @@ class PSGPlotter:
         x = start_s + (np.arange(n, dtype=float) / fs)
         y = data
 
+        if target_len and target_len > 0 and y.size > target_len:
+            bin_size = int(np.ceil(y.size / float(target_len)))
+            if bin_size > 1:
+                usable = y[: (y.size // bin_size) * bin_size]
+                down = usable.reshape(-1, bin_size).mean(axis=1).astype(np.float32, copy=False)
+                if usable.size < y.size:
+                    remainder_mean = float(np.mean(y[usable.size :], dtype=np.float32))
+                    down = np.concatenate([down, np.array([remainder_mean], dtype=np.float32)])
+                y = down
+                fs = fs / bin_size
+                x = start_s + (np.arange(y.size, dtype=float) / fs)
+
         # Baseline and filtering per channel
         params = self.filter_params_by_channel.get(ch_name, None)
         if params is None:
@@ -827,42 +1003,59 @@ class PSGPlotter:
                 "amplitude": presets.get("amplitude", 100.0),
             }
 
-        # Apply baseline correction for EEG/EOG/ECG and EMG (legs), toggle-controlled
-        try:
-            import time as _time
-            _t0 = _time.perf_counter()
-            if self.baseline_enabled and cesa_detect_signal_type(ch_name) in ("eeg", "eog", "ecg", "emg"):
-                y = cesa_apply_baseline_correction(y, window_duration=30.0, sfreq=fs)
-        except Exception:
-            pass
+        baseline_elapsed = 0.0
+        filter_elapsed = 0.0
 
-        # Apply filter if enabled globally and per channel
-        try:
-            if self.global_filter_enabled and params.get("enabled", False):
-                y = cesa_apply_filter(
-                    y,
-                    sfreq=fs,
-                    filter_order=4,
-                    low=params.get("low", 0.0),
-                    high=params.get("high", 0.0),
-                )
-            # Accumulate per-channel preprocessing time
+        if not self._signals_preprocessed:
             try:
                 import time as _time
-                self._perf_last["filter_ms"] += (_time.perf_counter() - _t0) * 1000.0
-                # Log per-channel length post processing occasionally
-                if y.size > 0 and (hash(ch_name) % 5 == 0):
-                    _log_checkpoint(f"⏱️ PREPROC {ch_name}: len={y.size}, acc_filter_ms={self._perf_last['filter_ms']:.1f}")
+                _t0 = _time.perf_counter()
+                if self.baseline_enabled and cesa_detect_signal_type(ch_name) in ("eeg", "eog", "ecg", "emg"):
+                    y = cesa_apply_baseline_correction(y, window_duration=30.0, sfreq=fs)
+                baseline_elapsed = (_time.perf_counter() - _t0) * 1000.0
+            except Exception:
+                baseline_elapsed = 0.0
+
+            try:
+                import time as _time
+                _t0 = _time.perf_counter()
+                if self.global_filter_enabled and params.get("enabled", False):
+                    y = cesa_apply_filter(
+                        y,
+                        sfreq=fs,
+                        filter_order=4,
+                        low=params.get("low", 0.0),
+                        high=params.get("high", 0.0),
+                    )
+                filter_elapsed = (_time.perf_counter() - _t0) * 1000.0
+                try:
+                    self._perf_last["filter_ms"] += filter_elapsed
+                    self._perf_last["baseline_ms"] += baseline_elapsed
+                    if y.size > 0 and (hash(ch_name) % 5 == 0):
+                        _log_checkpoint(
+                            f"⏱️ PREPROC {ch_name}: len={y.size}, baseline_ms={self._perf_last['baseline_ms']:.1f}, filter_ms={self._perf_last['filter_ms']:.1f}"
+                        )
+                except Exception:
+                    pass
             except Exception:
                 pass
-        except Exception:
-            pass
 
-        # Apply amplitude scaling if provided (percentage)
-        try:
-            amp = float(params.get("amplitude", 100.0))
-            y = y * (amp / 100.0)
-        except Exception:
+            try:
+                amp = float(params.get("amplitude", 100.0))
+                y = y * (amp / 100.0)
+            except Exception:
+                pass
+
+            if self._current_frame_sample:
+                try:
+                    self._current_frame_sample.setdefault("baseline_ms", 0.0)
+                    self._current_frame_sample.setdefault("filter_ms", 0.0)
+                    self._current_frame_sample["baseline_ms"] += baseline_elapsed
+                    self._current_frame_sample["filter_ms"] += filter_elapsed
+                except Exception:
+                    pass
+        else:
+            # Preprocessed signals are assumed to have already applied filter/baseline/amplitude
             pass
 
         return x, y
