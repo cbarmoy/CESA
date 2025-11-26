@@ -1,6 +1,6 @@
 # Dépannage
 
-Cette fiche recense les problèmes fréquemment rencontrés lors de l'utilisation de CESA `0.0alpha3.0` et propose des solutions rapides.
+Cette fiche recense les problèmes fréquemment rencontrés lors de l'utilisation de CESA `0.0alpha4.0` et propose des solutions rapides.
 
 ## Python introuvable (Windows)
 
@@ -96,5 +96,5 @@ Consultez `docs/Import_Excel.md` pour la structure attendue et les dépendances.
 
 ---
 
-*CESA – dépannage (pré-release 0.0alpha3.0)*
+*CESA – dépannage (pré-release 0.0alpha4.0)*
 

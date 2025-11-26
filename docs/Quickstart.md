@@ -1,6 +1,6 @@
 # ⚡ Démarrage rapide
 
-Ce guide résume les étapes clés pour charger un enregistrement EDF+ et activer la navigation multirésolution dans CESA `0.0alpha3.0`.
+Ce guide résume les étapes clés pour charger un enregistrement EDF+ et activer la navigation multirésolution dans CESA `0.0alpha4.0`.
 
 ## 1. Première ouverture d'un enregistrement
 
@@ -54,5 +54,5 @@ Ajoutez `--fresh` pour forcer une reconstruction complète. Le script `monitor_p
 
 ---
 
-*CESA – documentation interne, pré-release 0.0alpha3.0*
+*CESA – documentation interne, pré-release 0.0alpha4.0*
 
