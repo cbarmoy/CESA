@@ -19,7 +19,7 @@ pandas>=1.3.0           # Data manipulation and scoring
 xlrd>=2.0.0             # Excel file reading (.xls)
 openpyxl>=3.0.0         # Excel file writing (.xlsx)
 yasa>=0.6.0             # Automatic sleep scoring
-zarr>=2.16.0,<3.0.0     # Multiscale min/max pyramids (pré-calcul PSG) - v2 API
+zarr>=2.16.0,<4.0.0     # Multiscale min/max pyramids (pré-calcul PSG) - v2 API
 numcodecs>=0.12.0       # Compression Blosc Zstd pour Zarr
 
 # Advanced analysis modules
