@@ -1,0 +1,5 @@
+metric,test,before,after,n_pairs,statistic,p_value
+rmssd,wilcoxon,avant,apres,10,26.0,0.921875
+lf,wilcoxon,avant,apres,9,21.0,0.91015625
+hf,wilcoxon,avant,apres,9,18.0,0.65234375
+lf_hf,wilcoxon,avant,apres,9,16.0,0.49609375
