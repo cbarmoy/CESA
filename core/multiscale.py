@@ -19,7 +19,13 @@ except Exception:  # pragma: no cover - optional dependency
     BaseRaw = object  # type: ignore
     mne = None  # type: ignore
 
-from .store import LevelDescriptor, MultiscaleStore, MultiscaleMetadata, open_multiscale
+from .store import (
+    MULTISCALE_ZARR_FORMAT,
+    LevelDescriptor,
+    MultiscaleMetadata,
+    MultiscaleStore,
+    open_multiscale,
+)
 from .raw_loader import open_raw_file
 
 
@@ -280,7 +286,7 @@ def build_pyramid(
     )
 
     # Ouvrir en mode écriture pour la construction, pas en lecture seule
-    root_group = zarr.open_group(str(ms_path), mode="a")
+    root_group = zarr.open_group(str(ms_path), mode="a", zarr_format=MULTISCALE_ZARR_FORMAT)
     store = _open_multiscale_writable(ms_path, root_group)
     level_states = _initialise_level_states(store, n_channels)
 
@@ -478,7 +484,7 @@ def _prepare_store(
     levels: Sequence[int],
     chunk_seconds: int,
 ) -> None:
-    root = zarr.open_group(str(path), mode="a")
+    root = zarr.open_group(str(path), mode="a", zarr_format=MULTISCALE_ZARR_FORMAT)
 
     existing = dict(root.attrs)
     if existing:
@@ -586,7 +592,7 @@ def _calculate_compression_ratio(ms_path: Path) -> float:
                 total_size += os.path.getsize(file_path)
         
         # Lire les métadonnées pour calculer la taille non compressée
-        group = zarr.open_group(str(ms_path), mode="r")
+        group = zarr.open_group(str(ms_path), mode="r", zarr_format=MULTISCALE_ZARR_FORMAT)
         attrs = dict(group.attrs)
         
         n_samples = int(attrs.get("n_samples", 0))

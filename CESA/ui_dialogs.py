@@ -1,12 +1,12 @@
 """
-CESA v3.0 - UI Dialogs Utilities
+CESA v0.0beta1.0 - UI Dialogs Utilities
 ==============================
 
-Module de dialogues d'interface pour CESA (EEG Studio Analysis) v3.0.
+Module de dialogues d'interface pour CESA (EEG Studio Analysis) v0.0beta1.0.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Fournit des dialogues d'interface utilisateur spécialisés pour
-les fonctionnalités avancées de l'application CESA v3.0.
+les fonctionnalités avancées de l'application CESA v0.0beta1.0.
 
 Dialogues implémentés:
 - Dialogues de configuration d'analyse
@@ -28,6 +28,6 @@ Architecture:
 - Interface cohérente avec le thème CESA
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 3.0.0
+Version: 0.0beta1.0
 Date: 2025-09-26
 """

@@ -10,6 +10,9 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import zarr
 
+# Magasins multiscale CESA : métadonnées Zarr v2 (compatibilité dossiers existants). zarr-python 3 gère ce format via zarr_format=2.
+MULTISCALE_ZARR_FORMAT = 2
+
 
 @dataclass(frozen=True)
 class MultiscaleMetadata:
@@ -124,7 +127,7 @@ def open_multiscale(path: str | Path) -> MultiscaleStore:
     if not root.exists():
         raise FileNotFoundError(f"Multiscale path does not exist: {root}")
 
-    group = zarr.open_group(str(root), mode="r")
+    group = zarr.open_group(str(root), mode="r", zarr_format=MULTISCALE_ZARR_FORMAT)
     attrs = dict(group.attrs)
 
     try:

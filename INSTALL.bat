@@ -1,19 +1,21 @@
 @echo off
+REM Toujours travailler dans le dossier du script (double-clic = sinon run.py introuvable, fenetre qui se ferme)
+cd /d "%~dp0"
 REM Forcer l'encodage UTF-8 pour afficher correctement les caracteres Unicode
 chcp 65001 >nul
-REM CESA 0.0alpha4.0 - Installation Complete
+REM CESA 0.0beta1.0 - Installation Complete
 REM ========================================
-REM Installation automatique complete de CESA 0.0alpha4.0
+REM Installation automatique complete de CESA 0.0beta1.0
 REM Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 
 echo.
 echo ========================================
-echo    CESA 0.0alpha4.0 - Installation Complete
+echo    CESA 0.0beta1.0 - Installation Complete
 echo ========================================
 echo.
 echo Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 echo Auteur: Come Barmoy
-echo Version: 0.0alpha4.0
+echo Version: 0.0beta1.0
 echo.
 echo ========================================
 echo.
@@ -26,47 +28,58 @@ echo.
 
 set FOUND_PYTHON=
 
-REM Essayer d'abord python direct
+REM D'abord Python.org (chemins entre guillemets : "C:\Program Files\..." sinon FOR casse sur les espaces)
+
+for %%P in (
+  "%LOCALAPPDATA%\Programs\Python\Python314\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python39\python.exe"
+  "%LOCALAPPDATA%\Programs\Python\Python38\python.exe"
+  "C:\Python314\python.exe"
+  "C:\Python313\python.exe"
+  "C:\Python312\python.exe"
+  "C:\Python311\python.exe"
+  "C:\Python310\python.exe"
+  "C:\Python39\python.exe"
+  "C:\Python38\python.exe"
+  "C:\Program Files\Python314\python.exe"
+  "C:\Program Files\Python313\python.exe"
+  "C:\Program Files\Python312\python.exe"
+  "C:\Program Files\Python311\python.exe"
+  "C:\Program Files\Python310\python.exe"
+  "C:\Program Files\Python39\python.exe"
+  "C:\Program Files\Python38\python.exe"
+  "C:\Program Files (x86)\Python314\python.exe"
+  "C:\Program Files (x86)\Python313\python.exe"
+  "C:\Program Files (x86)\Python312\python.exe"
+  "C:\Program Files (x86)\Python311\python.exe"
+  "C:\Program Files (x86)\Python310\python.exe"
+  "C:\Program Files (x86)\Python39\python.exe"
+  "C:\Program Files (x86)\Python38\python.exe"
+) do (
+  if exist %%~P (
+    %%~P --version >nul 2>&1
+    if not errorlevel 1 (
+      echo [OK] Python trouve: %%~P
+      %%~P --version
+      set "FOUND_PYTHON=%%~P"
+      goto :python_found_std
+    )
+  )
+)
+
+:python_found_std
+if defined FOUND_PYTHON goto :check_files
+
 python --version >nul 2>&1
 if %errorlevel% == 0 (
     echo [OK] Python trouve dans le PATH
     python --version
     set FOUND_PYTHON=python
     goto :check_files
-)
-
-echo [INFO] Python non trouve dans le PATH, recherche automatique...
-
-REM Chemins communs ou Python est installe
-set PYTHON_PATHS=
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Python311\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Python310\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Python39\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Python38\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files\Python311\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files\Python310\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files\Python39\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files\Python38\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files (x86)\Python311\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files (x86)\Python310\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files (x86)\Python39\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;C:\Program Files (x86)\Python38\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;%USERPROFILE%\AppData\Local\Programs\Python\Python311\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;%USERPROFILE%\AppData\Local\Programs\Python\Python310\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;%USERPROFILE%\AppData\Local\Programs\Python\Python39\python.exe
-set PYTHON_PATHS=%PYTHON_PATHS%;%USERPROFILE%\AppData\Local\Programs\Python\Python38\python.exe
-
-REM Recherche dans les chemins standards
-for %%p in (%PYTHON_PATHS%) do (
-    if exist "%%p" (
-        "%%p" --version >nul 2>&1
-        if !errorlevel! == 0 (
-            echo [OK] Python trouve: %%p
-            "%%p" --version
-            set FOUND_PYTHON=%%p
-            goto :check_files
-        )
-    )
 )
 
 echo.
@@ -110,17 +123,18 @@ echo    ou depuis le dossier parent contenant CESA\
     exit /b 1
 
 :check_requirements
-if not exist "%CESA_DIR%\eeg_studio_fixed.py" (
-if not exist "CESA\eeg_studio_fixed.py" (
-        echo [ERREUR] Fichier eeg_studio_fixed.py non trouve
-    echo.
-    echo [SOLUTION] Assurez-vous que tous les fichiers CESA sont presents
-    echo.
-    echo Appuyez sur une touche pour continuer...
-    pause >nul
-    exit /b 1
-    )
-)
+if exist "CESA\eeg_studio_fixed.py" goto :check_requirements_ok
+if exist "%CESA_DIR%\eeg_studio_fixed.py" goto :check_requirements_ok
+if exist "eeg_studio_fixed.py" goto :check_requirements_ok
+echo [ERREUR] Fichier eeg_studio_fixed.py non trouve
+echo.
+echo [SOLUTION] Assurez-vous que tous les fichiers CESA sont presents
+echo.
+echo Appuyez sur une touche pour continuer...
+pause >nul
+exit /b 1
+
+:check_requirements_ok
 
 if not exist "requirements.txt" (
     echo [ERREUR] Fichier requirements.txt non trouve
@@ -152,6 +166,14 @@ if !errorlevel! neq 0 (
 )
 
 echo [OK] Dependances principales installees
+
+echo.
+echo [3b/6] Viewer PyQtGraph: PySide6 + pyqtgraph ^(vue PSG par defaut^)...
+"%FOUND_PYTHON%" -m pip install "PySide6>=6.5.0" "pyqtgraph>=0.13.0"
+if !errorlevel! neq 0 (
+    echo [ATTENTION] Echec PySide6/pyqtgraph - CESA utilisera Matplotlib pour le PSG.
+    echo Verifiez la version Python ^(PySide6 exige souvent des roues precompilees 3.9-3.12^).
+)
 
 echo.
 echo [4/6] Installation des modules Excel...
@@ -208,10 +230,18 @@ if !errorlevel! neq 0 (
     echo.
 )
 
+echo [TEST] PySide6 + pyqtgraph ^(viewer PSG^)...
+"%FOUND_PYTHON%" -c "import PySide6; import pyqtgraph; print('[OK] PySide6', PySide6.__version__, '| pyqtgraph', pyqtgraph.__version__)"
+if !errorlevel! neq 0 (
+    echo [ATTENTION] PySide6 ou pyqtgraph non importables - le PSG s^'ouvrira en Matplotlib.
+    echo Essayez: "%FOUND_PYTHON%" -m pip install --upgrade PySide6 pyqtgraph
+    echo.
+)
+
 echo.
 echo [6/7] Test de lancement d'CESA...
 
-echo [LANCEMENT] Test de lancement de CESA 0.0alpha4.0...
+echo [LANCEMENT] Test de lancement de CESA 0.0beta1.0...
 echo    Veuillez patienter quelques secondes...
 echo.
 
@@ -240,18 +270,18 @@ echo [7/7] Creation du raccourci sur le bureau...
 REM Creer le raccourci sur le bureau
 set DESKTOP=%USERPROFILE%\Desktop
 set CURRENT_DIR=%~dp0
-set SHORTCUT_PATH=%DESKTOP%\CESA 0.0alpha4.0.lnk
+set SHORTCUT_PATH=%DESKTOP%\CESA 0.0beta1.0.lnk
 
-echo [CREATION] Creation du raccourci CESA 0.0alpha4.0 sur le bureau...
+echo [CREATION] Creation du raccourci CESA 0.0beta1.0 sur le bureau...
 echo    Chemin: %SHORTCUT_PATH%
 echo    Cible: %CURRENT_DIR%RUN.bat
 
 REM Creer le raccourci avec PowerShell
-powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0alpha4.0 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
+powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0beta1.0 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
 
 if %errorlevel% == 0 (
     echo [OK] Raccourci cree avec succes sur le bureau
-    echo    Nom: CESA 0.0alpha4.0.lnk
+    echo    Nom: CESA 0.0beta1.0.lnk
     echo    Cible: RUN.bat
 ) else (
     echo [ATTENTION] Erreur lors de la creation du raccourci
@@ -260,13 +290,13 @@ if %errorlevel% == 0 (
 
 echo.
 echo ========================================
-echo    Installation CESA 0.0alpha4.0 Terminee
+echo    Installation CESA 0.0beta1.0 Terminee
 echo ========================================
 echo.
 echo [OK] Installation reussie avec succes!
 echo.
 echo [LANCEMENT] Pour lancer CESA:
-echo    1. Double-cliquez sur le raccourci "CESA 0.0alpha4.0" sur le bureau
+echo    1. Double-cliquez sur le raccourci "CESA 0.0beta1.0" sur le bureau
 echo    2. Double-cliquez sur RUN.bat dans ce dossier
 echo    3. Ou utilisez: cd CESA && "%FOUND_PYTHON%" run.py
 echo.
@@ -281,7 +311,7 @@ echo Voulez-vous lancer CESA maintenant? (O/N)
 set /p LAUNCH_NOW=
 if /i "%LAUNCH_NOW%"=="O" (
     echo.
-    echo [LANCEMENT] Lancement de CESA 0.0alpha4.0...
+    echo [LANCEMENT] Lancement de CESA 0.0beta1.0...
     echo.
     "%FOUND_PYTHON%" run.py
     if !errorlevel! neq 0 (

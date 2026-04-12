@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CCESA (Complex EEG Studio Analysis) v1.0 - Professional EEG Analysis Interface
+CESA (Complex EEG Studio Analysis) v0.0beta1.0 - Professional EEG Analysis Interface
 ====================================================================
 
 Application professionnelle complète pour l'analyse de données EEG avec
@@ -11,12 +11,12 @@ scientifiques et les bonnes pratiques MNE-Python.
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
 Contact: come1.barmoy@supbiotech.fr
 GitHub: cbarmoy
-Version: 3.0.0 - Release Candidate
-Date: 2025-09-26
+Version: 0.0beta1.0
+Date: 2026-04-05
 Licence: MIT
-Release: CESA_3.0_release
+Release: CESA_0.0beta1.0_release
 
-Fonctionnalités principales v3.0:
+Fonctionnalités principales v0.0beta1.0:
 - ✅ Chargement EDF+ avec diagnostic automatique et amplification
 - ✅ Interface graphique professionnelle (thèmes clair/sombre)
 - ✅ Scoring de sommeil (import Excel/EDF+ avec synchronisation)
@@ -80,11 +80,12 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pandas as pd
 import warnings
-from typing import Dict, List, Optional, Tuple, Any, Iterable, Sequence
+from typing import Callable, Dict, List, Optional, Tuple, Any, Iterable, Sequence
 import logging
 import re
 from itertools import groupby
 from concurrent.futures import ThreadPoolExecutor
+from queue import Empty, SimpleQueue
 import threading
 from logging.handlers import RotatingFileHandler
 
@@ -116,6 +117,8 @@ from CESA.profile_store import ProfileStore
 from CESA.profile_schema import DisplayProcessingProfile, SignalSection
 from ui.channel_mapping_dialog import ChannelMappingDialog
 from ui.section_layout_dialog import SectionLayoutDialog
+from CESA.filter_engine import FilterAuditLog, FilterPipeline, pipeline_from_legacy_params
+from ui.filter_dialog import FilterConfigDialog
 
 # Configuration des warnings
 warnings.filterwarnings('ignore')
@@ -206,6 +209,25 @@ try:
 except Exception as _e:
     logging.warning(f"Impossible d'initialiser le RotatingFileHandler: {_e}")
 
+
+def _log_viewer_checkpoint(code: str, msg: str, **fields: Any) -> None:
+    """Étapes viewer Qt↔Tk pour diagnostic (fichier ``logs/eeg_studio.log``). Chercher ``VIEWER-CHK``."""
+    if fields:
+        tail = " ".join(f"{k}={v!r}" for k, v in fields.items())
+        logging.info("[VIEWER-CHK-%s] %s | %s", code, msg, tail)
+    else:
+        logging.info("[VIEWER-CHK-%s] %s", code, msg)
+
+
+def _flush_viewer_logs() -> None:
+    """Force l'écriture disque des logs (crash natif / fermeture console avant buffer)."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 # =============================================================================
 # CLASSE PRINCIPALE - EEG ANALYSIS STUDIO
 # =============================================================================
@@ -255,6 +277,14 @@ class EEGAnalysisStudio:
         self.profile_channel_map_runtime: Dict[str, str] = {}
         self._bridge_executor: Optional[ThreadPoolExecutor] = None
         self._preprocess_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=3)
+        # Reprise sur le thread Tk uniquement (jamais root.after depuis un worker : GIL / crash avec Py3.14 + Qt)
+        self._tk_main_thread_queue: SimpleQueue[Callable[[], None]] = SimpleQueue()
+        self._tk_main_poll_id: Optional[Any] = None
+        self._tk_modal_ui_block_depth: int = 0
+        try:
+            self._tk_main_poll_id = self.root.after(16, self._poll_tk_main_thread_queue)
+        except Exception:
+            self._tk_main_poll_id = None
         self._processed_lock = threading.Lock()
         self._processed_window_cache: OrderedDict[str, Tuple[np.ndarray, float, Dict[str, Any]]] = OrderedDict()
         self._processed_window_limit = 64
@@ -287,6 +317,9 @@ class EEGAnalysisStudio:
         # Filtrage par canal (alpha): paramètres spécifiques par dérivation
         # Clé = nom de canal/dérivation, valeur = dict(low, high, enabled)
         self.channel_filter_params: Dict[str, Dict[str, float]] = {}
+        # New pipeline-based filter storage (takes precedence when present)
+        self.channel_filter_pipelines: Dict[str, FilterPipeline] = {}
+        self._filter_audit_log = FilterAuditLog()
         self.default_derivation_presets: Dict[str, Tuple[float, float]] = {
             # EEG: 0.3-35 Hz
             'F3-M2': (0.3, 35.0),
@@ -344,6 +377,11 @@ class EEGAnalysisStudio:
             self.filter_window = str(self.active_profile.filter_window or "hamming")
             for ch, cfg in (self.active_profile.channel_filter_params or {}).items():
                 self.channel_filter_params[ch] = dict(cfg)
+            for ch, pipe_dict in (self.active_profile.channel_filter_pipelines or {}).items():
+                try:
+                    self.channel_filter_pipelines[ch] = FilterPipeline.from_dict(pipe_dict)
+                except Exception:
+                    pass
         except Exception:
             pass
         
@@ -388,7 +426,15 @@ class EEGAnalysisStudio:
         # Cache PSG
         self._psg_cached_hypnogram: Optional[Tuple[List[str], float]] = None
         self._psg_cached_scoring_rows: int = 0
-        
+        # Viewer PSG : PyQtGraph par défaut si PySide6 + pyqtgraph sont disponibles
+        self._qt_viewer_bridge: Optional[Any] = None
+        self.prefer_qt_psg_viewer: bool = True
+        self._qt_nav_sync_queued: bool = False
+        self._qt_nav_sync_deferred: bool = False
+        self._pending_nav_sync_t: float = 0.0
+        self._qt_channel_tuple: Tuple[str, ...] = ()
+        self._qt_import_check_failed: bool = False
+
         # Gestionnaire de thèmes (remplace l'ancien système de palettes)
         from CESA.theme_manager import theme_manager
         self.theme_manager = theme_manager
@@ -471,7 +517,7 @@ class EEGAnalysisStudio:
         self._update_version_display()
         
         # Log de l'initialisation
-        logging.info("CCESA (Complex EEG Studio Analysis) v1.0 initialisé avec succès")
+        logging.info("CESA (Complex EEG Studio Analysis) v0.0beta1.0 initialisé avec succès")
         logging.info("Application initialized successfully")
 
         # Optimisation rendu: exécuteur en arrière-plan + debouncing
@@ -548,7 +594,7 @@ class EEGAnalysisStudio:
         self.control_width = control_width
         
         # Configuration de la fenêtre principale
-        self.root.title("CCESA (Complex EEG Studio Analysis) v1.0 - Interface Moderne")
+        self.root.title("CESA (Complex EEG Studio Analysis) v0.0beta1.0 - Interface Moderne")
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(1000, 600)
         
@@ -809,7 +855,12 @@ class EEGAnalysisStudio:
         view_menu.add_command(label="📏 Activer Autoscale", command=self._toggle_autoscale, accelerator="Ctrl+A")
         view_menu.add_command(label="🔧 Configuration Filtres", command=self.show_filter_config, accelerator="Ctrl+F")
         view_menu.add_separator()
-        view_menu.add_command(label="📊 Vue Multi-Graphiques", command=self.show_multi_graph_view, accelerator="Ctrl+M")
+        view_menu.add_command(
+            label="📊 Vue Multi-Graphiques (Matplotlib)",
+            command=self._open_matplotlib_psg_view,
+            accelerator="Ctrl+M",
+        )
+        view_menu.add_command(label="⚡ Viewer PyQtGraph (défaut)", command=self._launch_qt_viewer)
         view_menu.add_separator()
         view_menu.add_command(label="🎨 Thème Sombre", command=self._toggle_dark_theme)
         view_menu.add_separator()
@@ -873,6 +924,30 @@ class EEGAnalysisStudio:
             variable=self.sleep_scoring_method_var,
             value="pftsleep",
             command=lambda: self._set_sleep_scoring_method("pftsleep"),
+        )
+        sleep_menu.main_menu.add_radiobutton(
+            label="Backend scoring: AASM Rules (nouveau)",
+            variable=self.sleep_scoring_method_var,
+            value="aasm_rules",
+            command=lambda: self._set_sleep_scoring_method("aasm_rules"),
+        )
+        sleep_menu.main_menu.add_radiobutton(
+            label="Backend scoring: ML (nouveau)",
+            variable=self.sleep_scoring_method_var,
+            value="ml",
+            command=lambda: self._set_sleep_scoring_method("ml"),
+        )
+        sleep_menu.main_menu.add_radiobutton(
+            label="Backend scoring: ML + HMM (nouveau)",
+            variable=self.sleep_scoring_method_var,
+            value="ml_hmm",
+            command=lambda: self._set_sleep_scoring_method("ml_hmm"),
+        )
+        sleep_menu.main_menu.add_radiobutton(
+            label="Backend scoring: Rules + HMM (nouveau)",
+            variable=self.sleep_scoring_method_var,
+            value="rules_hmm",
+            command=lambda: self._set_sleep_scoring_method("rules_hmm"),
         )
         sleep_menu.add_command(label="⚙️ Configurer auto-scoring (YASA/U-Sleep)...", command=self._open_sleep_scoring_settings)
         sleep_menu.add_command(label="📦 Définir checkpoint U-Sleep...", command=self._select_usleep_checkpoint)
@@ -979,7 +1054,7 @@ class EEGAnalysisStudio:
                     create_new_profile_on_pending=False,
                     show_dialog_on_pending=False,
                 )
-                self.show_multi_graph_view(embed_parent=getattr(self, "psg_container", None))
+                self._show_default_psg_view(embed_parent=getattr(self, "psg_container", None))
                 self.update_plot()
             except Exception:
                 pass
@@ -1246,6 +1321,11 @@ class EEGAnalysisStudio:
         profile.filter_type = str(getattr(self, "filter_type", "butterworth"))
         profile.filter_window = str(getattr(self, "filter_window", "hamming"))
         profile.channel_filter_params = {ch: dict(cfg) for ch, cfg in getattr(self, "channel_filter_params", {}).items()}
+        cfp = getattr(self, "channel_filter_pipelines", {})
+        profile.channel_filter_pipelines = {
+            ch: (pipe.to_dict() if hasattr(pipe, "to_dict") else dict(pipe))
+            for ch, pipe in cfp.items()
+        }
         profile.channel_mappings = dict(getattr(self, "profile_channel_map_runtime", profile.channel_mappings))
         self.profile_store.save_profile(profile)
         self.profile_store.set_last_profile_name(profile.name)
@@ -1273,6 +1353,12 @@ class EEGAnalysisStudio:
             self.channel_filter_params = {
                 ch: dict(cfg) for ch, cfg in (profile.channel_filter_params or {}).items()
             }
+            self.channel_filter_pipelines = {}
+            for ch, pipe_dict in (profile.channel_filter_pipelines or {}).items():
+                try:
+                    self.channel_filter_pipelines[ch] = FilterPipeline.from_dict(pipe_dict)
+                except Exception:
+                    pass
             if hasattr(self, "filter_var"):
                 self.filter_var.set(self.filter_enabled)
             if hasattr(self, "baseline_var"):
@@ -1310,7 +1396,7 @@ class EEGAnalysisStudio:
             if self.raw is not None:
                 if not self._ensure_profile_channel_mapping(list(self.raw.ch_names)):
                     return
-                self.show_multi_graph_view(embed_parent=getattr(self, "psg_container", None))
+                self._show_default_psg_view(embed_parent=getattr(self, "psg_container", None))
             self.update_plot()
             messagebox.showinfo("Profils", f"Profil '{selected.strip()}' chargé.")
 
@@ -1720,7 +1806,7 @@ class EEGAnalysisStudio:
         }
         self.profile_ignored_channels_runtime = [ch for ch in ignored if ch in available]
         try:
-            self.show_multi_graph_view(embed_parent=getattr(self, "psg_container", None))
+            self._show_default_psg_view(embed_parent=getattr(self, "psg_container", None))
             self.update_plot()
         except Exception:
             pass
@@ -2176,6 +2262,8 @@ class EEGAnalysisStudio:
             if hasattr(self, 'psg_plotter') and self.psg_plotter is not None:
                 self.psg_plotter.set_autoscale_enabled(self.autoscale_enabled)
                 logging.debug(f"UI->Viewer: autoscale pushed -> {self.autoscale_enabled}")
+            elif self._qt_psg_plot_active():
+                pass  # autoscale géré dans le viewer Qt si besoin
         except Exception:
             pass
         self.update_plot()
@@ -2189,296 +2277,954 @@ class EEGAnalysisStudio:
             if hasattr(self, 'psg_plotter') and self.psg_plotter is not None:
                 self.psg_plotter.set_global_filter_enabled(self.filter_enabled)
                 logging.debug(f"UI->Viewer: filter pushed -> {self.filter_enabled}")
+            elif self._qt_psg_plot_active():
+                self._qt_viewer_bridge.set_global_filter_enabled(self.filter_enabled)
         except Exception:
             pass
         self.update_plot()
     
     def show_filter_config(self):
-        """Interface unifiée de configuration des filtres (globaux + par canal)."""
-        if not self.raw:
-            messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
-            return
+        """Open the professional filter-configuration dialog.
 
-        win = tk.Toplevel(self.root)
-        win.title("Configuration des Filtres - CESA")
-        win.geometry("920x780")
-        win.minsize(700, 500)
-        win.transient(self.root)
-        win.grab_set()
+        Delegates to ``FilterConfigDialog`` from ``ui.filter_dialog`` which
+        provides per-channel pipeline editing with sliders, real-time signal
+        preview, frequency-response plot, and preset management.
+        """
         try:
-            from CESA.theme_manager import theme_manager as _tm
-            _tm.apply_theme_to_root(win)
+            self._qt_pause_pump_for_tk_modal()
+            if not self.raw:
+                messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
+                return
+
+            channel_names = sorted(self.derivations.keys()) if hasattr(self, "derivations") else []
+            if not channel_names:
+                messagebox.showwarning("Attention", "Aucun canal disponible.")
+                return
+
+            sfreq = float(self.raw.info["sfreq"]) if self.raw else 256.0
+
+            # Build channel-type map
+            channel_types: Dict[str, str] = {}
+            for ch in channel_names:
+                channel_types[ch] = cesa_detect_signal_type(ch)
+
+            # Prepare pipelines dict: prefer existing pipelines, fall back to legacy params
+            pipelines: Dict[str, FilterPipeline] = {}
+            for ch in channel_names:
+                if ch in self.channel_filter_pipelines:
+                    pipelines[ch] = self.channel_filter_pipelines[ch].deep_copy()
+                elif ch in self.channel_filter_params:
+                    p = self.channel_filter_params[ch]
+                    pipelines[ch] = pipeline_from_legacy_params(
+                        low=float(p.get("low", 0.0)),
+                        high=float(p.get("high", 0.0)),
+                        order=self.filter_order,
+                        filter_type=self.filter_type,
+                        enabled=bool(p.get("enabled", True)),
+                    )
+                else:
+                    dp = cesa_get_filter_presets(channel_types.get(ch, "unknown"))
+                    pipelines[ch] = pipeline_from_legacy_params(
+                        low=float(dp.get("low", 0.0)),
+                        high=float(dp.get("high", 0.0)),
+                        order=self.filter_order,
+                        filter_type=self.filter_type,
+                        enabled=bool(dp.get("enabled", True)),
+                    )
+
+            # Signal getter for live preview
+            def _signal_getter(ch_name: str, start_s: float, duration_s: float) -> np.ndarray:
+                try:
+                    idx = self.raw.ch_names.index(ch_name) if ch_name in self.raw.ch_names else 0
+                    n_samples = int(sfreq * duration_s)
+                    start_sample = int(start_s * sfreq)
+                    data = self.raw.get_data(
+                        picks=[idx],
+                        start=start_sample,
+                        stop=start_sample + n_samples,
+                    )[0] * 1e6
+                    return data
+                except Exception:
+                    return np.array([])
+
+            def _on_apply(new_pipelines: Dict[str, FilterPipeline], global_enabled: bool) -> None:
+                self.filter_enabled = global_enabled
+                self.channel_filter_pipelines = dict(new_pipelines)
+
+                # Sync legacy params for backward compat
+                for ch, pipe in new_pipelines.items():
+                    self.channel_filter_params[ch] = {"enabled": pipe.enabled, "low": 0.0, "high": 0.0, "amplitude": 100.0}
+
+                if hasattr(self, "filter_var"):
+                    self.filter_var.set(self.filter_enabled)
+
+                plotter = getattr(self, "psg_plotter", None)
+                if plotter is not None:
+                    plotter.global_filter_enabled = self.filter_enabled
+                    plotter.filter_pipelines_by_channel = {
+                        ch: pipe for ch, pipe in self.channel_filter_pipelines.items()
+                    }
+                elif self._qt_psg_plot_active():
+                    try:
+                        self._qt_viewer_bridge.set_global_filter_enabled(self.filter_enabled)
+                        self._qt_viewer_bridge.filter_pipelines_by_channel = {
+                            ch: pipe for ch, pipe in self.channel_filter_pipelines.items()
+                        }
+                    except Exception:
+                        pass
+                try:
+                    self._capture_runtime_into_profile()
+                except Exception:
+                    pass
+                self.update_plot()
+
+            FilterConfigDialog(
+                self.root,
+                channel_names,
+                sfreq,
+                channel_pipelines=pipelines,
+                channel_types=channel_types,
+                signal_getter=_signal_getter,
+                on_apply=_on_apply,
+                global_enabled=self.filter_enabled,
+                audit_log=self._filter_audit_log,
+            )
+        finally:
+            self._qt_resume_pump_after_tk_modal()
+
+    def _open_matplotlib_psg_view(self) -> None:
+        """Force le viewer Matplotlib intégré (raccourci menu / Ctrl+M)."""
+        self.prefer_qt_psg_viewer = False
+        parent = getattr(self, "psg_container", None)
+        self.show_multi_graph_view(embed_parent=parent)
+
+    # ------------------------------------------------------------------
+    # PyQtGraph : viewer par défaut
+    # ------------------------------------------------------------------
+
+    def _qt_psg_dependencies_available(self) -> bool:
+        if getattr(self, "_qt_import_check_failed", False):
+            return False
+        try:
+            import PySide6  # noqa: F401
+            import pyqtgraph  # noqa: F401
+            return True
+        except ImportError as exc:
+            self._qt_import_check_failed = True
+            logging.warning(
+                "[VIEW] PySide6/pyqtgraph indisponibles (%s) — repli sur Matplotlib. "
+                "Installez: python -m pip install PySide6 pyqtgraph. "
+                "Erreur DLL Qt souvent due à un autre Python sur le PATH (ex. PyMOL) — utilisez python.org ou un venv.",
+                exc,
+            )
+            return False
+
+    def _qt_psg_plot_active(self) -> bool:
+        if not getattr(self, "prefer_qt_psg_viewer", True):
+            return False
+        br = getattr(self, "_qt_viewer_bridge", None)
+        if br is None:
+            return False
+        try:
+            return bool(br.is_alive())
+        except Exception:
+            return False
+
+    def _close_qt_viewer_if_any(self) -> None:
+        br = getattr(self, "_qt_viewer_bridge", None)
+        if br is None:
+            return
+        _log_viewer_checkpoint("20", "close_qt_viewer_if_any", had_bridge=True)
+        try:
+            br.close()
+        except Exception:
+            pass
+        self._qt_viewer_bridge = None
+
+    def _embed_qt_viewer_placeholder(self, parent: ttk.Frame) -> None:
+        for child in parent.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        holder = ttk.Frame(parent)
+        holder.pack(fill=tk.BOTH, expand=True)
+        msg = (
+            "Fenêtre « Viewer PyQtGraph » active (affichée à part).\n\n"
+            "Signaux EEG/PSG : navigation et zoom dans cette fenêtre Qt.\n"
+            "Pour le tracé intégré Matplotlib : Affichage > Vue Multi-Graphiques (Matplotlib)."
+        )
+        ttk.Label(
+            holder, text=msg, anchor=tk.CENTER, justify=tk.CENTER, wraplength=420,
+        ).pack(expand=True, padx=24, pady=24)
+
+    def _qt_build_launch_kwargs(self) -> Optional[Dict[str, Any]]:
+        """Arguments pour launch_viewer (signaux pleine nuit, µV).
+
+        Utilise en priorité ``self.derivations[ch]`` (déjà en µV, mêmes clés que
+        ``channel_filter_pipelines`` / dialogue filtres) pour chaque canal affiché ;
+        repli sur ``raw.get_data`` si absent.
+        """
+        if not self.raw:
+            return None
+        signals: Dict[str, Tuple[np.ndarray, float]] = {}
+        fs = float(getattr(self, "sfreq", 256.0))
+        selected = getattr(self, "psg_channels_used", None)
+        if not selected:
+            selected = (
+                list(self.selected_channels)
+                if self.selected_channels
+                else list(self.raw.ch_names)[:16]
+            )
+        derivs = getattr(self, "derivations", None) or {}
+        for ch in selected:
+            try:
+                if ch in derivs:
+                    arr = np.asarray(derivs[ch], dtype=np.float64).reshape(-1)
+                    signals[ch] = (np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0), fs)
+                else:
+                    arr = self.raw.get_data(picks=[ch])[0]
+                    signals[ch] = (self._to_microvolts_and_sanitize(arr), fs)
+            except Exception:
+                continue
+        if not signals:
+            return None
+        hypnogram = None
+        try:
+            df = self._get_active_scoring_df()
+            if df is not None and len(df) > 0 and "time" in df.columns and "stage" in df.columns:
+                df_work = df[["time", "stage"]].copy()
+                df_work["time"] = pd.to_numeric(df_work["time"], errors="coerce")
+                df_work = df_work.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+                if len(df_work) >= 2:
+                    diffs = np.diff(df_work["time"].to_numpy(dtype=float))
+                    diffs_pos = diffs[diffs > 0]
+                    epoch_len = float(np.median(diffs_pos)) if len(diffs_pos) > 0 else 30.0
+                else:
+                    epoch_len = 30.0
+                total_dur = float(len(self.raw.times) / fs)
+                num_epochs = int(np.ceil(total_dur / epoch_len))
+                labels = ["U"] * num_epochs
+                for t_val, s in zip(
+                    df_work["time"].to_numpy(dtype=float),
+                    df_work["stage"].astype(str).str.upper().str.strip().to_numpy(),
+                ):
+                    idx = int(round(t_val / epoch_len))
+                    if 0 <= idx < len(labels):
+                        labels[idx] = s
+                hypnogram = (labels, epoch_len)
+        except Exception:
+            pass
+        channel_types: Dict[str, str] = {}
+        try:
+            from CESA.filters import detect_signal_type as _dst
+            for ch in signals:
+                channel_types[ch] = _dst(ch)
+        except Exception:
+            pass
+        total_dur = float(len(self.raw.times) / fs)
+        return {
+            "signals": signals,
+            "hypnogram": hypnogram,
+            "scoring_annotations": [],
+            "filter_pipelines": getattr(self, "channel_filter_pipelines", {}),
+            "channel_types": channel_types,
+            "global_filter_enabled": bool(self.filter_var.get()) if hasattr(self, "filter_var") else True,
+            "start_time_s": float(self.current_time),
+            "duration_s": float(self.duration),
+            "total_duration_s": total_dur,
+            "theme_name": "dark",
+        }
+
+    def _qt_defer_to_studio(self, fn: Callable[[], None]) -> None:
+        """Planifie un appel sur la boucle Tk (jamais depuis la pile Qt directe)."""
+
+        def _run() -> None:
+            try:
+                fn()
+            except Exception:
+                logging.debug("[VIEW] deferred studio call failed", exc_info=True)
+
+        try:
+            self.root.after(0, _run)
+        except Exception:
+            try:
+                self._enqueue_tk_main(_run)
+            except Exception:
+                pass
+
+    def _qt_sync_global_filter_from_viewer(self, enabled: bool) -> None:
+        """Aligne filter_var / filter_enabled après toggle F dans le viewer Qt."""
+        self.filter_enabled = bool(enabled)
+        if hasattr(self, "filter_var"):
+            try:
+                self.filter_var.set(self.filter_enabled)
+            except Exception:
+                pass
+        try:
+            plotter = getattr(self, "psg_plotter", None)
+            if plotter is not None:
+                plotter.set_global_filter_enabled(self.filter_enabled)
         except Exception:
             pass
 
-        # --- Scrollable outer container ---
-        outer_canvas = tk.Canvas(win, highlightthickness=0)
-        outer_scroll = ttk.Scrollbar(win, orient="vertical", command=outer_canvas.yview)
-        outer_frame = ttk.Frame(outer_canvas, padding=20)
-        outer_frame.bind("<Configure>", lambda _e: outer_canvas.configure(scrollregion=outer_canvas.bbox("all")))
-        outer_canvas.create_window((0, 0), window=outer_frame, anchor="nw")
-        outer_canvas.configure(yscrollcommand=outer_scroll.set)
-        outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        outer_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    def _qt_pause_pump_for_tk_modal(self) -> None:
+        """Pendant un modal Tk : coupe le pump Qt et la file worker→Tk (poll 16 ms).
 
-        def _on_mousewheel(event):
-            try:
-                outer_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            except Exception:
-                pass
-        outer_canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        def _unbind_mousewheel():
-            try:
-                outer_canvas.unbind_all("<MouseWheel>")
-            except Exception:
-                pass
-        win.protocol("WM_DELETE_WINDOW", lambda: (_unbind_mousewheel(), win.destroy()))
-
-        ttk.Label(outer_frame, text="Configuration des Filtres",
-                  font=("Segoe UI", 15, "bold")).pack(pady=(0, 15))
-
-        # ============================================================
-        # 1. GLOBAL ON/OFF
-        # ============================================================
-        toggle_frame = ttk.LabelFrame(outer_frame, text="Activation", padding=10)
-        toggle_frame.pack(fill=tk.X, pady=(0, 10))
-        row_toggle = ttk.Frame(toggle_frame)
-        row_toggle.pack(fill=tk.X)
-
-        global_filter_var = tk.BooleanVar(value=self.filter_enabled)
-        ttk.Checkbutton(row_toggle, text="Filtrage actif", variable=global_filter_var).pack(side=tk.LEFT, padx=(0, 30))
-
-        baseline_var = tk.BooleanVar(value=self.baseline_correction_enabled)
-        ttk.Checkbutton(row_toggle, text="Correction de ligne de base", variable=baseline_var).pack(side=tk.LEFT)
-
-        # ============================================================
-        # 2. TYPE & ORDRE DU FILTRE
-        # ============================================================
-        design_frame = ttk.LabelFrame(outer_frame, text="Type et Ordre du Filtre", padding=10)
-        design_frame.pack(fill=tk.X, pady=(0, 10))
-
-        type_row = ttk.Frame(design_frame)
-        type_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(type_row, text="Type :").pack(side=tk.LEFT, padx=(0, 8))
-        filter_type_var = tk.StringVar(value=self.filter_type)
-        for label, val in [("Butterworth", "butterworth"), ("Chebyshev I", "cheby1"),
-                           ("Chebyshev II", "cheby2"), ("Elliptique", "ellip")]:
-            ttk.Radiobutton(type_row, text=label, variable=filter_type_var, value=val).pack(side=tk.LEFT, padx=6)
-
-        order_row = ttk.Frame(design_frame)
-        order_row.pack(fill=tk.X)
-        ttk.Label(order_row, text="Ordre :").pack(side=tk.LEFT, padx=(0, 8))
-        filter_order_var = tk.IntVar(value=self.filter_order)
-        order_spin = ttk.Spinbox(order_row, from_=1, to=10, textvariable=filter_order_var, width=5)
-        order_spin.pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(order_row, text="(plus élevé = pente plus raide)").pack(side=tk.LEFT)
-
-        # ============================================================
-        # 3. PRESETS RAPIDES PAR TYPE DE SIGNAL
-        # ============================================================
-        presets_frame = ttk.LabelFrame(outer_frame, text="Préréglages rapides par type de signal", padding=10)
-        presets_frame.pack(fill=tk.X, pady=(0, 10))
-
-        presets = {
-            "EEG": {"low": 0.3, "high": 70.0, "amplitude": 100.0, "channels": []},
-            "ECG": {"low": 0.3, "high": 70.0, "amplitude": 100.0, "channels": []},
-            "EMG": {"low": 10.0, "high": 0.0, "amplitude": 25.0, "channels": []},
-            "EOG": {"low": 0.3, "high": 35.0, "amplitude": 50.0, "channels": []},
-        }
-        for channel in self.derivations.keys():
-            stype = cesa_detect_signal_type(channel)
-            bucket = {"eeg": "EEG", "ecg": "ECG", "emg": "EMG", "eog": "EOG",
-                      "sas_eeg": "EEG", "sas_emg": "EMG"}.get(stype, "EEG")
-            presets[bucket]["channels"].append(channel)
-
-        # channel_vars dict will be populated later; preset apply needs a reference
-        channel_vars: Dict[str, Dict[str, tk.Variable]] = {}
-
-        def _apply_preset(data):
-            for ch in data["channels"]:
-                v = channel_vars.get(ch)
-                if v:
-                    v["low"].set(data["low"])
-                    v["high"].set(data["high"])
-                    v["amplitude"].set(data["amplitude"])
-                    v["enabled"].set(True)
-
-        for pname, pdata in presets.items():
-            if not pdata["channels"]:
-                continue
-            row = ttk.Frame(presets_frame)
-            row.pack(fill=tk.X, pady=2)
-            chs_text = ", ".join(pdata["channels"][:4])
-            if len(pdata["channels"]) > 4:
-                chs_text += f" (+{len(pdata['channels']) - 4})"
-            ttk.Label(row, text=f"{pname}:", font=("Segoe UI", 9, "bold"), width=6).pack(side=tk.LEFT)
-            ttk.Label(row, text=f"{pdata['low']}-{pdata['high']} Hz, {pdata['amplitude']}%",
-                      width=22).pack(side=tk.LEFT, padx=(4, 8))
-            ttk.Label(row, text=chs_text).pack(side=tk.LEFT, padx=(0, 8))
-            ttk.Button(row, text="Appliquer",
-                       command=lambda d=pdata: _apply_preset(d)).pack(side=tk.RIGHT)
-
-        # ============================================================
-        # 4. CONFIGURATION PAR CANAL (table)
-        # ============================================================
-        chan_frame = ttk.LabelFrame(outer_frame, text="Paramètres par canal", padding=10)
-        chan_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        columns = ("Canal", "Bas (Hz)", "Haut (Hz)", "Amplitude (%)", "Actif")
-        tree = ttk.Treeview(chan_frame, columns=columns, show="headings", height=10)
-        for col in columns:
-            tree.heading(col, text=col)
-        tree.column("Canal", width=160, anchor=tk.W)
-        tree.column("Bas (Hz)", width=90, anchor=tk.CENTER)
-        tree.column("Haut (Hz)", width=90, anchor=tk.CENTER)
-        tree.column("Amplitude (%)", width=110, anchor=tk.CENTER)
-        tree.column("Actif", width=70, anchor=tk.CENTER)
-        tree_scroll = ttk.Scrollbar(chan_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=tree_scroll.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Internal Tk vars for each channel (hidden, synced with tree)
-        for channel in sorted(self.derivations.keys()):
-            if channel in self.channel_filter_params:
-                p = self.channel_filter_params[channel]
-                lo = p.get("low", 0.5)
-                hi = p.get("high", 30.0)
-                amp = p.get("amplitude", 100.0)
-                ena = bool(p.get("enabled", True))
+        Sinon les callbacks planifiés par ``ThreadPoolExecutor`` peuvent s'exécuter
+        pendant ``messagebox`` / ``grab_set`` et provoquer PyEval_RestoreThread (Py3.14).
+        """
+        d = int(getattr(self, "_tk_modal_ui_block_depth", 0)) + 1
+        self._tk_modal_ui_block_depth = d
+        _log_viewer_checkpoint("62", "_qt_pause_pump_for_tk_modal enter", new_depth=d)
+        if d == 1:
+            pid = getattr(self, "_tk_main_poll_id", None)
+            self._tk_main_poll_id = None
+            if pid is not None:
+                try:
+                    self.root.after_cancel(pid)
+                except Exception:
+                    pass
+                logging.info("[VIEWER-CHK-30] tk main-thread poll paused for Tk modal")
+                _log_viewer_checkpoint("63", "tk main-thread poll after_cancel ok", had_poll_id=True)
             else:
-                stype = cesa_detect_signal_type(channel)
-                dp = cesa_get_filter_presets(stype)
-                lo, hi, amp, ena = dp["low"], dp["high"], dp["amplitude"], dp["enabled"]
-
-            enabled_var = tk.BooleanVar(value=ena)
-            low_var = tk.DoubleVar(value=lo)
-            high_var = tk.DoubleVar(value=hi)
-            amp_var = tk.DoubleVar(value=amp)
-            channel_vars[channel] = {"enabled": enabled_var, "low": low_var,
-                                     "high": high_var, "amplitude": amp_var}
-            tree.insert("", tk.END, iid=channel,
-                        values=(channel, f"{lo:.1f}", f"{hi:.1f}", f"{amp:.0f}",
-                                "Oui" if ena else "Non"))
-
-        # Double-click to edit a cell
-        def _on_dbl_click(event):
-            item_id = tree.identify_row(event.y)
-            col_id = tree.identify_column(event.x)
-            if not item_id or not col_id:
-                return
-            col_idx = int(col_id.replace("#", "")) - 1
-            if col_idx == 0:
-                return
+                _log_viewer_checkpoint("63", "tk main-thread poll pause depth==1 (no poll id)", had_poll_id=False)
+        br = getattr(self, "_qt_viewer_bridge", None)
+        if br is not None and hasattr(br, "pause_qt_pump"):
             try:
-                x, y, w, h = tree.bbox(item_id, col_id)
+                br.pause_qt_pump()
             except Exception:
-                return
-            cur_val = tree.set(item_id, columns[col_idx])
-            entry = ttk.Entry(tree, width=10)
-            entry.insert(0, cur_val)
-            entry.place(x=x, y=y, width=w, height=h)
-            entry.focus_set()
-            entry.select_range(0, tk.END)
+                logging.debug("[VIEW] pause_qt_pump failed", exc_info=True)
 
-            def _save(ev=None):
-                new = entry.get().strip()
-                entry.destroy()
-                ch = item_id
-                v = channel_vars.get(ch)
-                if not v:
-                    return
-                if col_idx in (1, 2, 3):
-                    try:
-                        fval = float(new)
-                    except ValueError:
-                        return
-                    tree.set(ch, columns[col_idx], f"{fval:.1f}" if col_idx < 3 else f"{fval:.0f}")
-                    if col_idx == 1:
-                        v["low"].set(fval)
-                    elif col_idx == 2:
-                        v["high"].set(fval)
-                    else:
-                        v["amplitude"].set(fval)
-                elif col_idx == 4:
-                    is_on = new.lower() in ("oui", "yes", "true", "1", "on")
-                    tree.set(ch, columns[col_idx], "Oui" if is_on else "Non")
-                    v["enabled"].set(is_on)
-
-            entry.bind("<Return>", _save)
-            entry.bind("<FocusOut>", _save)
-
-        tree.bind("<Double-1>", _on_dbl_click)
-
-        ttk.Label(chan_frame, text="Double-cliquez sur une cellule pour la modifier",
-                  font=("Segoe UI", 8)).pack(anchor=tk.W, pady=(4, 0))
-
-        # ============================================================
-        # 5. BOUTONS
-        # ============================================================
-        btn_frame = ttk.Frame(outer_frame)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-
-        def _apply():
-            self.filter_enabled = bool(global_filter_var.get())
-            self.baseline_correction_enabled = bool(baseline_var.get())
-            self.filter_type = str(filter_type_var.get())
-            self.filter_order = int(filter_order_var.get())
-            for ch, v in channel_vars.items():
-                self.channel_filter_params[ch] = {
-                    "enabled": bool(v["enabled"].get()),
-                    "low": float(v["low"].get()),
-                    "high": float(v["high"].get()),
-                    "amplitude": float(v["amplitude"].get()),
-                }
-            if hasattr(self, "filter_var"):
-                self.filter_var.set(self.filter_enabled)
-            if hasattr(self, "baseline_var"):
-                self.baseline_var.set(self.baseline_correction_enabled)
-            plotter = getattr(self, "psg_plotter", None)
-            if plotter is not None:
-                plotter.global_filter_enabled = self.filter_enabled
-                plotter.filter_order = self.filter_order
-                plotter.filter_type = self.filter_type
-                plotter.filter_params_by_channel = dict(self.channel_filter_params)
-                plotter.baseline_enabled = self.baseline_correction_enabled
+    def _qt_resume_pump_after_tk_modal(self) -> None:
+        def _do() -> None:
+            _log_viewer_checkpoint("65", "_qt_resume_pump_after_tk_modal _do() started")
             try:
-                self._capture_runtime_into_profile()
+                pf = getattr(self, "_active_plot_future", None)
+                if pf is not None and not pf.done():
+                    try:
+                        pf.cancel()
+                    except Exception:
+                        pass
+                self._active_plot_future = None
+                puid = getattr(self, "_plot_update_pending_id", None)
+                if puid is not None:
+                    try:
+                        self.root.after_cancel(puid)
+                    except Exception:
+                        pass
+                    self._plot_update_pending_id = None
             except Exception:
                 pass
-            self.update_plot()
-            messagebox.showinfo("Filtres", "Configuration appliquée et sauvegardée dans le profil.")
 
-        def _reset():
-            filter_type_var.set("butterworth")
-            filter_order_var.set(4)
-            global_filter_var.set(True)
-            baseline_var.set(True)
-            for ch, v in channel_vars.items():
-                stype = cesa_detect_signal_type(ch)
-                dp = cesa_get_filter_presets(stype)
-                v["low"].set(dp["low"])
-                v["high"].set(dp["high"])
-                v["amplitude"].set(dp["amplitude"])
-                v["enabled"].set(dp["enabled"])
-                tree.set(ch, "Bas (Hz)", f"{dp['low']:.1f}")
-                tree.set(ch, "Haut (Hz)", f"{dp['high']:.1f}")
-                tree.set(ch, "Amplitude (%)", f"{dp['amplitude']:.0f}")
-                tree.set(ch, "Actif", "Oui" if dp["enabled"] else "Non")
+            self._tk_modal_ui_block_depth = max(0, int(getattr(self, "_tk_modal_ui_block_depth", 0)) - 1)
+            br = getattr(self, "_qt_viewer_bridge", None)
+            if br is not None and hasattr(br, "resume_qt_pump"):
+                try:
+                    br.resume_qt_pump()
+                except Exception:
+                    logging.debug("[VIEW] resume_qt_pump failed", exc_info=True)
+            _log_viewer_checkpoint(
+                "66",
+                "_qt_resume _do after resume_qt_pump attempt",
+                modal_depth=int(getattr(self, "_tk_modal_ui_block_depth", 0)),
+                has_bridge=bool(getattr(self, "_qt_viewer_bridge", None)),
+            )
 
-        def _close():
-            _unbind_mousewheel()
-            win.destroy()
+            if self._tk_modal_ui_block_depth == 0:
+                def _restart_poll_late() -> None:
+                    _log_viewer_checkpoint("67", "_restart_poll_late entered")
+                    # #region agent log
+                    try:
+                        from CESA.agent_debug_f8b011 import log as _agent_log
 
-        ttk.Button(btn_frame, text="Appliquer et Sauvegarder", command=_apply).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Réinitialiser", command=_reset).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Fermer", command=_close).pack(side=tk.RIGHT, padx=5)
+                        _agent_log(
+                            "F",
+                            "eeg_studio._restart_poll_late",
+                            "schedule poll after modal",
+                            {},
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    try:
+                        if getattr(self, "_tk_main_poll_id", None) is None:
+                            self._tk_main_poll_id = self.root.after(
+                                16, self._poll_tk_main_thread_queue
+                            )
+                            logging.info("[VIEWER-CHK-31] tk main-thread poll restarted after modal")
+                    except Exception:
+                        logging.debug("[VIEW] restart tk poll failed", exc_info=True)
+
+                # Après un modal, le premier processEvents Qt est retardé (~300 ms, viewer_bridge).
+                # Redémarrer le poll Tk trop tôt après ce tick provoquait PyEval_RestoreThread (Py3.14).
+                # Marge large vs cooldown + premiers ticks pump (cf. eeg_studio.log CHK-56..69).
+                _has_qt_bridge = getattr(self, "_qt_viewer_bridge", None) is not None
+                _poll_restart_ms = 1200 if _has_qt_bridge else 180
+                # #region agent log
+                try:
+                    from CESA.agent_debug_f8b011 import log as _agent_log
+
+                    _agent_log(
+                        "F",
+                        "eeg_studio._qt_resume_pump_after_tk_modal:poll_delay",
+                        "scheduling _restart_poll_late",
+                        {"ms": _poll_restart_ms, "has_qt_bridge": _has_qt_bridge},
+                    )
+                except Exception:
+                    pass
+                # #endregion
+                try:
+                    self.root.after(_poll_restart_ms, _restart_poll_late)
+                except Exception:
+                    _restart_poll_late()
+
+        # Laisser Tk finir de dépiler le messagebox avant toute logique liée à Qt.
+        _log_viewer_checkpoint("64", "_qt_resume_pump_after_tk_modal scheduling _do via after(48)")
+        try:
+            self.root.after(48, _do)
+        except Exception:
+            _do()
+
+    def _qt_normalize_quick_stage(self, stage: str) -> Optional[str]:
+        s = str(stage).upper().strip()
+        if s == "REM":
+            s = "R"
+        if s in ManualScoringService.ALLOWED_STAGES:
+            return s
+        return None
+
+    def _qt_labels_and_epoch_from_any_scoring(self) -> Optional[Tuple[List[str], float]]:
+        """Même grille que le hypnogramme Qt : une étiquette par époque à partir du scoring actif."""
+        if not self.raw:
+            return None
+        fs = float(getattr(self, "sfreq", 256.0))
+        total_dur = float(len(self.raw.times) / fs)
+        df = self._get_active_scoring_df()
+        epoch_len = float(getattr(self, "scoring_epoch_duration", 30.0))
+        try:
+            if df is not None and len(df) > 0 and "time" in df.columns and "stage" in df.columns:
+                df_work = df[["time", "stage"]].copy()
+                df_work["time"] = pd.to_numeric(df_work["time"], errors="coerce")
+                df_work = df_work.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+                if len(df_work) >= 2:
+                    diffs = np.diff(df_work["time"].to_numpy(dtype=float))
+                    diffs_pos = diffs[diffs > 0]
+                    epoch_len = float(np.median(diffs_pos)) if len(diffs_pos) > 0 else epoch_len
+                num_epochs = int(np.ceil(total_dur / epoch_len))
+                labels = ["U"] * num_epochs
+                for t_val, s in zip(
+                    df_work["time"].to_numpy(dtype=float),
+                    df_work["stage"].astype(str).str.upper().str.strip().to_numpy(),
+                ):
+                    idx = int(round(t_val / epoch_len))
+                    if 0 <= idx < len(labels):
+                        labels[idx] = s
+                return (labels, epoch_len)
+        except Exception:
+            pass
+        num_epochs = int(np.ceil(total_dur / epoch_len))
+        return (["U"] * num_epochs, epoch_len)
+
+    def _qt_mutate_hypnogram_stage_at_time(self, onset_s: float, stage: str) -> None:
+        """Met à jour le scoring manuel dense et rafraîchit le viewer Qt."""
+        norm = self._normalize_quick_stage(stage)
+        if norm is None or not self.raw:
+            return
+        tup = self._qt_labels_and_epoch_from_any_scoring()
+        if tup is None:
+            return
+        labels, epoch_len = list(tup[0]), float(tup[1])
+        if not labels:
+            return
+        idx = int(max(0, min(len(labels) - 1, onset_s // epoch_len)))
+        labels[idx] = norm
+        n = len(labels)
+        times = (np.arange(n, dtype=float) * epoch_len).tolist()
+        try:
+            new_df = self.manual_scoring_service.validate(
+                pd.DataFrame({"time": times, "stage": labels}),
+            )
+        except Exception:
+            new_df = pd.DataFrame({"time": times, "stage": labels})
+        self.manual_scoring_data = new_df
+        self.show_manual_scoring = True
+        self.scoring_dirty = True
+        if self._qt_psg_plot_active():
+            try:
+                tup2 = self._qt_labels_and_epoch_from_any_scoring()
+                if tup2 is not None:
+                    self._qt_viewer_bridge.set_hypnogram((list(tup2[0]), float(tup2[1])))
+            except Exception:
+                logging.warning("[VIEW] set_hypnogram après scoring rapide a échoué.", exc_info=True)
+
+    def _qt_apply_sleep_stage_at_epoch_time(self, onset_s: float, stage: str) -> None:
+        self._qt_mutate_hypnogram_stage_at_time(float(onset_s), stage)
+
+    def _qt_apply_sleep_stage_at_current_epoch(self, stage: str) -> None:
+        if not self.raw:
+            return
+        tup = self._qt_labels_and_epoch_from_any_scoring()
+        if tup is None:
+            return
+        _, el = tup
+        el = float(el)
+        onset = float(int(float(self.current_time) // el) * el)
+        self._qt_mutate_hypnogram_stage_at_time(onset, stage)
+
+    def _qt_on_viewer_navigate(self, target_time: float) -> None:
+        """Appelé par le viewer Qt (pendant processEvents).
+
+        Aucun appel Tk ici — même ``root.after(0, ...)`` provoque un crash GIL fatal
+        (PyEval_RestoreThread) sur Python 3.14. On pose seulement l'état ; le pump Tk
+        enfile ``_after_qt_pump_commit_deferred_nav`` sur le poll Tk après ``processEvents()``.
+        """
+        _log_viewer_checkpoint(
+            "01",
+            "qt_on_viewer_navigate",
+            target=target_time,
+            queued=getattr(self, "_qt_nav_sync_queued", False),
+        )
+        try:
+            self._pending_nav_sync_t = float(max(0.0, float(target_time)))
+        except Exception:
+            self._pending_nav_sync_t = 0.0
+        self._qt_nav_sync_deferred = True
+        _log_viewer_checkpoint(
+            "02",
+            "pending_nav_sync_t set; defer until after_qt_pump (no Tk from Qt stack)",
+            pending=self._pending_nav_sync_t,
+        )
+
+    def _after_qt_pump_enqueue_commit_nav(self) -> None:
+        """Après ``processEvents`` : ne rien faire de lourd ici (GIL Py3.14).
+
+        Enfile éventuellement la synchro sur ``_poll_tk_main_thread_queue`` pour qu'elle
+        s'exécute dans un autre tick Tk, pas dans la foulée du pump Qt.
+        """
+        if not getattr(self, "_qt_nav_sync_deferred", False):
+            return
+        self._enqueue_tk_main(self._after_qt_pump_commit_deferred_nav)
+
+    def _after_qt_pump_commit_deferred_nav(self) -> None:
+        """Après chaque ``processEvents()`` : exécute la synchro Tk si le viewer Qt a navigué."""
+        # #region agent log
+        try:
+            from CESA.agent_debug_f8b011 import log as _agent_log
+
+            _agent_log(
+                "A",
+                "eeg_studio._after_qt_pump_commit_deferred_nav",
+                "enter",
+                {"deferred": bool(getattr(self, "_qt_nav_sync_deferred", False))},
+            )
+        except Exception:
+            pass
+        # #endregion
+        if not getattr(self, "_qt_nav_sync_deferred", False):
+            return
+        self._qt_nav_sync_deferred = False
+        if not self._request_qt_nav_sync_to_tk():
+            self._qt_nav_sync_deferred = True
+
+    def _apply_qt_nav_sync_time(self, t: float) -> None:
+        """Met à jour temps + sliders/labels sans déclencher command= des ttk.Scale.
+
+        Sinon ``time_var.set`` peut invoquer ``_update_time`` → ``update_plot()`` puis
+        un second ``update_plot()`` depuis la synchro Qt → réentrance et plantages.
+        """
+        _log_viewer_checkpoint(
+            "03",
+            "apply_qt_nav_sync_time enter",
+            t_in=t,
+            current_before=getattr(self, "current_time", None),
+        )
+        self.current_time = float(max(0.0, t))
+        ts = getattr(self, "time_scale", None)
+        bts = getattr(self, "bottom_time_scale", None)
+        try:
+            if ts is not None:
+                try:
+                    ts.configure(command="")
+                except Exception:
+                    pass
+            if bts is not None:
+                try:
+                    bts.configure(command="")
+                except Exception:
+                    pass
+            self._update_time_display()
+        finally:
+            if ts is not None:
+                try:
+                    ts.configure(command=self._update_time)
+                except Exception:
+                    pass
+            if bts is not None:
+                try:
+                    bts.configure(command=self._update_time_from_bottom)
+                except Exception:
+                    pass
+        _log_viewer_checkpoint("04", "apply_qt_nav_sync_time exit", current=self.current_time)
+
+    def _delayed_resync_qt_nav_to_tk(self) -> None:
+        """Re-sync différé : évite une chaîne immédiate after(0) → update_plot sous rafale."""
+        _log_viewer_checkpoint(
+            "05",
+            "delayed_resync_qt_nav_to_tk",
+            pending=getattr(self, "_pending_nav_sync_t", None),
+            current=getattr(self, "current_time", None),
+        )
+        try:
+            if abs(float(getattr(self, "_pending_nav_sync_t", 0)) - float(self.current_time)) > 1e-3:
+                _log_viewer_checkpoint("06", "delayed_resync triggers new request_sync")
+                self._request_qt_nav_sync_to_tk()
+        except Exception:
+            pass
+
+    def _request_qt_nav_sync_to_tk(self) -> bool:
+        """Reporte temps + update_plot sur la boucle Tk (évite réentrance Qt/Tk et crashs GIL).
+
+        Returns
+        -------
+        bool
+            True si un ``after(12, _run)`` (ou équivalent) a été planifié, False si file déjà pleine.
+        """
+        if self._qt_nav_sync_queued:
+            _log_viewer_checkpoint(
+                "07",
+                "request_qt_nav_sync_to_tk skipped (already queued)",
+                pending=getattr(self, "_pending_nav_sync_t", None),
+            )
+            return False
+        self._qt_nav_sync_queued = True
+
+        def _run() -> None:
+            try:
+                sys.stderr.write("[VIEWER-PRE10] Tk sync_run: callback Tk entré\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            t = None
+            try:
+                t = float(self._pending_nav_sync_t)
+            except Exception:
+                pass
+            _log_viewer_checkpoint(
+                "10",
+                "Tk sync_run start",
+                pending_t=t,
+                thread=threading.current_thread().name,
+            )
+            _flush_viewer_logs()
+            try:
+                if t is not None:
+                    _log_viewer_checkpoint("11", "sync_run before update_plot", apply_t=t)
+                    _flush_viewer_logs()
+                    self._apply_qt_nav_sync_time(t)
+                    _flush_viewer_logs()
+                    if self._qt_psg_plot_active() and getattr(
+                        self, "psg_plotter", None,
+                    ) is None:
+                        self._sync_qt_viewer_bridge_plot_state()
+                        _log_viewer_checkpoint(
+                            "12",
+                            "sync_run after qt bridge sync (no full update_plot)",
+                            current=getattr(self, "current_time", None),
+                        )
+                    else:
+                        self.update_plot()
+                        _log_viewer_checkpoint(
+                            "12",
+                            "sync_run after update_plot ok",
+                            current=getattr(self, "current_time", None),
+                        )
+                    _flush_viewer_logs()
+            except Exception:
+                logging.exception("[VIEWER-CHK-ERR] sync_run: apply_qt_nav_sync_time or update_plot failed")
+                _flush_viewer_logs()
+            finally:
+                need_resync = False
+                try:
+                    if t is not None:
+                        need_resync = (
+                            abs(
+                                float(getattr(self, "_pending_nav_sync_t", t))
+                                - float(self.current_time),
+                            )
+                            > 1e-3
+                        )
+                except Exception:
+                    pass
+                self._qt_nav_sync_queued = False
+                _log_viewer_checkpoint(
+                    "13",
+                    "sync_run finally",
+                    need_resync=need_resync,
+                    pending_after=getattr(self, "_pending_nav_sync_t", None),
+                    current=getattr(self, "current_time", None),
+                )
+                _flush_viewer_logs()
+                if need_resync:
+                    try:
+                        self.root.after(40, self._delayed_resync_qt_nav_to_tk)
+                    except Exception:
+                        pass
+                # #region agent log
+                try:
+                    from CESA.agent_debug_f8b011 import log as _agent_log
+
+                    _agent_log(
+                        "D",
+                        "eeg_studio._request_qt_nav_sync_to_tk._run:finally_end",
+                        "sync_run finally complete",
+                        {"need_resync": need_resync},
+                    )
+                except Exception:
+                    pass
+                # #endregion
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _log_viewer_checkpoint("08", "request_sync scheduled root.after(12) main_thread")
+                _flush_viewer_logs()
+                self.root.after(12, _run)
+                return True
+            _log_viewer_checkpoint("09", "request_sync enqueue_tk_main (off main thread)")
+            _flush_viewer_logs()
+            self._enqueue_tk_main(_run)
+            return True
+        except Exception:
+            try:
+                _log_viewer_checkpoint("14", "request_sync fallback enqueue_tk_main after exception")
+                _flush_viewer_logs()
+                self._enqueue_tk_main(_run)
+                return True
+            except Exception:
+                self._qt_nav_sync_queued = False
+                _log_viewer_checkpoint("15", "request_sync failed; queue cleared")
+                _flush_viewer_logs()
+                return False
+
+    def _sync_qt_viewer_bridge_plot_state(
+        self,
+        hypnogram: Optional[Any] = None,
+    ) -> None:
+        """Pousse l'état Studio (temps, filtres, hypnogramme) vers le bridge Qt sans ``update_plot``.
+
+        Évite d'exécuter tout le pipeline d'extraction/scipy de ``update_plot`` lorsque seul le
+        viewer Qt est actif (``psg_plotter`` est None), ce qui réduit la charge et les crashs
+        GIL (``PyEval_RestoreThread``) observés avec Python 3.14 + pump Tk/Qt.
+
+        *hypnogram* : si fourni (ex. depuis ``update_plot``), utilisé à la place du cache.
+        """
+        if not self._qt_psg_plot_active():
+            return
+        br = getattr(self, "_qt_viewer_bridge", None)
+        if br is None:
+            return
+        # #region agent log
+        try:
+            from CESA.agent_debug_f8b011 import log as _agent_log
+
+            _agent_log(
+                "C",
+                "eeg_studio._sync_qt_viewer_bridge_plot_state:enter",
+                "sync bridge",
+                {"ct": float(self.current_time), "dur": float(self.duration)},
+            )
+        except Exception:
+            pass
+        # #endregion
+        try:
+            hg = hypnogram
+            if hg is None:
+                hg = getattr(self, "_psg_cached_hypnogram", None)
+            if hg is not None:
+                br.set_hypnogram(hg)
+            if getattr(self, "raw", None) is not None:
+                br.set_total_duration(float(len(self.raw.times) / float(self.sfreq)))
+            br.set_global_filter_enabled(
+                bool(self.filter_var.get()) if hasattr(self, "filter_var") else True,
+            )
+            try:
+                br.filter_pipelines_by_channel = getattr(
+                    self, "channel_filter_pipelines", {},
+                )
+            except Exception:
+                pass
+            br.set_time_window(float(self.current_time), float(self.duration))
+        except Exception:
+            logging.warning("[VIEW] Synchronisation viewer Qt (léger) échouée.", exc_info=True)
+            raise
+        # #region agent log
+        try:
+            from CESA.agent_debug_f8b011 import log as _agent_log
+
+            _agent_log("C", "eeg_studio._sync_qt_viewer_bridge_plot_state:exit", "sync bridge ok", {})
+        except Exception:
+            pass
+        # #endregion
+
+    def _ensure_qt_viewer(self, *, full_reload: bool = False) -> bool:
+        if not self._qt_psg_dependencies_available():
+            return False
+        try:
+            from CESA.qt_viewer import launch_viewer
+        except ImportError as exc:
+            self._qt_import_check_failed = True
+            logging.warning(
+                "[VIEW] Module CESA.qt_viewer introuvable (%s) — repli sur Matplotlib.",
+                exc,
+            )
+            return False
+        kwargs = self._qt_build_launch_kwargs()
+        if kwargs is None:
+            return False
+
+        br = getattr(self, "_qt_viewer_bridge", None)
+        alive = br is not None
+        try:
+            alive = alive and bool(br.is_alive())
+        except Exception:
+            alive = False
+
+        _log_viewer_checkpoint(
+            "16",
+            "ensure_qt_viewer",
+            full_reload=full_reload,
+            bridge_alive=alive,
+            current_time=getattr(self, "current_time", None),
+            duration=getattr(self, "duration", None),
+        )
+
+        if alive and full_reload:
+            try:
+                br.update_signals(kwargs["signals"])
+                hg = kwargs.get("hypnogram")
+                if hg is not None:
+                    br.set_hypnogram(hg)
+                td = kwargs.get("total_duration_s")
+                if td is not None:
+                    br.set_total_duration(float(td))
+                br.filter_pipelines_by_channel = kwargs.get("filter_pipelines") or {}
+                br.set_global_filter_enabled(bool(kwargs.get("global_filter_enabled", True)))
+                br.set_time_window(float(self.current_time), float(self.duration))
+                _log_viewer_checkpoint("17", "ensure_qt_viewer full_reload ok")
+                return True
+            except Exception:
+                logging.warning("[VIEW] Rafraîchissement Qt échoué, nouvelle fenêtre.", exc_info=True)
+                self._close_qt_viewer_if_any()
+                alive = False
+
+        if alive and not full_reload:
+            _log_viewer_checkpoint("18", "ensure_qt_viewer reuse existing (no reload)")
+            return True
+
+        self._close_qt_viewer_if_any()
+        _log_viewer_checkpoint(
+            "19",
+            "ensure_qt_viewer calling launch_viewer",
+            start_time_s=kwargs.get("start_time_s"),
+            duration_s=kwargs.get("duration_s"),
+            total_duration_s=kwargs.get("total_duration_s"),
+        )
+        try:
+            self._qt_viewer_bridge = launch_viewer(
+                signals=kwargs["signals"],
+                hypnogram=kwargs.get("hypnogram"),
+                scoring_annotations=kwargs.get("scoring_annotations") or [],
+                filter_pipelines=kwargs.get("filter_pipelines") or {},
+                channel_types=kwargs.get("channel_types") or {},
+                global_filter_enabled=bool(kwargs.get("global_filter_enabled", True)),
+                start_time_s=float(kwargs.get("start_time_s", 0.0)),
+                duration_s=float(kwargs.get("duration_s", 30.0)),
+                total_duration_s=kwargs.get("total_duration_s"),
+                theme_name=str(kwargs.get("theme_name", "dark")),
+                on_navigate=self._qt_on_viewer_navigate,
+                tk_root=self.root,
+                after_qt_pump=self._after_qt_pump_enqueue_commit_nav,
+                on_request_auto_scoring=lambda: self._qt_defer_to_studio(self._run_auto_sleep_scoring),
+                on_open_filter_config=lambda: self._qt_defer_to_studio(self.show_filter_config),
+                on_open_manual_scoring_editor=lambda: self._qt_defer_to_studio(
+                    self._open_manual_scoring_editor,
+                ),
+                on_request_stage_for_current_epoch=lambda st: self._qt_defer_to_studio(
+                    lambda s=st: self._qt_apply_sleep_stage_at_current_epoch(s),
+                ),
+                on_request_stage_at_epoch_time=lambda t, st: self._qt_defer_to_studio(
+                    lambda tt=t, s=st: self._qt_apply_sleep_stage_at_epoch_time(tt, s),
+                ),
+                on_global_filter_toggled=lambda en: self._qt_defer_to_studio(
+                    lambda e=en: self._qt_sync_global_filter_from_viewer(e),
+                ),
+            )
+            _log_viewer_checkpoint("21", "ensure_qt_viewer launch_viewer returned ok")
+            return True
+        except Exception:
+            logging.exception("[VIEW] Ouverture du viewer Qt impossible.")
+            _log_viewer_checkpoint("22", "ensure_qt_viewer launch_viewer failed")
+            self._qt_viewer_bridge = None
+            return False
+
+    def _show_default_psg_view(self, embed_parent: Optional[ttk.Frame] = None) -> None:
+        """Ouvre le viewer PSG par défaut : PyQtGraph si disponible, sinon Matplotlib."""
+        if not self.raw:
+            parent = embed_parent or getattr(self, "psg_container", None) or self.root
+            try:
+                for child in parent.winfo_children():
+                    try:
+                        child.destroy()
+                    except Exception:
+                        pass
+                holder = ttk.Frame(parent)
+                holder.pack(fill=tk.BOTH, expand=True)
+                ttk.Label(
+                    holder,
+                    text="Aucun enregistrement chargé\nOuvrez un fichier EDF pour afficher la PSG",
+                    anchor=tk.CENTER, justify=tk.CENTER,
+                ).pack(expand=True)
+            except Exception:
+                messagebox.showinfo(
+                    "Information",
+                    "Aucun enregistrement chargé. Veuillez ouvrir un fichier EDF.",
+                )
+            return
+
+        if getattr(self, "prefer_qt_psg_viewer", True) and self._qt_psg_dependencies_available():
+            ch_tup = tuple(getattr(self, "psg_channels_used", None) or ())
+            prev = getattr(self, "_qt_channel_tuple", ())
+            br = getattr(self, "_qt_viewer_bridge", None)
+            bridge_ok = False
+            try:
+                bridge_ok = br is not None and bool(br.is_alive())
+            except Exception:
+                bridge_ok = False
+            full_reload = (ch_tup != prev) or (not bridge_ok)
+            self._qt_channel_tuple = ch_tup
+            ok = self._ensure_qt_viewer(full_reload=full_reload)
+            if ok:
+                parent = embed_parent or getattr(self, "psg_container", None)
+                if parent is not None:
+                    self._embed_qt_viewer_placeholder(parent)
+                self.psg_plotter = None
+                try:
+                    self.canvas = None
+                except Exception:
+                    pass
+                logging.info("[VIEW] Viewer PyQtGraph actif (défaut).")
+                return
+
+        if not self._qt_psg_dependencies_available():
+            self.prefer_qt_psg_viewer = False
+        self.show_multi_graph_view(embed_parent=embed_parent)
     
     def show_multi_graph_view(self, embed_parent: Optional[ttk.Frame] = None):
         """Affiche la vue PSG multi-subplots.
         - Si embed_parent est fourni, intègre la figure dans ce conteneur (vue principale)
         - Sinon, ouvre une nouvelle fenêtre Toplevel.
         """
+        self._close_qt_viewer_if_any()
         if not self.raw:
             # Pas d'EDF chargé: n'affiche pas de graphe vide; affiche un placeholder propre
             parent = embed_parent or self.root
@@ -2625,6 +3371,7 @@ class EEGAnalysisStudio:
                 start_time_s=float(self.current_time),
                 duration_s=float(self.duration),
                 filter_params_by_channel=self.channel_filter_params,
+                filter_pipelines_by_channel=getattr(self, "channel_filter_pipelines", {}),
                 global_filter_enabled=bool(self.filter_var.get()),
                 filter_order=int(self.filter_order),
                 filter_type=str(self.filter_type),
@@ -2767,6 +3514,37 @@ class EEGAnalysisStudio:
         ttk.Button(control_frame, text="📄 Export PDF", command=export_pdf, style='Modern.TButton').pack(side=tk.RIGHT, padx=5)
         ttk.Button(control_frame, text="💾 Export Scoring CSV", command=export_scoring_csv, style='Modern.TButton').pack(side=tk.RIGHT, padx=5)
     
+    def _launch_qt_viewer(self):
+        """Ouvre ou rafraîchit le viewer PyQtGraph (défaut si disponible)."""
+        if not self.raw:
+            messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF.")
+            return
+
+        if not self._qt_psg_dependencies_available():
+            messagebox.showinfo(
+                "PyQtGraph indisponible",
+                "PySide6 et/ou pyqtgraph ne sont pas installes.\n"
+                "Installez-les avec : pip install PySide6 pyqtgraph\n\n"
+                "Utilisation du viewer matplotlib a la place.",
+            )
+            self._open_matplotlib_psg_view()
+            return
+
+        self.prefer_qt_psg_viewer = True
+        ok = self._ensure_qt_viewer(full_reload=True)
+        if not ok:
+            messagebox.showwarning(
+                "PyQtGraph",
+                "Impossible d'ouvrir le viewer PyQtGraph. Passage au viewer Matplotlib.",
+            )
+            self._open_matplotlib_psg_view()
+            return
+
+        parent = getattr(self, "psg_container", None)
+        if parent is not None:
+            self._embed_qt_viewer_placeholder(parent)
+        self.psg_plotter = None
+
     def _run_yasa_scoring(self, method: Optional[str] = None):
         """Exécute le scoring automatique (YASA/U-Sleep) et stocke le résultat."""
         try:
@@ -3240,6 +4018,10 @@ class EEGAnalysisStudio:
         ttk.Radiobutton(backend_box, text="YASA", variable=method_var, value="yasa").pack(side=tk.LEFT, padx=8, pady=6)
         ttk.Radiobutton(backend_box, text="U-Sleep", variable=method_var, value="usleep").pack(side=tk.LEFT, padx=8, pady=6)
         ttk.Radiobutton(backend_box, text="PFTSleep", variable=method_var, value="pftsleep").pack(side=tk.LEFT, padx=8, pady=6)
+        ttk.Radiobutton(backend_box, text="AASM Rules", variable=method_var, value="aasm_rules").pack(side=tk.LEFT, padx=8, pady=6)
+        ttk.Radiobutton(backend_box, text="ML", variable=method_var, value="ml").pack(side=tk.LEFT, padx=8, pady=6)
+        ttk.Radiobutton(backend_box, text="ML+HMM", variable=method_var, value="ml_hmm").pack(side=tk.LEFT, padx=8, pady=6)
+        ttk.Radiobutton(backend_box, text="Rules+HMM", variable=method_var, value="rules_hmm").pack(side=tk.LEFT, padx=8, pady=6)
 
         common_box = ttk.LabelFrame(frame, text="Paramètres communs")
         common_box.pack(fill=tk.X, pady=4)
@@ -7803,12 +8585,12 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
             stats = group_analysis.run_statistical_tests(result, stats_cfg)
         except Exception as exc:
             try:
-                self.root.after(0, lambda: self._group_analysis_failed(exc))
+                self._enqueue_tk_main(lambda: self._group_analysis_failed(exc))
             except Exception:
                 pass
         else:
             try:
-                self.root.after(0, lambda: self._group_analysis_completed(result, stats))
+                self._enqueue_tk_main(lambda: self._group_analysis_completed(result, stats))
             except Exception:
                 pass
         finally:
@@ -7872,12 +8654,12 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
         except Exception as exc:
             try:
                 err = exc
-                self.root.after(0, lambda err=err: self._group_hrv_failed(err))
+                self._enqueue_tk_main(lambda err=err: self._group_hrv_failed(err))
             except Exception:
                 pass
         else:
             try:
-                self.root.after(0, lambda: self._group_hrv_completed(result))
+                self._enqueue_tk_main(lambda: self._group_hrv_completed(result))
             except Exception:
                 pass
         finally:
@@ -7972,7 +8754,7 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
             self._group_set_progress(message, ratio * 100.0)
 
         try:
-            self.root.after(0, _update)
+            self._enqueue_tk_main(_update)
         except Exception:
             pass
 
@@ -8372,7 +9154,7 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
             self.user_assistant._open_support()
         else:
             support_info = """
-📞 SUPPORT CESA v3.0
+📞 SUPPORT CESA v0.0beta1.0
 
 🆘 EN CAS DE PROBLÈME :
 
@@ -8393,12 +9175,12 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
 • Joignez des captures d'écran si utile
 
 🎯 DÉVELOPPEMENT :
-CESA v3.0 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
+CESA v0.0beta1.0 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
 Auteur : Côme Barmoy
-Version : 3.0.0
+Version : 0.0beta1.0
 Licence : MIT
             """
-            messagebox.showinfo("Support CESA v3.0", support_info)
+            messagebox.showinfo("Support CESA v0.0beta1.0", support_info)
     
     def _open_reference_guide(self):
         """Ouvre le guide de référence complet."""
@@ -9497,7 +10279,7 @@ Licence : MIT
             report_lines.append("EEG ANALYSIS STUDIO - RAPPORT DE BUG")
             report_lines.append("=" * 80)
             report_lines.append(f"Date de génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            report_lines.append(f"Version de l'application : v3.0")
+            report_lines.append(f"Version de l'application : v0.0beta1.0")
             report_lines.append("")
             
             # Informations système
@@ -9769,23 +10551,31 @@ Licence : MIT
         if not self.raw:
             messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
             return
-        hub = tk.Toplevel(self.root)
-        hub.title("Importer Scoring (Excel/EDF)")
-        hub.geometry("420x200")
-        hub.transient(self.root)
-        hub.grab_set()
-        frame = ttk.Frame(hub, padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="Choisissez la source de scoring à importer:", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
-        ttk.Button(frame, text="Importer Excel/CSV", command=lambda: (hub.destroy(), self._import_manual_scoring_excel())).pack(fill=tk.X, pady=(12,6))
-        ttk.Button(frame, text="Charger Hypnogram EDF (Sleep-EDFx)", command=lambda: (hub.destroy(), self._load_hypnogram_edfplus())).pack(fill=tk.X)
+        try:
+            self._qt_pause_pump_for_tk_modal()
+            hub = tk.Toplevel(self.root)
+            hub.title("Importer Scoring (Excel/EDF)")
+            hub.geometry("420x200")
+            hub.transient(self.root)
+            hub.grab_set()
+            frame = ttk.Frame(hub, padding=12)
+            frame.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(frame, text="Choisissez la source de scoring à importer:", font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+            ttk.Button(frame, text="Importer Excel/CSV", command=lambda: (hub.destroy(), self._import_manual_scoring_excel())).pack(fill=tk.X, pady=(12,6))
+            ttk.Button(frame, text="Charger Hypnogram EDF (Sleep-EDFx)", command=lambda: (hub.destroy(), self._load_hypnogram_edfplus())).pack(fill=tk.X)
+            try:
+                self.root.wait_window(hub)
+            except tk.TclError:
+                pass
+        finally:
+            self._qt_resume_pump_after_tk_modal()
     
     def _open_manual_scoring_editor(self):
         """Modern manual scoring editor with validation and explicit actions."""
         if not self.raw:
             messagebox.showwarning("Attention", "Veuillez d'abord charger un fichier EDF")
             return
-
+        self._qt_pause_pump_for_tk_modal()
         win = tk.Toplevel(self.root)
         win.title("Éditeur de Scoring Manuel")
         win.geometry("1120x860")
@@ -9986,13 +10776,20 @@ Licence : MIT
             except Exception as e:
                 messagebox.showerror("Erreur", f"Export CSV: {e}")
 
-        # Stage shortcuts for fast scoring
-        win.bind_all("<KeyPress-1>", lambda e: stage_var.set("W"))
-        win.bind_all("<KeyPress-2>", lambda e: stage_var.set("N1"))
-        win.bind_all("<KeyPress-3>", lambda e: stage_var.set("N2"))
-        win.bind_all("<KeyPress-4>", lambda e: stage_var.set("N3"))
-        win.bind_all("<KeyPress-5>", lambda e: stage_var.set("R"))
-        win.bind_all("<KeyPress-0>", lambda e: stage_var.set("U"))
+        # Raccourcis stades (sur la fenêtre seulement — pas bind_all : fuite globale).
+        win.bind("<KeyPress-1>", lambda e: stage_var.set("W"))
+        win.bind("<KeyPress-2>", lambda e: stage_var.set("N1"))
+        win.bind("<KeyPress-3>", lambda e: stage_var.set("N2"))
+        win.bind("<KeyPress-4>", lambda e: stage_var.set("N3"))
+        win.bind("<KeyPress-5>", lambda e: stage_var.set("R"))
+        win.bind("<KeyPress-0>", lambda e: stage_var.set("U"))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        try:
+            self.root.wait_window(win)
+        except tk.TclError:
+            pass
+        finally:
+            self._qt_resume_pump_after_tk_modal()
 
     def _get_active_scoring_df(self) -> Optional[pd.DataFrame]:
         """Retourne le scoring actif: manuel non vide si dispo, sinon auto non vide, sinon None."""
@@ -12239,7 +13036,7 @@ Licence : MIT
     def _show_about(self):
         """Affiche la boîte de dialogue À propos."""
         about_text = """
-CCESA (Complex EEG Studio Analysis) v1.0
+CESA (Complex EEG Studio Analysis) v0.0beta1.0
 
 Application professionnelle pour l'analyse de données EEG
 avec amplification automatique des signaux de faible amplitude
@@ -12259,7 +13056,7 @@ Fonctionnalités:
 
 Développé avec Python, MNE-Python, Matplotlib et Tkinter.
 
-Version: 4.0.0
+Version: 0.0beta1.0
 Date: 2025-09-09
         """
         messagebox.showinfo("À propos", about_text)
@@ -12418,6 +13215,14 @@ Date: 2025-09-09
             try:
                 if hasattr(self, 'psg_plotter') and self.psg_plotter is not None:
                     self.psg_plotter.set_theme(theme_name)
+                elif self._qt_psg_plot_active():
+                    tnl = str(theme_name).lower()
+                    qtheme = (
+                        "dark"
+                        if ("dark" in tnl or "sombre" in tnl or "night" in tnl)
+                        else "light"
+                    )
+                    self._qt_viewer_bridge.set_theme(qtheme)
             except Exception:
                 pass
 
@@ -12994,6 +13799,7 @@ Date: 2025-09-09
         self.root.bind('<Control-s>', lambda e: self._export_data())
         self.root.bind('<Control-a>', lambda e: self._toggle_autoscale())
         self.root.bind('<Control-f>', lambda e: self._toggle_filter())
+        self.root.bind('<Control-m>', lambda e: self._open_matplotlib_psg_view())
         self.root.bind('<Control-1>', lambda e: self._show_channel_selector())
         self.root.bind('<F1>', lambda e: self._show_user_guide())
         self.root.bind('<F5>', lambda e: self._refresh_plot())
@@ -13036,7 +13842,7 @@ Date: 2025-09-09
         # Version de l'application
         self.version_label = ttk.Label(
             status_frame, 
-            text="v3.0", 
+            text="v0.0beta1.0", 
             style='Version.TLabel',
             font=('Segoe UI', 8, 'bold')
         )
@@ -13076,7 +13882,7 @@ Date: 2025-09-09
         """Met à jour l'affichage de la version dans l'interface."""
         if hasattr(self, 'version_label'):
             try:
-                self.version_label.config(text="v3.0")
+                self.version_label.config(text="v0.0beta1.0")
             except Exception:
                 pass
 
@@ -13201,7 +14007,7 @@ Date: 2025-09-09
 
         # Fenêtre principale d'automatisation
         batch_window = tk.Toplevel(self.root)
-        batch_window.title("🤖 Automatisation FFT en Lot - CESA v3.0")
+        batch_window.title("🤖 Automatisation FFT en Lot - CESA v0.0beta1.0")
         batch_window.geometry("1100x900")
         batch_window.configure(bg='#f8f9fa')
         
@@ -14814,7 +15620,7 @@ Date: 2025-09-09
         
         finally:
             # Réactiver les boutons
-            self.root.after(0, self._reset_batch_ui)
+            self._enqueue_tk_main(self._reset_batch_ui)
 
     def _load_eeg_file_for_batch(self, file_path):
         """Charge un fichier EEG pour le traitement en lot."""
@@ -15153,15 +15959,15 @@ Date: 2025-09-09
 
     def _update_batch_status(self, status):
         """Met à jour le statut du traitement."""
-        self.root.after(0, lambda: self.batch_status_var.set(status))
+        self._enqueue_tk_main(lambda: self.batch_status_var.set(status))
 
     def _update_batch_progress(self, value):
         """Met à jour la barre de progression."""
-        self.root.after(0, lambda: self.batch_progress.configure(value=value))
+        self._enqueue_tk_main(lambda: self.batch_progress.configure(value=value))
 
     def _update_batch_progress_text(self, text):
         """Met à jour le texte de progression."""
-        self.root.after(0, lambda: self.batch_progress_text.set(text))
+        self._enqueue_tk_main(lambda: self.batch_progress_text.set(text))
 
     def _log_batch(self, message):
         """Ajoute un message aux logs du traitement en lot."""
@@ -15174,7 +15980,7 @@ Date: 2025-09-09
                 self.batch_logs.insert(tk.END, log_message)
                 self.batch_logs.see(tk.END)
         
-        self.root.after(0, update_logs)
+        self._enqueue_tk_main(update_logs)
     
     def _setup_modern_plot(self, parent: ttk.Frame) -> None:
         """Configure le conteneur principal pour afficher la vue PSG multi-subplots."""
@@ -15185,7 +15991,7 @@ Date: 2025-09-09
         # Si des données sont chargées, afficher directement la vue PSG intégrée
         if getattr(self, 'raw', None) is not None:
             try:
-                self.show_multi_graph_view(embed_parent=self.psg_container)
+                self._show_default_psg_view(embed_parent=self.psg_container)
                 return
             except Exception:
                 pass
@@ -16161,6 +16967,7 @@ Date: 2025-09-09
         self.root.bind('<Control-o>', lambda e: self.load_edf_file())
         self.root.bind('<Control-a>', lambda e: self.toggle_autoscale())
         self.root.bind('<Control-f>', lambda e: self.toggle_filter())
+        self.root.bind('<Control-m>', lambda e: self._open_matplotlib_psg_view())
     
     def load_edf_file(self):
         """Charge un fichier EDF avec barre de chargement stylée"""
@@ -16570,7 +17377,7 @@ Date: 2025-09-09
                 parent = getattr(self, "psg_container", None)
                 if parent is None:
                     logging.warning("[OPEN] psg_container absent au chargement; fallback fenetre dediee")
-                self.show_multi_graph_view(embed_parent=parent)
+                self._show_default_psg_view(embed_parent=parent)
             except Exception:
                 logging.exception("[OPEN] Echec creation vue PSG initiale")
             self.update_plot()
@@ -16584,20 +17391,24 @@ Date: 2025-09-09
             self._update_loading_message("Chargement terminé!")
             self.root.update()
             
-            # Attendre un peu pour que l'utilisateur voie "Terminé!"
-            self.root.after(500, self._hide_loading_bar)
-            
             if self.data_mode == "precomputed":
                 mode_msg = "⚡ Navigation Rapide"
             elif self.data_mode == "lazy":
                 mode_msg = "🧠 Mode Lazy (calcul à la volée)"
             else:
                 mode_msg = "📂 Mode Standard"
-            messagebox.showinfo(
-                "✅ Succès",
-                f"Fichier chargé: {os.path.basename(file_path)}\n\nMode: {mode_msg}",
-                parent=self.root,
-            )
+            self._qt_pause_pump_for_tk_modal()
+            try:
+                messagebox.showinfo(
+                    "✅ Succès",
+                    f"Fichier chargé: {os.path.basename(file_path)}\n\nMode: {mode_msg}",
+                    parent=self.root,
+                )
+            finally:
+                self._qt_resume_pump_after_tk_modal()
+            # Fermer la barre après le modal : évite destroy/grab Tk pendant messagebox
+            # alors que le pump Qt tourne (Py3.14 / PyEval_RestoreThread).
+            self.root.after(0, self._hide_loading_bar)
             logging.info(f"[OPEN] Popup succès affiché: {os.path.basename(file_path)} | mode={mode_msg}")
             
             # Commiter le sample de télémetrie si disponible
@@ -16620,7 +17431,11 @@ Date: 2025-09-09
                 pass
             
             print(f"❌ Erreur lors du chargement: {e}")
-            messagebox.showerror("Erreur", f"Erreur lors du chargement: {str(e)}", parent=self.root)
+            self._qt_pause_pump_for_tk_modal()
+            try:
+                messagebox.showerror("Erreur", f"Erreur lors du chargement: {str(e)}", parent=self.root)
+            finally:
+                self._qt_resume_pump_after_tk_modal()
     
     def _extract_absolute_time(self):
         """Extrait le temps absolu de début d'enregistrement depuis les métadonnées EDF."""
@@ -17008,7 +17823,7 @@ Date: 2025-09-09
                         self._processed_window_cache.popitem(last=False)
                     except Exception:
                         break
-            self.root.after(0, self._apply_cached_processed_signals)
+            self._enqueue_tk_main(self._apply_cached_processed_signals)
 
         future.add_done_callback(_callback)
 
@@ -17044,7 +17859,95 @@ Date: 2025-09-09
                 self._last_filter_ms = total_filter_ms
         except Exception:
             pass
-    
+
+    def _enqueue_tk_main(self, fn: Callable[[], None]) -> None:
+        """Planifie *fn* sur le thread principal Tk. Appelable depuis n'importe quel thread."""
+        self._tk_main_thread_queue.put(fn)
+
+    def _poll_tk_main_thread_queue(self) -> None:
+        # #region agent log
+        try:
+            from CESA.agent_debug_f8b011 import log as _agent_log
+
+            _agent_log("B", "eeg_studio._poll_tk_main_thread_queue:enter", "poll queue", {})
+        except Exception:
+            pass
+        # #endregion
+        self._tk_main_poll_id = None
+        _br_pe = getattr(self, "_qt_viewer_bridge", None)
+        if _br_pe is not None and getattr(_br_pe, "_qt_pe_active", False):
+            try:
+                self._tk_main_poll_id = self.root.after(
+                    12, self._poll_tk_main_thread_queue
+                )
+            except Exception:
+                self._tk_main_poll_id = None
+            _t_pe = time.monotonic()
+            if _t_pe - float(getattr(self, "_chk_poll_defer_pe_at", -999.0)) >= 2.0:
+                self._chk_poll_defer_pe_at = _t_pe
+                _log_viewer_checkpoint(
+                    "70",
+                    "_poll_tk_main_thread_queue deferred (Qt processEvents active)",
+                )
+            return
+        if int(getattr(self, "_tk_modal_ui_block_depth", 0)) > 0:
+            _t_modal = time.monotonic()
+            if _t_modal - float(getattr(self, "_chk_poll_modal_skip_at", -999.0)) >= 1.0:
+                self._chk_poll_modal_skip_at = _t_modal
+                _log_viewer_checkpoint(
+                    "68",
+                    "_poll_tk_main_thread_queue skip (modal depth>0)",
+                    depth=int(getattr(self, "_tk_modal_ui_block_depth", 0)),
+                )
+            return
+        # Un seul callback par tick : évite d'enchaîner plot/Qt/scipy dans une même
+        # invocation Tk (réduit les crashs PyEval_RestoreThread / GIL avec Py3.14 + pump Qt).
+        fn = None
+        try:
+            fn = self._tk_main_thread_queue.get_nowait()
+        except Empty:
+            pass
+        if fn is not None:
+            try:
+                fn()
+            except Exception:
+                pass
+            _poll_next_ms = (
+                24 if getattr(self, "_qt_viewer_bridge", None) is not None else 0
+            )
+            # #region agent log
+            try:
+                from CESA.agent_debug_f8b011 import log as _agent_log
+
+                _agent_log(
+                    "B",
+                    "eeg_studio._poll_tk_main_thread_queue:after_fn",
+                    "one fn done",
+                    {"poll_next_ms": _poll_next_ms},
+                )
+            except Exception:
+                pass
+            # #endregion
+            try:
+                self._tk_main_poll_id = self.root.after(
+                    _poll_next_ms, self._poll_tk_main_thread_queue
+                )
+            except Exception:
+                self._tk_main_poll_id = None
+            return
+        try:
+            self._tk_main_poll_id = self.root.after(16, self._poll_tk_main_thread_queue)
+        except Exception:
+            self._tk_main_poll_id = None
+        else:
+            _t_idle = time.monotonic()
+            if _t_idle - float(getattr(self, "_chk_poll_idle_at", -999.0)) >= 2.0:
+                self._chk_poll_idle_at = _t_idle
+                _log_viewer_checkpoint(
+                    "69",
+                    "_poll_tk_main_thread_queue idle branch scheduled after(16)",
+                )
+
     def update_plot(self, *args):
         """Met à jour l'affichage principal en rafraîchissant la vue PSG intégrée."""
         if not getattr(self, 'raw', None):
@@ -17064,10 +17967,11 @@ Date: 2025-09-09
             plot_width_px = self._get_plot_width_px()
             use_bridge = getattr(self, 'data_bridge', None) is not None
             is_lazy = getattr(self, 'data_mode', 'raw') == 'lazy'
+            skip_lazy_preprocess_workers = self._qt_psg_plot_active()
             token = object()
             self._active_plot_token = token
 
-            def _do_update(current_token=token):
+            def _do_update(current_token=token, _skip_lazy_pre=skip_lazy_preprocess_workers):
                 try:
                     _t_extract0 = None
                     _t_filter0 = None
@@ -17208,7 +18112,8 @@ Date: 2025-09-09
                                 extract_ms = 0.0
                     
                     # Submit async preprocessing tasks for lazy mode if we have raw signals
-                    if is_lazy and raw_signals_for_preprocessing:
+                    # Py3.14 + Qt embarqué : pas de workers (capturé sur le thread Tk, pas depuis un worker).
+                    if is_lazy and raw_signals_for_preprocessing and not _skip_lazy_pre:
                         config = self._snapshot_processing_config()
                         target_processing_len = max(300, int(plot_width_px * 1.2))
                         self._expected_channels = set(selected)
@@ -17381,7 +18286,7 @@ Date: 2025-09-09
                                     pass
                                 self.psg_plotter.set_time_window(float(self.current_time), float(self.duration))
                             except Exception:
-                                self.show_multi_graph_view(embed_parent=parent)
+                                self._show_default_psg_view(embed_parent=parent)
                             if hasattr(self, 'canvas') and self.canvas is not None:
                                 try:
                                     self.canvas.draw_idle()
@@ -17431,11 +18336,17 @@ Date: 2025-09-09
                                 print(f"{timestamp} | PERF nav: extract_ms={extract_ms:.1f} filter_ms={filter_ms:.1f} draw_ms={draw_ms:.1f} total_ms={total_ms:.1f} n_channels={n_channels} n_points={n_points}")
                             except Exception:
                                 pass
+                        elif self._qt_psg_plot_active():
+                            try:
+                                self._sync_qt_viewer_bridge_plot_state(hypnogram=hypnogram)
+                            except Exception:
+                                logging.warning("[VIEW] Synchronisation viewer Qt échouée.", exc_info=True)
+                                self._show_default_psg_view(embed_parent=parent)
                         else:
-                            self.show_multi_graph_view(embed_parent=parent)
+                            self._show_default_psg_view(embed_parent=parent)
 
-                    # Back to UI thread
-                    self.root.after(0, _apply_to_ui)
+                    # Reprise sur le thread Tk (pas root.after depuis le worker)
+                    self._enqueue_tk_main(_apply_to_ui)
                 except Exception:
                     pass
                 finally:
@@ -17457,7 +18368,10 @@ Date: 2025-09-09
                     pass
 
             def _schedule_update():
-                if getattr(self, '_plot_executor', None):
+                use_pool = getattr(self, "_plot_executor", None) is not None
+                if use_pool and self._qt_psg_plot_active():
+                    use_pool = False
+                if use_pool:
                     future = self._plot_executor.submit(_do_update)
                     self._active_plot_future = future
                 else:
@@ -18381,7 +19295,7 @@ Date: 2025-09-09
 
 def main(ms_path: Optional[str] = None) -> int:
     """Fonction principale"""
-    print("CCESA (Complex EEG Studio Analysis) v1.0")
+    print("CESA (Complex EEG Studio Analysis) v0.0beta1.0")
     print("=" * 50)
     print("Vérification des dépendances...")
     

@@ -1,8 +1,8 @@
 """
-CCESA (Complex EEG Studio Analysis) v1.0 - Entropy Analysis Module
+CESA (Complex EEG Studio Analysis) v0.0beta1.0 - Entropy Analysis Module
 =========================================================
 
-Module d'analyse d'entropie renormée pour CESA v3.0.
+Module d'analyse d'entropie renormée pour CESA v0.0beta1.0.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Ce module implémente l'analyse d'entropie renormée basée sur les travaux
@@ -17,7 +17,7 @@ Fonctionnalités principales:
 - Interface compatible avec MNE-Python
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 3.0.0
+Version: 0.0beta1.0
 Date: 2025-01-27
 Licence: MIT
 """
@@ -382,7 +382,7 @@ def compute_entropy_from_raw(
     Parameters
     ----------
     raw : mne.io.Raw
-        Raw instance already loaded in CCESA.
+        Raw instance already loaded in CESA.
     channel_names : Iterable[str]
         Channels to include in the analysis.
     config : Optional[RenormalizedEntropyConfig]

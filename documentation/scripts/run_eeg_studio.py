@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-CESA v3.0 - Script de lancement
+CESA v0.0beta1.0 - Script de lancement
 ===============================
 
-Script de lancement pour CESA (Complex EEG Studio Analysis) v3.0.
+Script de lancement pour CESA (Complex EEG Studio Analysis) v0.0beta1.0.
 Lance l'application avec vérification des dépendances.
 
 Ce script est un wrapper qui appelle le lanceur principal run.py.
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 3.0.0
+Version: 0.0beta1.0
 Date: 2025-10-26
 """
 
@@ -32,7 +32,7 @@ def main():
         return 1
     
     # Lancer l'application
-    print("🚀 Lancement de CESA v3.0...")
+    print("🚀 Lancement de CESA v0.0beta1.0...")
     try:
         subprocess.call([sys.executable, run_py])
     except Exception as e:

@@ -1,9 +1,9 @@
 @echo off
 REM Script pour initialiser Git et pousser vers GitHub
-REM Version 0.0alpha4.0
+REM Version 0.0beta1.0
 
 echo ========================================
-echo  Initialisation Git et Push - CESA 0.0alpha4.0
+echo  Initialisation Git et Push - CESA 0.0beta1.0
 echo ========================================
 echo.
 
@@ -60,9 +60,9 @@ if not exist .gitignore (
 REM Créer le commit
 echo.
 echo [3/6] Creation du commit...
-git commit -m "chore: bump version to 0.0alpha4.0
+git commit -m "chore: bump version to 0.0beta1.0
 
-- Updated version number from 0.0alpha3.0 to 0.0alpha4.0
+- Updated version number from 0.0alpha3.0 to 0.0beta1.0
 - Updated run.py, requirements.txt, INSTALL.bat
 - Updated documentation files
 - Updated prepare_release.py
@@ -116,8 +116,8 @@ echo  Configuration terminee avec succes!
 echo ========================================
 echo.
 echo Pour creer un tag pour cette version:
-echo   git tag -a v0.0alpha4.0 -m "Release 0.0alpha4.0"
-echo   git push origin v0.0alpha4.0
+echo   git tag -a v0.0beta1.0 -m "Release 0.0beta1.0"
+echo   git push origin v0.0beta1.0
 echo.
 
 pause

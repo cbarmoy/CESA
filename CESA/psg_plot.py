@@ -1,5 +1,5 @@
 """
-CESA v3.0 - PSG Multi-Subplot Viewer
+CESA v0.0beta1.0 - PSG Multi-Subplot Viewer
 ====================================
 
 Modulaire, indépendant de Tkinter, ce module fournit une classe `PSGPlotter`
@@ -43,6 +43,11 @@ from CESA.filters import (
 )
 from CESA.theme_manager import theme_manager
 from core.telemetry import telemetry
+
+try:
+    from CESA.filter_engine import FilterPipeline as _FilterPipeline
+except Exception:
+    _FilterPipeline = None  # type: ignore[assignment,misc]
 
 
 Seconds = float
@@ -126,6 +131,7 @@ class PSGPlotter:
         start_time_s: Seconds = 0.0,
         duration_s: Seconds = 30.0,
         filter_params_by_channel: Optional[Dict[str, Dict[str, Any]]] = None,
+        filter_pipelines_by_channel: Optional[Dict[str, Any]] = None,
         global_filter_enabled: bool = True,
         filter_order: int = 4,
         filter_type: str = "butterworth",
@@ -142,6 +148,7 @@ class PSGPlotter:
         self.start_time_s = float(max(0.0, start_time_s))
         self.duration_s = float(max(1.0, duration_s))
         self.filter_params_by_channel = filter_params_by_channel or {}
+        self.filter_pipelines_by_channel: Dict[str, Any] = filter_pipelines_by_channel or {}
         self.global_filter_enabled = bool(global_filter_enabled)
         self.filter_order: int = int(filter_order) if filter_order else 4
         self.filter_type: str = str(filter_type or "butterworth").strip().lower()
@@ -1094,15 +1101,24 @@ class PSGPlotter:
             try:
                 import time as _time
                 _t0 = _time.perf_counter()
-                if self.global_filter_enabled and params.get("enabled", False):
-                    y = cesa_apply_filter(
-                        y,
-                        sfreq=fs,
-                        filter_order=self.filter_order,
-                        low=params.get("low", 0.0),
-                        high=params.get("high", 0.0),
-                        filter_type=self.filter_type,
-                    )
+                _used_pipeline = False
+                if self.global_filter_enabled:
+                    pipe = self.filter_pipelines_by_channel.get(ch_name)
+                    if pipe is not None and _FilterPipeline is not None:
+                        if isinstance(pipe, dict):
+                            pipe = _FilterPipeline.from_dict(pipe)
+                        if isinstance(pipe, _FilterPipeline) and pipe.enabled and pipe.filters:
+                            y = pipe.apply(y, fs)
+                            _used_pipeline = True
+                    if not _used_pipeline and params.get("enabled", False):
+                        y = cesa_apply_filter(
+                            y,
+                            sfreq=fs,
+                            filter_order=self.filter_order,
+                            low=params.get("low", 0.0),
+                            high=params.get("high", 0.0),
+                            filter_type=self.filter_type,
+                        )
                 filter_elapsed = (_time.perf_counter() - _t0) * 1000.0
                 try:
                     self._perf_last["filter_ms"] += filter_elapsed

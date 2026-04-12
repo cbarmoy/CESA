@@ -1,17 +1,17 @@
 @echo off
 REM ========================================
-REM   CESA v3.0 - Script d'installation
+REM   CESA v0.0beta1.0 - Script d'installation
 REM ========================================
 REM
-REM Script d'installation des dépendances pour CESA (Complex EEG Studio Analysis) v3.0
+REM Script d'installation des dépendances pour CESA (Complex EEG Studio Analysis) v0.0beta1.0
 REM Installe automatiquement toutes les bibliothèques Python requises.
 REM
 REM Auteur: Côme Barmoy (IRBA)
-REM Version: 3.0.0
+REM Version: 0.0beta1.0
 REM Date: 2025-10-26
 
 echo ========================================
-echo   CESA v3.0 - Installation
+echo   CESA v0.0beta1.0 - Installation
 echo ========================================
 echo.
 

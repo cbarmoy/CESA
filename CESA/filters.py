@@ -1,32 +1,17 @@
 """
-CESA v3.0 - Signal Filter Utilities
+CESA v4.0 - Signal Filter Utilities
 ==================================
 
-Module centralisé de filtrage pour CESA (EEG Studio Analysis) v3.0.
-Développé pour l'Unité Neuropsychologie du Stress (IRBA).
+Backward-compatible thin wrapper around ``CESA.filter_engine``.
 
-Fournit une fonction unique `apply_filter` qui supporte :
-- Passe-bande : low > 0 et high > 0 (EEG standard)
-- Passe-haut : low > 0 et high = 0/None (EMG à 10Hz)
-- Passe-bas : low = 0/None et high > 0
-
-Paramètres explicites (fréquence d'échantillonnage, ordre) pour
-indépendance vis-à-vis des classes GUI.
-
-Filtres implémentés :
-- Butterworth 4ème ordre (standard scientifique)
-- Fenêtrage configurable (Hamming, Hann, etc.)
-- Gestion robuste des fréquences de Nyquist
-- Validation des paramètres d'entrée
-
-Utilisé par l'interface principale CESA pour :
-- Filtrage global de tous les canaux
-- Filtrage sélectif par canal
-- Pré-traitement avant analyses spectrales
+The public API (``apply_filter``, ``apply_baseline_correction``,
+``detect_signal_type``, ``get_filter_presets``) is unchanged.  Internally
+``apply_filter`` now delegates to the composable filter-engine classes so
+that the same IIR implementations are shared with the new pipeline-based
+filter dialog.
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 3.0.0
-Date: 2025-09-26
+Version: 0.0beta1.0
 """
 
 from typing import Optional
@@ -72,54 +57,24 @@ def apply_filter(
         Filtered signal. If parameters are invalid, returns the input unchanged.
     """
     try:
-        from scipy.signal import butter, cheby1, cheby2, ellip, filtfilt
-    except Exception:
-        return data
+        from CESA.filter_engine import pipeline_from_legacy_params
 
-    try:
-        if not isinstance(data, np.ndarray):
-            data = np.asarray(data, dtype=float)
-        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        lo = 0.0 if low is None else float(low)
+        hi = 0.0 if high is None else float(high)
 
         nyquist = float(sfreq) / 2.0
         if nyquist <= 0.0:
             return data
+        if lo > 0 and hi > 0 and hi >= nyquist:
+            hi = nyquist - 1e-6
 
-        low = 0.0 if low is None else float(low)
-        high = 0.0 if high is None else float(high)
-
-        if low > 0.0 and high > 0.0:
-            if high >= nyquist:
-                high = nyquist - 1e-6
-            if not (0.0 < low < high < nyquist):
-                return data
-            wn = [low / nyquist, high / nyquist]
-            btype = "band"
-        elif low > 0.0 and high == 0.0:
-            if not (0.0 < low < nyquist):
-                return data
-            wn = low / nyquist
-            btype = "highpass"
-        elif (low == 0.0) and high > 0.0:
-            if not (0.0 < high < nyquist):
-                return data
-            wn = high / nyquist
-            btype = "lowpass"
-        else:
+        pipeline = pipeline_from_legacy_params(
+            low=lo, high=hi, order=int(filter_order),
+            filter_type=filter_type, enabled=True,
+        )
+        if not pipeline.filters:
             return data
-
-        order = int(filter_order)
-        ft = (filter_type or "butterworth").strip().lower()
-        if ft == "cheby1":
-            b, a = cheby1(order, rp=0.5, Wn=wn, btype=btype)
-        elif ft == "cheby2":
-            b, a = cheby2(order, rs=40, Wn=wn, btype=btype)
-        elif ft == "ellip":
-            b, a = ellip(order, rp=0.5, rs=40, Wn=wn, btype=btype)
-        else:
-            b, a = butter(order, wn, btype=btype)
-
-        return filtfilt(b, a, data)
+        return pipeline.apply(data, sfreq)
     except Exception:
         return data
 
