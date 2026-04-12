@@ -1,0 +1,267 @@
+{
+  "profile_name": "TEST Emphy 2",
+  "global_filter_enabled": true,
+  "channels": [
+    {
+      "name": "D1",
+      "alias": "A1",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": true,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "D2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": false,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "D3",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "D4",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M1",
+      "alias": "A2",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": true,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "M3",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "M4",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M5",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M6",
+      "alias": "A3",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": true,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "M7",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M8",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M9",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M10",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M11",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    },
+    {
+      "name": "M12",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": []
+      }
+    }
+  ]
+}

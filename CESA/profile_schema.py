@@ -1,4 +1,10 @@
-"""Schema objects for global display/processing profiles."""
+"""Schema objects for global display/processing profiles.
+
+Extends the original flat ``channel_filter_params`` with the richer
+``channel_filter_pipelines`` dict that serialises full
+``FilterPipeline`` objects from ``CESA.filter_engine``.  Old profiles
+are transparently upgraded on load.
+"""
 
 from __future__ import annotations
 
@@ -43,6 +49,7 @@ class DisplayProcessingProfile:
     filter_type: str = "butterworth"
     filter_window: str = "hamming"
     channel_filter_params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    channel_filter_pipelines: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.last_used_at = datetime.utcnow().isoformat(timespec="seconds")
@@ -67,6 +74,9 @@ class DisplayProcessingProfile:
             "filter_window": str(self.filter_window),
             "channel_filter_params": {
                 str(ch): dict(cfg) for ch, cfg in self.channel_filter_params.items()
+            },
+            "channel_filter_pipelines": {
+                str(ch): dict(cfg) for ch, cfg in self.channel_filter_pipelines.items()
             },
         }
 
@@ -109,7 +119,36 @@ class DisplayProcessingProfile:
             channel_filter_params={
                 str(k): dict(v) for k, v in (data.get("channel_filter_params", {}) or {}).items()
             },
+            channel_filter_pipelines={
+                str(k): dict(v) for k, v in (data.get("channel_filter_pipelines", {}) or {}).items()
+            },
         )
+
+
+def _migrate_legacy_params_to_pipelines(
+    params: Dict[str, Dict[str, Any]],
+    order: int = 4,
+    filter_type: str = "butterworth",
+) -> Dict[str, Dict[str, Any]]:
+    """Convert flat ``channel_filter_params`` to serialised ``FilterPipeline`` dicts.
+
+    Used when loading an old profile that lacks ``channel_filter_pipelines``.
+    """
+    try:
+        from CESA.filter_engine import pipeline_from_legacy_params
+    except Exception:
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for ch, cfg in params.items():
+        lo = float(cfg.get("low", 0.0))
+        hi = float(cfg.get("high", 0.0))
+        enabled = bool(cfg.get("enabled", True))
+        pipe = pipeline_from_legacy_params(
+            low=lo, high=hi, order=order,
+            filter_type=filter_type, enabled=enabled,
+        )
+        result[ch] = pipe.to_dict()
+    return result
 
 
 def build_default_profile() -> DisplayProcessingProfile:

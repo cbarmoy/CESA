@@ -1,0 +1,31 @@
+##############################################################################
+# CESA Benchmark Configuration — MASS Dataset (SS3)
+#
+# Usage:
+#   python scripts/run_benchmark.py --config config/benchmark_mass.yaml \
+#       --data-path /path/to/mass/SS3
+#
+# NOTE: MASS requires a license — data must be downloaded manually.
+##############################################################################
+
+dataset: mass
+data_path: ""                      # REQUIRED: path to MASS SS3 root folder
+n_subjects: -1
+n_folds: 5
+epoch_duration_s: 30.0
+target_sfreq: 100.0
+
+backends:
+  - aasm_rules
+  - ml
+  - ml_hmm
+
+ml_model_type: hgb
+random_seed: 42
+
+output_dir: results
+figure_dpi: 300
+figure_format: pdf
+
+bootstrap_n: 1000
+bootstrap_ci: 0.95

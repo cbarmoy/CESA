@@ -322,12 +322,14 @@ class TelemetryRecorder:
         expected = set(self._expected_modes)
         if not expected:
             return
-        missing = expected.difference(self._seen_modes)
-        if missing:
+        # OR semantics: at least one expected mode must have been marked in-session
+        # (lazy-only and precomputed-only sessions are both valid).
+        seen = set(self._seen_modes)
+        if not seen.intersection(expected):
             raise RuntimeError(
-                "Mode checkpoint failed: expected modes were not observed "
-                f"{sorted(missing)}.\nEnsure the expected calculation path reports its mode "
-                "via telemetry.mark_mode()."
+                "Mode checkpoint failed: none of the expected modes "
+                f"{sorted(expected)} were observed via telemetry.mark_mode(). "
+                f"Observed: {sorted(seen) if seen else '(none)'}"
             )
 
 

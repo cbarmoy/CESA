@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-CESA v3.0 - Spectral Analysis Utilities (FFT-based)
+CESA v0.0beta1.0 - Spectral Analysis Utilities (FFT-based)
 ==================================================
 
-Spectral analysis utilities for EEG Analysis Studio v3.0
+Spectral analysis utilities for EEG Analysis Studio v0.0beta1.0
 Développé pour l'Unité Neuropsychologie du Stress (IRBA)
 
 Fournit des analyses spectrales robustes pour l'EEG :
@@ -27,7 +27,7 @@ Bandes EEG standards:
 - Gamma: 30-45 Hz (traitement d'information)
 
 Auteur: Côme Barmoy (IRBA)
-Version: 3.0.0 - Compatible CESA v3.0
+Version: 0.0beta1.0
 Date: 2025-09-26
 """
 

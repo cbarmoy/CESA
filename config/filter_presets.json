@@ -1,0 +1,237 @@
+{
+  "presets": [
+    {
+      "name": "EEG Standard PSG",
+      "description": "Standard clinical PSG EEG: bandpass 0.3-35 Hz (Butterworth order 4) + 50 Hz notch",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 35.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "EEG Recherche",
+      "description": "Research EEG with wide bandwidth: 0.1-70 Hz + 50 Hz notch (3 harmonics)",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "EEG Sleep Scoring AASM",
+      "description": "AASM-compliant EEG filtering for automatic sleep scoring: 0.3-35 Hz bandpass",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 35.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "EOG Standard",
+      "description": "Standard EOG: bandpass 0.3-10 Hz (order 2) to capture slow eye movements",
+      "channel_type": "eog",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 10.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "EOG Large Bande",
+      "description": "Wide-band EOG for REM detection: 0.3-35 Hz",
+      "channel_type": "eog",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 35.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "EMG Menton",
+      "description": "Chin EMG: high-pass 10 Hz + 50 Hz notch to isolate muscle activity",
+      "channel_type": "emg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "HighpassFilter",
+            "enabled": true,
+            "cutoff_hz": 10.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "EMG Sleep Scoring AASM",
+      "description": "AASM chin EMG for sleep scoring: bandpass 10-100 Hz",
+      "channel_type": "emg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 10.0,
+            "high_hz": 100.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ECG Standard",
+      "description": "Standard ECG: bandpass 0.3-70 Hz + 50 Hz notch",
+      "channel_type": "ecg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "Aucun Filtre",
+      "description": "No filtering - raw signal pass-through",
+      "channel_type": "generic",
+      "builtin": true,
+      "pipeline": {
+        "enabled": false,
+        "filters": []
+      }
+    },
+    {
+      "name": "Notch 50 Hz seul",
+      "description": "50 Hz mains rejection only (3 harmonics: 50, 100, 150 Hz)",
+      "channel_type": "generic",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "Notch 60 Hz seul",
+      "description": "60 Hz mains rejection for North American recordings (3 harmonics)",
+      "channel_type": "generic",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 60.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    }
+  ]
+}

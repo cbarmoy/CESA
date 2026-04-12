@@ -1,8 +1,8 @@
 """
-CESA v3.0 - Scoring I/O Utilities
+CESA v0.0beta1.0 - Scoring I/O Utilities
 ================================
 
-Module d'import et de synchronisation du scoring pour CESA v3.0.
+Module d'import et de synchronisation du scoring pour CESA v0.0beta1.0.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Fonctions pour normaliser le scoring manuel (Excel/CSV) et les annotations
@@ -30,7 +30,7 @@ Formats supportés:
 - Formats de date variés (ISO, français, etc.)
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 3.0.0
+Version: 0.0beta1.0
 Date: 2025-09-26
 """
 

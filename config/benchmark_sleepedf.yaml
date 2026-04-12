@@ -1,0 +1,29 @@
+##############################################################################
+# CESA Benchmark Configuration — Sleep-EDF Expanded
+#
+# Usage:
+#   python scripts/run_benchmark.py --config config/benchmark_sleepedf.yaml
+#
+##############################################################################
+
+dataset: sleep_edf
+data_path: ""                      # empty = MNE default cache directory
+n_subjects: -1                     # -1 = all available (~83 for age study)
+n_folds: 5
+epoch_duration_s: 30.0
+target_sfreq: 100.0
+
+backends:
+  - aasm_rules
+  - ml
+  - ml_hmm
+
+ml_model_type: hgb                 # hgb | rf
+random_seed: 42
+
+output_dir: results
+figure_dpi: 300
+figure_format: pdf
+
+bootstrap_n: 1000
+bootstrap_ci: 0.95

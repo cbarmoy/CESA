@@ -1,0 +1,25 @@
+{
+    "edf_paths": [
+        "data/subject01.edf",
+        "data/subject02.edf"
+    ],
+    "scoring_paths": [
+        "data/subject01_scoring.csv",
+        "data/subject02_scoring.csv"
+    ],
+    "epoch_duration_s": 30.0,
+    "target_sfreq": 100.0,
+    "model_type": "cnn",
+    "base_filters": 64,
+    "lstm_hidden": 128,
+    "lstm_layers": 2,
+    "dropout": 0.5,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "max_epochs": 100,
+    "patience": 15,
+    "val_split": 0.2,
+    "output_dir": "models/dl",
+    "device": "auto"
+}

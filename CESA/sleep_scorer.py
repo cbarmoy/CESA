@@ -1,4 +1,4 @@
-"""Unified sleep-scoring backends for YASA and U-Sleep."""
+"""Unified sleep-scoring backends for YASA, U-Sleep, and the new AASM pipeline."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import os
 import inspect
 import logging
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, Literal, Optional, Sequence
 
 import mne
 import numpy as np
 import pandas as pd
 
-StageMethod = Literal["yasa", "usleep", "pftsleep"]
+StageMethod = Literal["yasa", "usleep", "pftsleep", "aasm_rules", "ml", "ml_hmm", "rules_hmm"]
 ProgressCallback = Optional[Callable[[str, dict[str, Any]], None]]
 
 
@@ -50,6 +50,10 @@ class SleepScorer:
 
     _CLASS_TO_STAGE = {0: "W", 1: "N1", 2: "N2", 3: "N3", 4: "R"}
 
+    # New pipeline options
+    aasm_thresholds: Optional[Dict[str, float]] = None
+    ml_model_path: Optional[str] = None
+
     def score(self, raw: mne.io.BaseRaw) -> pd.DataFrame:
         """Run selected backend and return a standard scoring DataFrame."""
         if not isinstance(raw, mne.io.BaseRaw):
@@ -64,7 +68,34 @@ class SleepScorer:
             return self._score_usleep(raw)
         if method == "pftsleep":
             return self._score_pftsleep(raw)
+        if method in ("aasm_rules", "ml", "ml_hmm", "rules_hmm"):
+            return self._score_pipeline(raw, backend=method)
         raise ValueError(f"Unsupported sleep scoring method: {self.method}")
+
+    def _score_pipeline(self, raw: mne.io.BaseRaw, *, backend: str) -> pd.DataFrame:
+        """Run the new modular AASM pipeline (rule-based or ML)."""
+        self._emit("start", {"backend": backend})
+        from CESA.sleep_pipeline.transition import run_pipeline
+
+        self._emit("staging_initialized", {"mode": backend})
+        self._emit("predict_begin", {"backend": backend})
+
+        result = run_pipeline(
+            raw,
+            backend=backend,
+            eeg_candidates=self.eeg_candidates,
+            eog_candidates=self.eog_candidates,
+            emg_candidates=self.emg_candidates,
+            epoch_duration_s=float(self.epoch_length),
+            target_sfreq=float(self.target_sfreq),
+            thresholds=self.aasm_thresholds,
+            ml_model_path=self.ml_model_path,
+        )
+
+        self._emit("predict_end", {"backend": backend})
+        df = result.to_dataframe()
+        self._emit("done", {"epochs": int(len(df))})
+        return self._validate_output_df(df)
 
     def _score_yasa(self, raw: mne.io.BaseRaw) -> pd.DataFrame:
         """Run YASA sleep staging directly via the official API."""
