@@ -1,8 +1,8 @@
 """
-CESA v0.0beta1.0 - Advanced Theme Manager
+CESA v0.0beta1.1 - Advanced Theme Manager
 =================================
 
-Module de gestion de thèmes complet pour l'interface CESA (EEG Studio Analysis) v0.0beta1.0.
+Module de gestion de thèmes complet pour l'interface CESA (EEG Studio Analysis) v0.0beta1.1.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Fournit un système de thèmes graphiques complet avec 3 thèmes personnalisés:
@@ -31,7 +31,7 @@ Styles configurés:
 - Images de fond et palettes de couleurs
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2025-09-26
 """
 

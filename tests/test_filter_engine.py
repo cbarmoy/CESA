@@ -1030,27 +1030,27 @@ class TestVersioning:
 
     def test_cesa_init_version(self):
         import CESA
-        assert CESA.__version__ == "0.0beta1.0"
+        assert CESA.__version__ == "0.0beta1.1"
 
     def test_sleep_pipeline_version(self):
         import CESA.sleep_pipeline
-        assert CESA.sleep_pipeline.__version__ == "0.0beta1.0"
+        assert CESA.sleep_pipeline.__version__ == "0.0beta1.1"
 
     def test_run_docstring_version(self):
         run_path = Path(__file__).resolve().parent.parent / "run.py"
         content = run_path.read_text(encoding="utf-8")
-        assert "0.0beta1.0" in content
+        assert "0.0beta1.1" in content
 
     def test_requirements_version(self):
         req_path = Path(__file__).resolve().parent.parent / "requirements.txt"
         content = req_path.read_text(encoding="utf-8")
-        assert "CESA 0.0beta1.0" in content
+        assert "CESA 0.0beta1.1" in content
 
     def test_changelog_exists(self):
         cl_path = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
         assert cl_path.exists()
         content = cl_path.read_text(encoding="utf-8")
-        assert "[0.0beta1.0]" in content
+        assert "[0.0beta1.1]" in content
 
 
 # ===========================================================================

@@ -1,13 +1,13 @@
 # CESA
 
-![Version](https://img.shields.io/badge/version-0.0beta1.0-blue)
+![Version](https://img.shields.io/badge/version-0.0beta1.1-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green)
 ![Tests](https://img.shields.io/badge/tests-217%20passed-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **CESA** (Complex EEG Studio Analysis) is a Windows workstation for clinicians and researchers working with long-form EEG or polysomnography recordings. It sits on top of MNE-Python and bundles everything needed to inspect raw EDF+, run standard sleep scorings, compute advanced metrics (coherence, microstates, renormalised entropy) and export publication-ready plots.
 
-## What's new in v0.0beta1.0
+## What's new in v0.0beta1.1
 
 - **Composable filter engine** -- typed filter nodes (Bandpass, Highpass, Lowpass, Notch, Smoothing) with `FilterPipeline` chaining, JSON serialization, frequency-response visualisation.
 - **Clinical filter presets** -- 11 built-in presets (EEG Standard PSG, AASM Scoring, EOG, EMG, ECG, Notch 50/60 Hz, etc.) + user presets with import/export.
@@ -66,7 +66,7 @@ The CLI auto-detects the number of CPU cores and can run analyses in parallel (`
 ```
 CESA-main/
 ├── CESA/                    # Core package
-│   ├── __init__.py          # Version 0.0beta1.0
+│   ├── __init__.py          # Version 0.0beta1.1
 │   ├── filter_engine.py     # Composable filter engine
 │   ├── filters.py           # Legacy wrapper (backward-compat)
 │   ├── report_generator.py  # HTML report generator

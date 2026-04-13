@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CESA (Complex EEG Studio Analysis) v0.0beta1.0 - Professional EEG Analysis Interface
+CESA (Complex EEG Studio Analysis) v0.0beta1.1 - Professional EEG Analysis Interface
 ====================================================================
 
 Application professionnelle complète pour l'analyse de données EEG avec
@@ -11,12 +11,12 @@ scientifiques et les bonnes pratiques MNE-Python.
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
 Contact: come1.barmoy@supbiotech.fr
 GitHub: cbarmoy
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2026-04-05
 Licence: MIT
-Release: CESA_0.0beta1.0_release
+Release: CESA_0.0beta1.1_release
 
-Fonctionnalités principales v0.0beta1.0:
+Fonctionnalités principales v0.0beta1.1:
 - ✅ Chargement EDF+ avec diagnostic automatique et amplification
 - ✅ Interface graphique professionnelle (thèmes clair/sombre)
 - ✅ Scoring de sommeil (import Excel/EDF+ avec synchronisation)
@@ -517,7 +517,7 @@ class EEGAnalysisStudio:
         self._update_version_display()
         
         # Log de l'initialisation
-        logging.info("CESA (Complex EEG Studio Analysis) v0.0beta1.0 initialisé avec succès")
+        logging.info("CESA (Complex EEG Studio Analysis) v0.0beta1.1 initialisé avec succès")
         logging.info("Application initialized successfully")
 
         # Optimisation rendu: exécuteur en arrière-plan + debouncing
@@ -594,7 +594,7 @@ class EEGAnalysisStudio:
         self.control_width = control_width
         
         # Configuration de la fenêtre principale
-        self.root.title("CESA (Complex EEG Studio Analysis) v0.0beta1.0 - Interface Moderne")
+        self.root.title("CESA (Complex EEG Studio Analysis) v0.0beta1.1 - Interface Moderne")
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(1000, 600)
         
@@ -9154,7 +9154,7 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
             self.user_assistant._open_support()
         else:
             support_info = """
-📞 SUPPORT CESA v0.0beta1.0
+📞 SUPPORT CESA v0.0beta1.1
 
 🆘 EN CAS DE PROBLÈME :
 
@@ -9175,12 +9175,12 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
 • Joignez des captures d'écran si utile
 
 🎯 DÉVELOPPEMENT :
-CESA v0.0beta1.0 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
+CESA v0.0beta1.1 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
 Auteur : Côme Barmoy
-Version : 0.0beta1.0
+Version : 0.0beta1.1
 Licence : MIT
             """
-            messagebox.showinfo("Support CESA v0.0beta1.0", support_info)
+            messagebox.showinfo("Support CESA v0.0beta1.1", support_info)
     
     def _open_reference_guide(self):
         """Ouvre le guide de référence complet."""
@@ -10279,7 +10279,7 @@ Licence : MIT
             report_lines.append("EEG ANALYSIS STUDIO - RAPPORT DE BUG")
             report_lines.append("=" * 80)
             report_lines.append(f"Date de génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            report_lines.append(f"Version de l'application : v0.0beta1.0")
+            report_lines.append(f"Version de l'application : v0.0beta1.1")
             report_lines.append("")
             
             # Informations système
@@ -13036,7 +13036,7 @@ Licence : MIT
     def _show_about(self):
         """Affiche la boîte de dialogue À propos."""
         about_text = """
-CESA (Complex EEG Studio Analysis) v0.0beta1.0
+CESA (Complex EEG Studio Analysis) v0.0beta1.1
 
 Application professionnelle pour l'analyse de données EEG
 avec amplification automatique des signaux de faible amplitude
@@ -13056,7 +13056,7 @@ Fonctionnalités:
 
 Développé avec Python, MNE-Python, Matplotlib et Tkinter.
 
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2025-09-09
         """
         messagebox.showinfo("À propos", about_text)
@@ -13842,7 +13842,7 @@ Date: 2025-09-09
         # Version de l'application
         self.version_label = ttk.Label(
             status_frame, 
-            text="v0.0beta1.0", 
+            text="v0.0beta1.1", 
             style='Version.TLabel',
             font=('Segoe UI', 8, 'bold')
         )
@@ -13882,7 +13882,7 @@ Date: 2025-09-09
         """Met à jour l'affichage de la version dans l'interface."""
         if hasattr(self, 'version_label'):
             try:
-                self.version_label.config(text="v0.0beta1.0")
+                self.version_label.config(text="v0.0beta1.1")
             except Exception:
                 pass
 
@@ -14007,7 +14007,7 @@ Date: 2025-09-09
 
         # Fenêtre principale d'automatisation
         batch_window = tk.Toplevel(self.root)
-        batch_window.title("🤖 Automatisation FFT en Lot - CESA v0.0beta1.0")
+        batch_window.title("🤖 Automatisation FFT en Lot - CESA v0.0beta1.1")
         batch_window.geometry("1100x900")
         batch_window.configure(bg='#f8f9fa')
         
@@ -19295,7 +19295,7 @@ Date: 2025-09-09
 
 def main(ms_path: Optional[str] = None) -> int:
     """Fonction principale"""
-    print("CESA (Complex EEG Studio Analysis) v0.0beta1.0")
+    print("CESA (Complex EEG Studio Analysis) v0.0beta1.1")
     print("=" * 50)
     print("Vérification des dépendances...")
     

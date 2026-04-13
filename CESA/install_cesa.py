@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CESA (EEG Studio Analysis) v0.0beta1.0 - Installateur Graphique
+CESA (EEG Studio Analysis) v0.0beta1.1 - Installateur Graphique
 =======================================================
 
-Installateur graphique noob-friendly pour CESA v0.0beta1.0.
+Installateur graphique noob-friendly pour CESA v0.0beta1.1.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Cet installateur vérifie automatiquement les dépendances,
@@ -19,7 +19,7 @@ Fonctionnalités:
 - Assistant de première utilisation
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2025-01-27
 Licence: MIT
 """
@@ -42,11 +42,11 @@ except ImportError:
     sys.exit(1)
 
 class CESAInstaller:
-    """Installateur graphique pour CESA v0.0beta1.0."""
+    """Installateur graphique pour CESA v0.0beta1.1."""
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("CESA v0.0beta1.0 - Installateur Graphique")
+        self.root.title("CESA v0.0beta1.1 - Installateur Graphique")
         self.root.geometry("800x600")
         self.root.resizable(True, True)
         
@@ -71,13 +71,13 @@ class CESAInstaller:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Titre
-        title_label = ttk.Label(main_frame, text="🧠 CESA v0.0beta1.0 - Installateur Graphique", 
+        title_label = ttk.Label(main_frame, text="🧠 CESA v0.0beta1.1 - Installateur Graphique", 
                                font=('Segoe UI', 18, 'bold'))
         title_label.pack(pady=(0, 20))
         
         # Sous-titre
         subtitle_label = ttk.Label(main_frame, 
-                                  text="Installation automatique d'EEG Studio Analysis v0.0beta1.0\n"
+                                  text="Installation automatique d'EEG Studio Analysis v0.0beta1.1\n"
                                        "Développé pour l'Unité Neuropsychologie du Stress (IRBA)",
                                   font=('Segoe UI', 10))
         subtitle_label.pack(pady=(0, 30))
@@ -238,7 +238,7 @@ class CESAInstaller:
         guide_frame.pack(fill=tk.BOTH, expand=True)
         
         guide_text = """
-🎯 GUIDE D'INSTALLATION CESA v0.0beta1.0
+🎯 GUIDE D'INSTALLATION CESA v0.0beta1.1
 
 📋 ÉTAPES D'INSTALLATION :
 
@@ -323,9 +323,9 @@ class CESAInstaller:
         self._log(f"Python {version.major}.{version.minor}.{version.micro} détecté")
         
         if version < (3, 8):
-            self._log("⚠️ Python 3.8+ requis pour CESA v0.0beta1.0", "warning")
+            self._log("⚠️ Python 3.8+ requis pour CESA v0.0beta1.1", "warning")
             messagebox.showwarning("Version Python", 
-                                  "Python 3.8+ est requis pour CESA v0.0beta1.0.\n"
+                                  "Python 3.8+ est requis pour CESA v0.0beta1.1.\n"
                                   f"Version actuelle: {version.major}.{version.minor}.{version.micro}")
         else:
             self._log("✅ Version Python compatible")
@@ -578,7 +578,7 @@ Répertoire courant: {os.getcwd()}
                 
                 messagebox.showinfo("Installation", 
                                   "Installation complète terminée avec succès!\n\n"
-                                  "CESA v0.0beta1.0 est maintenant prêt à être utilisé.")
+                                  "CESA v0.0beta1.1 est maintenant prêt à être utilisé.")
                 
             except Exception as e:
                 self._log(f"❌ Erreur lors de l'installation complète: {e}")
@@ -593,7 +593,7 @@ Répertoire courant: {os.getcwd()}
             # Raccourci sur le bureau
             if self.create_desktop_shortcut.get():
                 desktop_path = Path.home() / "Desktop"
-                shortcut_path = desktop_path / "CESA v0.0beta1.0.lnk"
+                shortcut_path = desktop_path / "CESA v0.0beta1.1.lnk"
                 
                 # Créer un fichier batch pour lancer CESA
                 batch_content = f'''@echo off
@@ -625,7 +625,7 @@ pause
 
 def main():
     """Fonction principale."""
-    print("🧠 CESA v0.0beta1.0 - Installateur Graphique")
+    print("🧠 CESA v0.0beta1.1 - Installateur Graphique")
     print("=" * 50)
     
     try:

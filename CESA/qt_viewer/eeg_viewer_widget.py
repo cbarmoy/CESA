@@ -69,6 +69,7 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._channel_types: Dict[str, str] = {}
         self._pipelines: Dict[str, Any] = {}
         self._global_filter: bool = True
+        self._active_layout: Optional[Any] = None  # LayoutConfig or None
 
         self._start_s: float = 0.0
         self._duration_s: float = 30.0
@@ -80,6 +81,15 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._annotation_overlay: Optional[Any] = None
         # ML overlay (lazy)
         self._ml_overlay: Optional[Any] = None
+
+        # Visual guide state
+        self._show_baselines: bool = False
+        self._show_amplitude_scale: bool = False
+        self._show_grid_fine: bool = False
+        self._show_artifact_highlight: bool = False
+        self._artifact_threshold: float = 500.0
+        self._fine_grid_lines: List[pg.InfiniteLine] = []
+        self._artifact_regions: List[pg.LinearRegionItem] = []
 
         # Selection region for annotation creation
         self._selection_region: Optional[pg.LinearRegionItem] = None
@@ -235,6 +245,170 @@ class EEGViewerWidget(QtWidgets.QWidget):
             strip.set_gain(1.0)
         self._refresh_view()
 
+    def apply_scaling(
+        self,
+        config,
+        channel_types: Dict[str, str],
+    ) -> None:
+        """Apply a full ScalingConfig to all strips.
+
+        Effective gain per channel =
+            global_gain * per_type_gain[type] * per_channel_gain.get(ch, 1.0)
+        """
+        if not config.enabled:
+            for strip in self._strips.values():
+                strip.set_gain(1.0)
+                strip.set_clip(False)
+            if abs(self._spacing - config.spacing_uv) > 0.1:
+                self.set_spacing(config.spacing_uv)
+            else:
+                self._refresh_view()
+            return
+
+        if abs(self._spacing - config.spacing_uv) > 0.1:
+            self._spacing = max(10.0, config.spacing_uv)
+            self._recompute_offsets()
+
+        per_type = config.per_type_gains or {}
+        per_ch = config.per_channel_gains or {}
+        g_global = config.global_gain
+
+        for name, strip in self._strips.items():
+            ch_type = channel_types.get(name, "eeg")
+            type_gain = per_type.get(ch_type, 1.0)
+            ch_gain = per_ch.get(name, 1.0)
+            effective = g_global * type_gain * ch_gain
+            strip.set_gain(max(0.01, effective))
+            strip.set_clip(config.clipping_enabled, config.clip_value_uv)
+
+        self._refresh_view()
+
+    def apply_layout(
+        self,
+        layout,
+        channel_types: Dict[str, str],
+        signal_medians: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Apply a LayoutConfig: type-aware spacing + optional DC centering."""
+        self._active_layout = layout
+        self._channel_types.update(channel_types)
+
+        if layout and layout.enabled and layout.center_signal and signal_medians:
+            for name, strip in self._strips.items():
+                strip.set_center_offset(signal_medians.get(name, 0.0))
+        else:
+            for strip in self._strips.values():
+                strip.set_center_offset(0.0)
+
+        self._recompute_offsets()
+        self._refresh_view()
+
+    # ------------------------------------------------------------------
+    # Visual guides
+    # ------------------------------------------------------------------
+
+    def set_show_baselines(self, show: bool) -> None:
+        self._show_baselines = show
+        for strip in self._strips.values():
+            strip.set_show_baseline(show)
+        self._refresh_view()
+
+    def set_show_amplitude_scale(self, show: bool) -> None:
+        self._show_amplitude_scale = show
+        for strip in self._strips.values():
+            strip.set_show_amplitude_scale(show)
+        self._refresh_view()
+
+    def set_show_grid_fine(self, show: bool) -> None:
+        self._show_grid_fine = show
+        self._update_fine_grid()
+        self._refresh_view()
+
+    def set_show_artifact_highlight(self, show: bool, threshold: float = 500.0) -> None:
+        self._show_artifact_highlight = show
+        self._artifact_threshold = threshold
+        if not show:
+            self._clear_artifact_regions()
+        self._refresh_view()
+
+    def _update_fine_grid(self) -> None:
+        """Draw fine (1s) and medium (5s) vertical grid lines."""
+        for line in self._fine_grid_lines:
+            self._plot.removeItem(line)
+        self._fine_grid_lines.clear()
+
+        if not self._show_grid_fine:
+            return
+
+        start = self._start_s
+        end = start + self._duration_s
+        t = int(start)
+        while t <= end + 1:
+            if t >= start - 1:
+                is_5s = (t % 5 == 0)
+                pen = pg.mkPen(
+                    self._theme.get("grid", "#45475A"),
+                    width=0.6 if is_5s else 0.3,
+                    style=(QtCore.Qt.PenStyle.DashLine if is_5s
+                           else QtCore.Qt.PenStyle.DotLine),
+                )
+                line = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+                line.setValue(float(t))
+                line.setZValue(-20)
+                self._plot.addItem(line, ignoreBounds=True)
+                self._fine_grid_lines.append(line)
+            t += 1
+
+    def _clear_artifact_regions(self) -> None:
+        for r in self._artifact_regions:
+            self._plot.removeItem(r)
+        self._artifact_regions.clear()
+
+    def _update_artifact_highlights(self) -> None:
+        """Detect and highlight epochs where any channel exceeds the threshold."""
+        self._clear_artifact_regions()
+        if not self._show_artifact_highlight:
+            return
+
+        start = self._start_s
+        end = start + self._duration_s
+        threshold = self._artifact_threshold
+
+        epoch_start = int(start / self._epoch_len) * self._epoch_len
+        t = epoch_start
+        while t < end + self._epoch_len:
+            if t + self._epoch_len <= start:
+                t += self._epoch_len
+                continue
+            has_artifact = False
+            for name, strip in self._strips.items():
+                if not strip.visible:
+                    continue
+                sig = self._signals.get(name)
+                if sig is None:
+                    continue
+                data, fs = sig
+                s0 = max(0, int(t * fs))
+                s1 = min(len(data), int((t + self._epoch_len) * fs))
+                if s1 <= s0:
+                    continue
+                step = max(1, (s1 - s0) // 5000)
+                chunk = data[s0:s1:step]
+                if float(np.max(np.abs(chunk))) > threshold:
+                    has_artifact = True
+                    break
+            if has_artifact:
+                region = pg.LinearRegionItem(
+                    values=[t, t + self._epoch_len],
+                    movable=False,
+                    brush=pg.mkBrush(255, 60, 60, 18),
+                    pen=pg.mkPen(None),
+                )
+                region.setZValue(-18)
+                self._plot.addItem(region, ignoreBounds=True)
+                self._artifact_regions.append(region)
+            t += self._epoch_len
+
     def set_spacing(self, spacing_uv: float) -> None:
         self._spacing = max(10.0, float(spacing_uv))
         self._recompute_offsets()
@@ -342,6 +516,8 @@ class EEGViewerWidget(QtWidgets.QWidget):
             if pipeline is not None:
                 strip.set_pipeline(pipeline)
             strip.set_filter_enabled(self._global_filter)
+            strip.set_show_baseline(self._show_baselines)
+            strip.set_show_amplitude_scale(self._show_amplitude_scale)
 
             self._strips[name] = strip
 
@@ -351,19 +527,33 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._plot.setYRange(y_bot, y_top, padding=0.02)
 
     def _recompute_offsets(self) -> None:
-        """Update Y offsets after visibility or order change."""
-        i = 0
+        """Update Y offsets after visibility or order change.
+
+        When a LayoutConfig is active, per-type spacing multipliers are
+        applied so that e.g. EEG channels get more vertical room while
+        EMG/ECG are compressed.
+        """
+        layout = self._active_layout
+        cumulative = 0.0
+        n_visible = 0
         for name in self._channel_order:
             strip = self._strips.get(name)
             if strip is None or not strip.visible:
                 continue
-            strip.set_y_offset(-i * self._spacing)
-            i += 1
-        n_visible = i
+            ch_type = self._channel_types.get(name, "eeg")
+            if layout and layout.enabled:
+                mult = layout.per_type_spacing_multiplier.get(ch_type, 1.0)
+                custom = layout.per_channel_offset.get(name, 0.0)
+            else:
+                mult = 1.0
+                custom = 0.0
+            strip.set_y_offset(-(cumulative + custom))
+            cumulative += self._spacing * mult
+            n_visible += 1
         if n_visible > 0:
             self._plot.setYRange(
-                -(n_visible) * self._spacing,
-                self._spacing,
+                -(cumulative + self._spacing * 0.2),
+                self._spacing * 0.5,
                 padding=0.02,
             )
 
@@ -373,6 +563,10 @@ class EEGViewerWidget(QtWidgets.QWidget):
         for strip in self._strips.values():
             strip.update_view(self._start_s, self._duration_s, w)
         self._update_epoch_grid()
+        if self._show_grid_fine:
+            self._update_fine_grid()
+        if self._show_artifact_highlight:
+            self._update_artifact_highlights()
 
         # Update annotation overlay
         if self._annotation_overlay is not None:

@@ -63,6 +63,9 @@ class ChannelStrip:
         self._y_offset = y_offset
 
         self._gain: float = 1.0
+        self._center_offset: float = 0.0
+        self._clip_enabled: bool = False
+        self._clip_value: float = 500.0
         self._pipeline: Optional[Any] = None  # FilterPipeline
         self._filter_enabled: bool = True
         self._visible: bool = True
@@ -91,6 +94,28 @@ class ChannelStrip:
         self._label.setFont(pg.QtGui.QFont("Segoe UI", 8))
         plot_item.addItem(self._label)
 
+        # Baseline guide line (horizontal at y_offset)
+        self._baseline_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("#45475A", width=0.4, style=pg.QtCore.Qt.PenStyle.DotLine),
+        )
+        self._baseline_line.setVisible(False)
+        self._baseline_line.setZValue(-10)
+        plot_item.addItem(self._baseline_line, ignoreBounds=True)
+
+        # Amplitude scale bar (vertical bracket showing e.g. 50 uV)
+        self._scale_bar = pg.PlotDataItem(
+            pen=pg.mkPen("#6C7086", width=1.0), skipFiniteCheck=True,
+        )
+        self._scale_bar.setVisible(False)
+        plot_item.addItem(self._scale_bar)
+        self._scale_text = pg.TextItem(text="", color="#6C7086", anchor=(0, 0.5))
+        self._scale_text.setFont(pg.QtGui.QFont("Segoe UI", 7))
+        self._scale_text.setVisible(False)
+        plot_item.addItem(self._scale_text)
+        self._show_scale: bool = False
+        self._scale_uv: float = 50.0
+
     # ----- public setters -----------------------------------------------
 
     def set_data(self, data: np.ndarray, sfreq: float) -> None:
@@ -100,6 +125,14 @@ class ChannelStrip:
 
     def set_gain(self, gain: float) -> None:
         self._gain = max(0.01, float(gain))
+
+    def set_clip(self, enabled: bool, value_uv: float = 500.0) -> None:
+        self._clip_enabled = enabled
+        self._clip_value = abs(value_uv)
+
+    def set_center_offset(self, offset_uv: float) -> None:
+        """Set DC offset to subtract (e.g. signal median) for baseline centering."""
+        self._center_offset = float(offset_uv)
 
     def set_pipeline(self, pipeline: Optional[Any]) -> None:
         self._pipeline = pipeline
@@ -125,6 +158,22 @@ class ChannelStrip:
 
     def set_show_raw(self, show: bool) -> None:
         self._raw_curve.setVisible(show and self._visible)
+
+    def set_show_baseline(self, show: bool) -> None:
+        self._baseline_line.setVisible(show and self._visible)
+
+    def set_show_amplitude_scale(self, show: bool, scale_uv: float = 50.0) -> None:
+        self._show_scale = show
+        self._scale_uv = max(1.0, scale_uv)
+        self._scale_bar.setVisible(show and self._visible)
+        self._scale_text.setVisible(show and self._visible)
+
+    def set_guide_theme(self, baseline_color: str, scale_color: str) -> None:
+        self._baseline_line.setPen(
+            pg.mkPen(baseline_color, width=0.4,
+                     style=pg.QtCore.Qt.PenStyle.DotLine))
+        self._scale_bar.setPen(pg.mkPen(scale_color, width=1.0))
+        self._scale_text.setColor(scale_color)
 
     @property
     def gain(self) -> float:
@@ -162,9 +211,13 @@ class ChannelStrip:
         # Filtered signal (with cache)
         filtered = self._get_filtered(s0, s1, raw_slice)
 
-        # Apply gain
-        display = filtered * self._gain + self._y_offset
-        raw_display = raw_slice * self._gain + self._y_offset
+        # Optional amplitude clipping (before gain, removes extreme artefacts)
+        if self._clip_enabled:
+            filtered = np.clip(filtered, -self._clip_value, self._clip_value)
+
+        # Apply gain and centering
+        display = (filtered - self._center_offset) * self._gain + self._y_offset
+        raw_display = (raw_slice - self._center_offset) * self._gain + self._y_offset
 
         # Downsample for rendering
         target_pts = compute_target_points(widget_width_px)
@@ -179,6 +232,18 @@ class ChannelStrip:
 
         # Position label at the left edge
         self._label.setPos(start_s, self._y_offset)
+
+        # Update guide positions
+        self._baseline_line.setValue(self._y_offset)
+        if self._show_scale and self._scale_bar.isVisible():
+            half = self._scale_uv * self._gain * 0.5
+            x_pos = start_s + duration_s * 0.005
+            self._scale_bar.setData(
+                [x_pos, x_pos],
+                [self._y_offset - half, self._y_offset + half],
+            )
+            self._scale_text.setText(f"{self._scale_uv:.0f} uV")
+            self._scale_text.setPos(x_pos + duration_s * 0.008, self._y_offset)
 
     # ----- internal -----------------------------------------------------
 
@@ -209,5 +274,8 @@ class ChannelStrip:
             self._plot_item.removeItem(self._filtered_curve)
             self._plot_item.removeItem(self._raw_curve)
             self._plot_item.removeItem(self._label)
+            self._plot_item.removeItem(self._baseline_line)
+            self._plot_item.removeItem(self._scale_bar)
+            self._plot_item.removeItem(self._scale_text)
         except Exception:
             pass

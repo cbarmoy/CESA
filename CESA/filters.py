@@ -11,7 +11,7 @@ that the same IIR implementations are shared with the new pipeline-based
 filter dialog.
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 """
 
 from typing import Optional

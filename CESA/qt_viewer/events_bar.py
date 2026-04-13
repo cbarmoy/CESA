@@ -14,7 +14,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .themes import DARK, ThemePalette, event_color
+from .themes import DARK, ThemePalette, event_color, stage_color, normalize_stage
 from .time_axis_item import TimeAxisItem
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,8 @@ class EventsBar(QtWidgets.QWidget):
         start = self._start_s
         end = start + self._duration_s
 
+        _SLEEP_STAGES = {"W", "N1", "N2", "N3", "R", "U"}
+
         for ev in self._events:
             onset = float(ev.get("onset", 0.0))
             dur = float(ev.get("duration", 1.0))
@@ -105,9 +107,23 @@ class EventsBar(QtWidgets.QWidget):
             if ev_end < start or onset > end:
                 continue
 
-            etype = str(ev.get("type", "event"))
-            color = event_color(self._theme, etype)
-            brush = pg.mkBrush(color + "88")  # semi-transparent
+            etype = str(
+                ev.get("type")
+                or ev.get("description")
+                or ev.get("label")
+                or "event"
+            )
+
+            canonical = normalize_stage(etype)
+            if canonical in _SLEEP_STAGES and canonical != "U":
+                color = stage_color(self._theme, canonical)
+                etype = canonical
+            elif etype.upper().strip() in _SLEEP_STAGES:
+                color = stage_color(self._theme, etype)
+            else:
+                color = event_color(self._theme, etype)
+
+            brush = pg.mkBrush(color + "88")
             pen = pg.mkPen(color, width=0.5)
 
             rect = pg.QtWidgets.QGraphicsRectItem(onset, 0.05, dur, 0.9)
@@ -116,7 +132,7 @@ class EventsBar(QtWidgets.QWidget):
             self._plot.addItem(rect)
             self._rect_items.append(rect)
 
-            label_text = str(ev.get("label", etype))[:12]
+            label_text = str(ev.get("label") or etype)[:12]
             if dur > (self._duration_s * 0.03):
                 txt = pg.TextItem(text=label_text, color=self._theme["foreground"],
                                   anchor=(0, 0.5))

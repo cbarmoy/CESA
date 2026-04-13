@@ -87,5 +87,5 @@ Le store généré peut être versionné ou partagé avec l'EDF pour éviter sa 
 
 ---
 
-*Documentation CESA – navigation rapide (pré-release 0.0beta1.0)*
+*Documentation CESA – navigation rapide (pré-release 0.0beta1.1)*
 

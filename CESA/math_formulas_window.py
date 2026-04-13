@@ -1,5 +1,5 @@
 """
-CESA v0.0beta1.0 - Mathematical Formulas Display Window
+CESA v0.0beta1.1 - Mathematical Formulas Display Window
 ===============================================
 
 Module pour afficher les formules mathématiques utilisées dans CESA.
@@ -17,7 +17,7 @@ Formules incluses:
 - Filtres Butterworth
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2025-09-26
 """
 
@@ -30,7 +30,7 @@ def show_math_formulas_window(parent=None):
     """Affiche une fenêtre avec les formules mathématiques utilisées dans CESA."""
     try:
         window = tk.Toplevel(parent) if parent else tk.Tk()
-        window.title("🧮 Formules Mathématiques - CESA v0.0beta1.0")
+        window.title("🧮 Formules Mathématiques - CESA v0.0beta1.1")
         window.geometry("900x700")
 
         # Créer un notebook pour organiser les formules par catégorie

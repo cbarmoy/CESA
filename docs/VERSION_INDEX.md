@@ -1,6 +1,6 @@
 # Index des versions CESA
 
-> **Version actuelle : `0.0beta1.0`**
+> **Version actuelle : `0.0beta1.1`**
 >
 > Ce fichier recense **tous** les emplacements où le numéro de version apparaît dans le projet.
 > Lors d'un bump de version, parcourir cette checklist pour garantir la cohérence.

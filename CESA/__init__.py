@@ -17,12 +17,12 @@ Ce package fournit les utilitaires modulaires utilisés par CESA :
 - user_assistant : Assistant utilisateur et aide contextuelle
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.0
+Version: 0.0beta1.1
 Date: 2026-04-05
 Licence: MIT
 """
 
-__version__ = "0.0beta1.0"
+__version__ = "0.0beta1.1"
 __author__ = "Côme Barmoy (IRBA)"
 __all__ = [
     "filters", "filter_engine", "scoring_io", "theme", "ui_dialogs",

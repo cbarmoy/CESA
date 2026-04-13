@@ -1,7 +1,8 @@
 """Bottom navigation bar: time slider, duration, epoch buttons, shortcuts.
 
 The bar drives the viewer's visible window via Qt signals without any
-knowledge of the rendering internals.
+knowledge of the rendering internals.  Scaling / Layout controls live
+in dedicated dock panels; the nav bar only has toggle buttons for them.
 """
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ class NavigationBar(QtWidgets.QWidget):
         Play/pause toggled (True = playing).
     filter_toggled()
         Global filter toggle requested.
+    normalize_toggled(bool)
+        Normalize toggle.
+    scaling_panel_toggled(bool)
+        Show/hide the Scaling dock panel.
+    layout_panel_toggled(bool)
+        Show/hide the Layout dock panel.
     """
 
     time_changed = QtCore.Signal(float)
@@ -36,6 +43,8 @@ class NavigationBar(QtWidgets.QWidget):
     filter_toggled = QtCore.Signal()
     normalize_toggled = QtCore.Signal(bool)
     time_slider_released = QtCore.Signal()
+    scaling_panel_toggled = QtCore.Signal(bool)
+    layout_panel_toggled = QtCore.Signal(bool)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -83,7 +92,6 @@ class NavigationBar(QtWidgets.QWidget):
         main.setContentsMargins(6, 2, 6, 2)
         main.setSpacing(4)
 
-        # -- Transport buttons --
         btn_style = "QPushButton { padding: 2px 6px; }"
 
         self._btn_home = QtWidgets.QPushButton("\u23EE")
@@ -91,7 +99,7 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_home.setStyleSheet(btn_style)
 
         self._btn_prev_epoch = QtWidgets.QPushButton("\u23EA")
-        self._btn_prev_epoch.setToolTip("Epoch precedente (PgUp pas lineaire, Q grille scoring)")
+        self._btn_prev_epoch.setToolTip("Epoch precedente (PgUp)")
         self._btn_prev_epoch.setStyleSheet(btn_style)
 
         self._btn_prev = QtWidgets.QPushButton("\u25C0")
@@ -108,7 +116,7 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_next.setStyleSheet(btn_style)
 
         self._btn_next_epoch = QtWidgets.QPushButton("\u23E9")
-        self._btn_next_epoch.setToolTip("Epoch suivante (PgDn pas lineaire, D grille scoring)")
+        self._btn_next_epoch.setToolTip("Epoch suivante (PgDn)")
         self._btn_next_epoch.setStyleSheet(btn_style)
 
         self._btn_end = QtWidgets.QPushButton("\u23ED")
@@ -131,7 +139,6 @@ class NavigationBar(QtWidgets.QWidget):
         self._slider.setMaximum(10000)
         self._slider.setSingleStep(10)
         self._slider.setPageStep(300)
-        # Ne pas prendre le focus clavier : sinon les flèches déplacent le slider au lieu du viewer.
         self._slider.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         main.addWidget(self._slider, stretch=1)
 
@@ -174,11 +181,26 @@ class NavigationBar(QtWidgets.QWidget):
         main.addWidget(self._btn_filter)
 
         # -- Normalize toggle --
-        self._btn_normalize = QtWidgets.QPushButton("Normaliser")
+        self._btn_normalize = QtWidgets.QPushButton("N")
         self._btn_normalize.setToolTip("Normaliser les amplitudes (Ctrl+N)")
         self._btn_normalize.setCheckable(True)
         self._btn_normalize.setChecked(False)
+        self._btn_normalize.setFixedWidth(28)
         main.addWidget(self._btn_normalize)
+
+        # -- Scaling panel toggle (opens dock) --
+        self._btn_scaling = QtWidgets.QPushButton("Scaling")
+        self._btn_scaling.setToolTip("Ouvrir/fermer le panneau Scaling")
+        self._btn_scaling.setCheckable(True)
+        self._btn_scaling.setChecked(False)
+        main.addWidget(self._btn_scaling)
+
+        # -- Layout panel toggle (opens dock) --
+        self._btn_layout = QtWidgets.QPushButton("Layout")
+        self._btn_layout.setToolTip("Ouvrir/fermer le panneau Layout")
+        self._btn_layout.setCheckable(True)
+        self._btn_layout.setChecked(False)
+        main.addWidget(self._btn_layout)
 
     def _connect_signals(self) -> None:
         self._slider.valueChanged.connect(self._on_slider)
@@ -195,6 +217,8 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_zoom_out.clicked.connect(self._zoom_out)
         self._btn_filter.clicked.connect(lambda: self.filter_toggled.emit())
         self._btn_normalize.toggled.connect(self.normalize_toggled.emit)
+        self._btn_scaling.toggled.connect(self.scaling_panel_toggled.emit)
+        self._btn_layout.toggled.connect(self.layout_panel_toggled.emit)
 
     # ----- slots --------------------------------------------------------
 
@@ -227,7 +251,6 @@ class NavigationBar(QtWidgets.QWidget):
         self._emit_time(self._current_time + self._epoch_len)
 
     def _jump_prev_scored_epoch(self) -> None:
-        """Début de l'époque de scoring précédente (grille t=0, L=_epoch_len)."""
         L = max(1.0, float(self._epoch_len))
         idx = int(math.floor(self._current_time / L))
         if idx <= 0:
@@ -236,18 +259,15 @@ class NavigationBar(QtWidgets.QWidget):
             self._emit_time(float((idx - 1) * L))
 
     def _jump_next_scored_epoch(self) -> None:
-        """Début de l'époque de scoring suivante (grille t=0, L=_epoch_len)."""
         L = max(1.0, float(self._epoch_len))
         idx = int(math.floor(self._current_time / L))
         self._emit_time(float((idx + 1) * L))
 
     def _step_back_window(self) -> None:
-        """Recule d'une fenêtre visible (aligne avec +/- durée affichée)."""
         step = max(0.5, float(self._duration))
         self._emit_time(max(0.0, self._current_time - step))
 
     def _step_fwd_window(self) -> None:
-        """Avance d'une fenêtre visible."""
         step = max(0.5, float(self._duration))
         self._emit_time(self._current_time + step)
 
@@ -266,12 +286,6 @@ class NavigationBar(QtWidgets.QWidget):
         if new_t >= self._total_duration_s - self._duration:
             self._btn_play.setChecked(False)
             return
-        logger.info(
-            "[VIEWER-CHK-31] navigation play tick new_t=%.4f total=%.4f dur=%.4f",
-            new_t,
-            self._total_duration_s,
-            self._duration,
-        )
         self._emit_time(new_t)
 
     def _zoom_in(self) -> None:
@@ -298,12 +312,23 @@ class NavigationBar(QtWidgets.QWidget):
         sec = int(s % 60)
         self._time_label.setText(f"{h:02d}:{m:02d}:{sec:02d}")
 
+    # ----- public helpers for syncing button state -----------------------
+
+    def set_scaling_button(self, checked: bool) -> None:
+        self._btn_scaling.blockSignals(True)
+        self._btn_scaling.setChecked(checked)
+        self._btn_scaling.blockSignals(False)
+
+    def set_layout_button(self, checked: bool) -> None:
+        self._btn_layout.blockSignals(True)
+        self._btn_layout.setChecked(checked)
+        self._btn_layout.blockSignals(False)
+
     # ----- keyboard shortcuts (forwarded from main window) ---------------
 
     def handle_key_ints(
         self, key: int, mod: QtCore.Qt.KeyboardModifiers,
     ) -> bool:
-        """Traite une touche (sans QKeyEvent) — sûr après QTimer.singleShot depuis le plot."""
         if key == QtCore.Qt.Key.Key_Left:
             self._step_back()
             return True
@@ -338,7 +363,6 @@ class NavigationBar(QtWidgets.QWidget):
             self._btn_normalize.toggle()
             return True
 
-        # AZERTY: Q/D = grille des époques scorer; Z/S = pas = durée fenêtre (ex. ±30s si fenêtre 30s)
         _combo = (
             QtCore.Qt.KeyboardModifier.ControlModifier
             | QtCore.Qt.KeyboardModifier.AltModifier
@@ -362,5 +386,4 @@ class NavigationBar(QtWidgets.QWidget):
         return False
 
     def handle_key(self, event: QtGui.QKeyEvent) -> bool:
-        """Process a key event; return True if handled."""
         return self.handle_key_ints(event.key(), event.modifiers())

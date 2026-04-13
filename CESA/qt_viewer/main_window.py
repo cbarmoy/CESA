@@ -32,8 +32,10 @@ from .events_bar import EventsBar
 from .filter_metrics import count_effective_filter_channels
 from .hypnogram_bar import HypnogramBar
 from .inspection_panel import InspectionPanel
+from .layout_panel import LayoutPanel
 from .ml_overlay import MLOverlayManager
 from .navigation_bar import NavigationBar
+from .scaling_panel import ScalingPanel
 from .report_export import ReportBuilder
 from .smart_navigation import SmartNavWidget
 from .sync_cursor import SyncCursorManager
@@ -236,7 +238,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("CESA (Complex EEG Studio Analysis) v0.0beta1.0")
+        self.setWindowTitle("CESA (Complex EEG Studio Analysis) v0.0beta1.1")
         self.resize(1500, 900)
         self.setMinimumSize(900, 500)
 
@@ -299,6 +301,20 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self._dashboard,
         )
         self._dashboard.setVisible(False)
+
+        # -- Scaling panel (dock) --
+        self._scaling_panel = ScalingPanel(self)
+        self.addDockWidget(
+            QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self._scaling_panel,
+        )
+        self._scaling_panel.setVisible(False)
+
+        # -- Layout panel (dock) --
+        self._layout_panel = LayoutPanel(self)
+        self.addDockWidget(
+            QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self._layout_panel,
+        )
+        self._layout_panel.setVisible(False)
 
         # Central widget layout
         central = QtWidgets.QWidget()
@@ -569,9 +585,37 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._nav.filter_toggled.connect(self._on_filter_toggle)
         self._nav.normalize_toggled.connect(self._on_normalize_toggle)
 
+        # Nav bar toggle buttons -> show/hide dock panels
+        self._nav.scaling_panel_toggled.connect(self._on_scaling_panel_toggled)
+        self._nav.layout_panel_toggled.connect(self._on_layout_panel_toggled)
+
+        # Scaling dock panel signals
+        self._scaling_panel.scaling_toggled.connect(self._on_scaling_toggle_nav)
+        self._scaling_panel.scaling_gain_changed.connect(self._on_scaling_gain)
+        self._scaling_panel.scaling_spacing_changed.connect(self._on_scaling_spacing)
+        self._scaling_panel.scaling_auto_requested.connect(self._on_scaling_auto)
+        self._scaling_panel.scaling_clip_changed.connect(self._on_scaling_clip)
+
+        # Layout dock panel signals
+        self._layout_panel.layout_toggled.connect(self._on_layout_toggle)
+        self._layout_panel.layout_preset_changed.connect(self._on_layout_preset)
+        self._layout_panel.layout_type_multiplier_changed.connect(self._on_layout_type_mult)
+        self._layout_panel.layout_center_changed.connect(self._on_layout_center)
+        self._layout_panel.layout_auto_requested.connect(self._on_layout_auto)
+        self._layout_panel.guides_baselines_changed.connect(self._on_guide_baselines)
+        self._layout_panel.guides_amplitude_changed.connect(self._on_guide_amplitude)
+        self._layout_panel.guides_grid_fine_changed.connect(self._on_guide_grid_fine)
+        self._layout_panel.guides_artifact_changed.connect(self._on_guide_artifact)
+
+        # Keep dock panel visibility in sync when user closes the dock via its X button
+        self._scaling_panel.visibilityChanged.connect(self._on_scaling_dock_visibility)
+        self._layout_panel.visibilityChanged.connect(self._on_layout_dock_visibility)
+
         # Hypnogram click -> navigate
         self._hypno.epoch_clicked.connect(self._on_epoch_clicked)
         self._hypno.epoch_context_stage.connect(self._on_hypno_context_stage)
+        self._hypno.navigate_to.connect(self._on_hypno_navigate)
+        self._hypno.zoom_requested.connect(self._on_hypno_zoom)
 
         # Events bar click -> navigate
         self._events.event_clicked.connect(self._on_event_clicked)
@@ -738,6 +782,21 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         if self._on_navigate:
             self._schedule_tk_navigation_callback(t)
 
+    def _on_hypno_navigate(self, t: float) -> None:
+        dur = self._viewer.duration_s
+        self._viewer.set_time_window(t, dur)
+        self._hypno.set_window(t, dur)
+        self._events.set_time_window(t, dur)
+        self._nav.set_current_time(t)
+        self._smart_nav.set_current_time(t)
+
+    def _on_hypno_zoom(self, new_dur: float) -> None:
+        start = self._viewer.start_s
+        self._viewer.set_time_window(start, new_dur)
+        self._hypno.set_window(start, new_dur)
+        self._events.set_time_window(start, new_dur)
+        self._nav.set_duration(new_dur)
+
     def _on_event_clicked(self, event: dict) -> None:
         onset = float(event.get("onset", 0.0))
         dur = self._viewer.duration_s
@@ -818,6 +877,234 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         else:
             self._viewer.reset_gains()
 
+    # ------------------------------------------------------------------
+    # Panel toggle handlers (nav bar buttons -> dock visibility)
+    # ------------------------------------------------------------------
+
+    def _on_scaling_panel_toggled(self, checked: bool) -> None:
+        self._scaling_panel.setVisible(checked)
+
+    def _on_layout_panel_toggled(self, checked: bool) -> None:
+        self._layout_panel.setVisible(checked)
+
+    def _on_scaling_dock_visibility(self, visible: bool) -> None:
+        self._nav.set_scaling_button(visible)
+
+    def _on_layout_dock_visibility(self, visible: bool) -> None:
+        self._nav.set_layout_button(visible)
+
+    # ------------------------------------------------------------------
+    # Scaling handlers
+    # ------------------------------------------------------------------
+
+    def _apply_scaling(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        self._viewer.apply_scaling(ctrl.scaling, getattr(self, '_channel_types', {}))
+
+    def _on_scaling_toggle_nav(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.scaling.enabled = checked
+        self._apply_scaling()
+        ctrl.save_active_profile()
+
+    def _on_scaling_gain(self, value: float) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.scaling.global_gain = value
+        if ctrl.scaling.enabled:
+            self._apply_scaling()
+
+    def _on_scaling_spacing(self, value: int) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.scaling.spacing_uv = float(value)
+        self._channel_list.spacing_slider.blockSignals(True)
+        self._channel_list.spacing_slider.setValue(value)
+        self._channel_list.spacing_slider.blockSignals(False)
+        self._channel_list.spacing_label.setText(str(value))
+        if ctrl.scaling.enabled:
+            self._apply_scaling()
+
+    def _on_scaling_auto(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ch_types = getattr(self, '_channel_types', {})
+        auto_gains = ctrl.compute_auto_gains(ch_types, ctrl.scaling.spacing_uv)
+        ctrl.scaling.per_channel_gains = auto_gains
+        ctrl.scaling.mode = "auto"
+        ctrl.scaling.enabled = True
+        self._scaling_panel.set_state(
+            enabled=True,
+            gain=ctrl.scaling.global_gain,
+            spacing=int(ctrl.scaling.spacing_uv),
+            clip_on=ctrl.scaling.clipping_enabled,
+            clip_val=ctrl.scaling.clip_value_uv,
+        )
+        self._apply_scaling()
+        ctrl.save_active_profile()
+        self._status.showMessage("Auto-scale applique", 3000)
+
+    def _on_scaling_clip(self, enabled: bool, value: float) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.scaling.clipping_enabled = enabled
+        ctrl.scaling.clip_value_uv = value
+        if ctrl.scaling.enabled:
+            self._apply_scaling()
+
+    def _restore_scaling_state(self) -> None:
+        """Sync scaling dock panel controls with controller state after file open."""
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        sc = ctrl.scaling
+        self._scaling_panel.set_state(
+            enabled=sc.enabled,
+            gain=sc.global_gain,
+            spacing=int(sc.spacing_uv),
+            clip_on=sc.clipping_enabled,
+            clip_val=sc.clip_value_uv,
+        )
+        if sc.enabled:
+            self._apply_scaling()
+
+    # ------------------------------------------------------------------
+    # Layout handlers
+    # ------------------------------------------------------------------
+
+    def _apply_layout(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ch_types = getattr(self, '_channel_types', {})
+        medians = None
+        if ctrl.layout.center_signal:
+            medians = ctrl.compute_signal_medians()
+        self._viewer.apply_layout(ctrl.layout, ch_types, medians)
+
+    def _on_layout_toggle(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.layout.enabled = checked
+        self._apply_layout()
+        ctrl.save_active_profile()
+
+    def _on_layout_preset(self, preset_key: str) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        from CESA.profile_schema import LAYOUT_PRESETS
+        if preset_key == "custom":
+            ctrl.layout.mode = "custom"
+        else:
+            ctrl.layout.apply_preset(preset_key)
+            self._layout_panel.sync_multipliers(ctrl.layout.per_type_spacing_multiplier)
+        if ctrl.layout.enabled:
+            self._apply_layout()
+        ctrl.save_active_profile()
+
+    def _on_layout_type_mult(self, type_key: str, value: float) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.layout.per_type_spacing_multiplier[type_key] = value
+        ctrl.layout.mode = "custom"
+        if ctrl.layout.enabled:
+            self._apply_layout()
+
+    def _on_layout_center(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ctrl.layout.center_signal = checked
+        if ctrl.layout.enabled:
+            self._apply_layout()
+
+    def _on_layout_auto(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        ch_types = getattr(self, '_channel_types', {})
+        result = ctrl.compute_auto_layout(ch_types)
+        ctrl.layout.mode = "auto"
+        ctrl.layout.per_type_spacing_multiplier = result["multipliers"]
+        ctrl.layout.center_signal = result["center"]
+        ctrl.layout.enabled = True
+        self._layout_panel.set_state(
+            enabled=True,
+            mode="auto",
+            multipliers=result["multipliers"],
+            center=result["center"],
+            baselines=ctrl.layout.show_baselines,
+            amp_scale=ctrl.layout.show_amplitude_scale,
+            grid_fine=ctrl.layout.show_grid_fine,
+            artifact=ctrl.layout.show_artifact_highlight,
+        )
+        self._apply_layout()
+        ctrl.save_active_profile()
+        self._status.showMessage(
+            f"Auto-layout applique (contexte: {result['context']})", 3000)
+
+    def _on_guide_baselines(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl:
+            ctrl.layout.show_baselines = checked
+        self._viewer.set_show_baselines(checked)
+
+    def _on_guide_amplitude(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl:
+            ctrl.layout.show_amplitude_scale = checked
+        self._viewer.set_show_amplitude_scale(checked)
+
+    def _on_guide_grid_fine(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl:
+            ctrl.layout.show_grid_fine = checked
+        self._viewer.set_show_grid_fine(checked)
+
+    def _on_guide_artifact(self, checked: bool) -> None:
+        ctrl = self._app_controller
+        if ctrl:
+            ctrl.layout.show_artifact_highlight = checked
+        self._viewer.set_show_artifact_highlight(checked)
+
+    def _restore_layout_state(self) -> None:
+        """Sync layout dock panel controls with controller state after file open."""
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        lc = ctrl.layout
+        self._layout_panel.set_state(
+            enabled=lc.enabled,
+            mode=lc.mode,
+            multipliers=lc.per_type_spacing_multiplier,
+            center=lc.center_signal,
+            baselines=lc.show_baselines,
+            amp_scale=lc.show_amplitude_scale,
+            grid_fine=lc.show_grid_fine,
+            artifact=lc.show_artifact_highlight,
+        )
+        if lc.show_baselines:
+            self._viewer.set_show_baselines(True)
+        if lc.show_amplitude_scale:
+            self._viewer.set_show_amplitude_scale(True)
+        if lc.show_grid_fine:
+            self._viewer.set_show_grid_fine(True)
+        if lc.show_artifact_highlight:
+            self._viewer.set_show_artifact_highlight(True, lc.artifact_threshold_uv)
+        if lc.enabled:
+            self._apply_layout()
+
     def _on_visibility(self) -> None:
         self._viewer.set_visible_channels(self._channel_list.visible_channels())
 
@@ -845,7 +1132,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         f.setBold(True)
         title.setFont(f)
         lay.addWidget(title)
-        has_fn = self._on_request_stage_for_current_epoch is not None
+        self._stage_buttons: List[QtWidgets.QPushButton] = []
         stages = [
             ("W", "Wake (touche 1)"),
             ("N1", "N1 (touche 2)"),
@@ -857,10 +1144,11 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         for st, tip in stages:
             btn = QtWidgets.QPushButton(st)
             btn.setToolTip(tip)
-            btn.setEnabled(has_fn)
+            btn.setEnabled(False)
             btn.setFixedWidth(32)
             btn.clicked.connect(functools.partial(self._invoke_stage_current_epoch, st))
             lay.addWidget(btn)
+            self._stage_buttons.append(btn)
         lay.addStretch(1)
         hint = QtWidgets.QLabel("Clic droit sur l’hypnogramme : autre époque")
         hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -975,10 +1263,14 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self.menuBar().clear()
         self._build_menus()
         self._install_scoring_shortcuts()
+        for btn in getattr(self, "_stage_buttons", []):
+            btn.setEnabled(True)
 
     def _ctrl_stage_current_epoch(self, stage: str) -> None:
         ctrl = self._app_controller
-        if ctrl is None or ctrl.sleep_scoring_data is None:
+        if ctrl is None:
+            return
+        if not ctrl.ensure_scoring_dataframe():
             return
         epoch_idx = int(self._viewer.start_s / self._epoch_len) if self._epoch_len > 0 else 0
         try:
@@ -993,7 +1285,9 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
 
     def _ctrl_stage_at_time(self, onset_s: float, stage: str) -> None:
         ctrl = self._app_controller
-        if ctrl is None or ctrl.sleep_scoring_data is None:
+        if ctrl is None:
+            return
+        if not ctrl.ensure_scoring_dataframe():
             return
         epoch_idx = int(onset_s / self._epoch_len) if self._epoch_len > 0 else 0
         try:
@@ -1107,8 +1401,87 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             )
 
         file_name = _Path(session.file_path).name
-        self.setWindowTitle(f"CESA v0.0beta1.0 - {file_name}")
+        self.setWindowTitle(f"CESA v0.0beta1.1 - {file_name}")
         self._status.showMessage(f"Fichier charge : {file_name}", 5000)
+
+        self._restore_scaling_state()
+        self._restore_layout_state()
+        self._offer_scoring_import(ctrl)
+
+    def _offer_scoring_import(self, ctrl) -> None:
+        """After opening a recording, propose to import a scoring file."""
+        has_embedded = ctrl.has_embedded_scoring()
+
+        if has_embedded:
+            msg = (
+                "Voulez-vous importer un scoring ?\n\n"
+                "  - Oui (Excel) : importer depuis un fichier Excel\n"
+                "  - Oui (EDF+) : utiliser les annotations du fichier charge\n"
+                "  - Non : continuer sans scoring"
+            )
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Importer un scoring ?")
+            box.setText(msg)
+            btn_excel = box.addButton("Oui (Excel)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            btn_edf = box.addButton("Oui (EDF+)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            btn_no = box.addButton("Non", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(btn_excel)
+            box.exec()
+            clicked = box.clickedButton()
+        else:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Importer un scoring ?",
+                "Voulez-vous importer un scoring Excel\n"
+                "pour cet enregistrement ?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            clicked = None
+            btn_excel = None
+            btn_edf = None
+            btn_no = None
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                clicked = btn_excel  # treat as Excel
+            else:
+                return
+
+        if has_embedded and clicked == btn_no:
+            return
+
+        if has_embedded and clicked == btn_edf:
+            if ctrl.import_embedded_scoring():
+                hyp = ctrl.build_hypnogram_tuple()
+                if hyp:
+                    self.set_hypnogram(hyp)
+                self.set_scoring_annotations(ctrl.build_scoring_annotations())
+                n = len(ctrl.sleep_scoring_data)
+                self._status.showMessage(f"Scoring EDF+ importe : {n} epoques", 5000)
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Attention",
+                    "Les annotations de scoring n'ont pas pu etre importees.",
+                )
+            return
+
+        # Excel import path (default)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Importer scoring Excel", "", "Excel (*.xlsx *.xls);;Tous (*.*)",
+        )
+        if not path:
+            return
+        if ctrl.import_scoring_excel(path):
+            hyp = ctrl.build_hypnogram_tuple()
+            if hyp:
+                self.set_hypnogram(hyp)
+            self.set_scoring_annotations(ctrl.build_scoring_annotations())
+            n = len(ctrl.sleep_scoring_data) if ctrl.sleep_scoring_data is not None else 0
+            self._status.showMessage(f"Scoring Excel importe : {n} epoques", 5000)
+        else:
+            QtWidgets.QMessageBox.warning(
+                self, "Erreur", "L'import du scoring Excel a echoue.",
+            )
 
     def _menu_auto_scoring(self) -> None:
         if self._on_request_auto_scoring:
@@ -1178,7 +1551,13 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         if ctrl.import_scoring_excel(path):
-            self._status.showMessage("Scoring Excel importe.", 5000)
+            hyp = ctrl.build_hypnogram_tuple()
+            if hyp:
+                self.set_hypnogram(hyp)
+            self.set_scoring_annotations(ctrl.build_scoring_annotations())
+            self._status.showMessage(
+                f"Scoring Excel importe ({len(ctrl.sleep_scoring_data)} epoques).", 5000,
+            )
         else:
             QtWidgets.QMessageBox.warning(self, "Erreur", "Import du scoring echoue.")
 
@@ -1192,7 +1571,12 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         if ctrl.import_scoring_edf(path):
-            self._status.showMessage("Scoring EDF+ importe.", 5000)
+            hyp = ctrl.build_hypnogram_tuple()
+            if hyp:
+                self.set_hypnogram(hyp)
+            self.set_scoring_annotations(ctrl.build_scoring_annotations())
+            n = len(ctrl.sleep_scoring_data) if ctrl.sleep_scoring_data is not None else 0
+            self._status.showMessage(f"Scoring EDF+ importe ({n} epoques).", 5000)
         else:
             QtWidgets.QMessageBox.warning(self, "Erreur", "Import du scoring echoue.")
 
@@ -1360,7 +1744,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             self,
             "A propos de CESA",
             "<h3>CESA (Complex EEG Studio Analysis)</h3>"
-            "<p>Version 0.0beta1.0</p>"
+            "<p>Version 0.0beta1.1</p>"
             "<p>Auteur: Come Barmoy<br>"
             "Unite Neuropsychologie du Stress - IRBA</p>"
             "<p>Licence: MIT</p>",

@@ -2,7 +2,7 @@
 
 All notable changes to CESA are documented in this file.
 
-## [0.0beta1.0] - 2026-04-05
+## [0.0beta1.1] - 2026-04-05
 
 ### Added
 - **Composable filter engine** (`CESA/filter_engine.py`): typed filter nodes
@@ -42,7 +42,7 @@ All notable changes to CESA are documented in this file.
   report generation, favorites, and annotations.
 
 ### Changed
-- Unified version to **0.0beta1.0** across all modules (`CESA/__init__.py`,
+- Unified version to **0.0beta1.1** across all modules (`CESA/__init__.py`,
   `sleep_pipeline/__init__.py`, `run.py`, `requirements.txt`).
 - `CESA/filters.py` now delegates to `filter_engine.py` while preserving the
   original `apply_filter()` API for backward compatibility.

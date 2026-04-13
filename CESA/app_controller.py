@@ -26,7 +26,7 @@ except ImportError:
 from core.telemetry import telemetry
 from core.raw_loader import open_raw_file, SUPPORTED_RECORDING_EXTENSIONS
 from CESA.profile_store import ProfileStore
-from CESA.profile_schema import DisplayProcessingProfile, SignalSection
+from CESA.profile_schema import DisplayProcessingProfile, LayoutConfig, ScalingConfig, SignalSection
 from CESA.filter_engine import FilterAuditLog, FilterPipeline, pipeline_from_legacy_params
 from CESA.filters import (
     apply_filter as cesa_apply_filter,
@@ -68,8 +68,8 @@ class AppController:
         self.filter_window: str = "hamming"
         self.baseline_correction_enabled: bool = True
         self.baseline_window_duration: float = 30.0
-        self.autoscale_enabled: bool = False
-        self.autoscale_window_duration: float = 30.0
+        self.scaling: ScalingConfig = ScalingConfig()
+        self.layout: LayoutConfig = LayoutConfig()
 
         self.channel_filter_params: Dict[str, Dict[str, float]] = {}
         self.channel_filter_pipelines: Dict[str, FilterPipeline] = {}
@@ -174,6 +174,12 @@ class AppController:
                     self.channel_filter_pipelines[ch] = FilterPipeline.from_dict(pipe_dict)
                 except Exception:
                     pass
+            self.scaling = ScalingConfig.from_dict(
+                p.scaling.to_dict() if isinstance(p.scaling, ScalingConfig) else {}
+            )
+            self.layout = LayoutConfig.from_dict(
+                p.layout.to_dict() if isinstance(p.layout, LayoutConfig) else {}
+            )
         except Exception:
             pass
 
@@ -190,8 +196,110 @@ class AppController:
         p.channel_filter_pipelines = {
             ch: pipe.to_dict() for ch, pipe in self.channel_filter_pipelines.items()
         }
+        p.scaling = ScalingConfig.from_dict(self.scaling.to_dict())
+        p.layout = LayoutConfig.from_dict(self.layout.to_dict())
         self.profile_store.save_profile(p)
         self.profile_store.set_last_profile_name(p.name)
+
+    def compute_auto_gains(
+        self,
+        channel_types: Dict[str, str],
+        target_spacing: float = 0.0,
+    ) -> Dict[str, float]:
+        """Compute per-channel gains so that each channel fills ~40% of spacing.
+
+        Uses the 98th percentile of absolute amplitude over the full
+        recording for robust estimation.  Returns ``{channel: gain}``.
+        """
+        spacing = target_spacing or self.scaling.spacing_uv
+        target_half = spacing * 0.4
+        gains: Dict[str, float] = {}
+        for ch_name, arr in self.derivations.items():
+            if arr.size < 2:
+                continue
+            step = max(1, arr.size // 200_000)
+            sub = arr[::step]
+            p98 = float(np.percentile(np.abs(sub), 98))
+            if p98 < 1e-9:
+                continue
+            g = target_half / p98
+            gains[ch_name] = max(0.01, min(g, 1e6))
+        return gains
+
+    def compute_signal_medians(self) -> Dict[str, float]:
+        """Compute per-channel median for DC-offset centering.
+
+        Returns ``{channel: median_uv}`` using subsampled data for speed.
+        """
+        medians: Dict[str, float] = {}
+        for ch_name, arr in self.derivations.items():
+            if arr.size < 2:
+                continue
+            step = max(1, arr.size // 200_000)
+            sub = arr[::step]
+            medians[ch_name] = float(np.median(sub))
+        return medians
+
+    def compute_auto_layout(
+        self,
+        channel_types: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Analyze channels and compute optimal layout multipliers.
+
+        Returns a dict with keys ``multipliers``, ``center``, ``context``
+        that can be applied to a ``LayoutConfig``.
+        """
+        type_counts: Dict[str, int] = {}
+        type_amplitudes: Dict[str, List[float]] = {}
+
+        for ch_name, arr in self.derivations.items():
+            if arr.size < 2:
+                continue
+            ch_type = channel_types.get(ch_name, "eeg")
+            type_counts[ch_type] = type_counts.get(ch_type, 0) + 1
+            step = max(1, arr.size // 200_000)
+            sub = arr[::step]
+            p95 = float(np.percentile(np.abs(sub), 95))
+            type_amplitudes.setdefault(ch_type, []).append(p95)
+
+        nb_eeg = type_counts.get("eeg", 0)
+        nb_emg = type_counts.get("emg", 0)
+        nb_ecg = type_counts.get("ecg", 0)
+
+        if nb_eeg >= 4:
+            context = "eeg_detailed"
+        elif nb_emg >= 2:
+            context = "muscle_focus"
+        else:
+            context = "balanced"
+
+        base = {"eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0}
+        if context == "eeg_detailed":
+            base = {"eeg": 1.6, "eog": 1.2, "emg": 0.5, "ecg": 0.4}
+        elif context == "muscle_focus":
+            base = {"eeg": 1.2, "eog": 1.0, "emg": 0.8, "ecg": 0.5}
+        else:
+            base = {"eeg": 1.3, "eog": 1.0, "emg": 0.6, "ecg": 0.5}
+
+        ref_amp = 50.0
+        for sig_type, amps in type_amplitudes.items():
+            if not amps:
+                continue
+            mean_amp = sum(amps) / len(amps)
+            if mean_amp < 1e-3:
+                continue
+            ratio = ref_amp / mean_amp
+            ratio = max(0.3, min(ratio, 2.0))
+            base[sig_type] = base.get(sig_type, 1.0) * ratio
+
+        for k in base:
+            base[k] = round(max(0.1, min(base[k], 3.0)), 2)
+
+        return {
+            "multipliers": base,
+            "center": True,
+            "context": context,
+        }
 
     # ------------------------------------------------------------------
     # Recording loading
@@ -343,6 +451,63 @@ class AppController:
 
     def build_viewer_filter_pipelines(self) -> Dict[str, FilterPipeline]:
         return dict(self.channel_filter_pipelines)
+
+    def has_embedded_scoring(self) -> bool:
+        """Check if the loaded EDF+ file contains sleep stage annotations."""
+        if self.raw is None:
+            return False
+        try:
+            ann = self.raw.annotations
+            if ann is None or len(ann) == 0:
+                return False
+            return any("Sleep stage" in str(d) for d in ann.description)
+        except Exception:
+            return False
+
+    def import_embedded_scoring(self) -> bool:
+        """Extract sleep scoring from the loaded EDF+'s own annotations."""
+        if self.raw is None:
+            return False
+        try:
+            from CESA.scoring_io import import_edf_hypnogram
+            abs_start = None
+            if self.raw.info.get("meas_date"):
+                abs_start = pd.Timestamp(self.raw.info["meas_date"])
+            df = import_edf_hypnogram(
+                self.edf_path,
+                recording_duration_s=self.total_duration_s,
+                epoch_seconds=self.scoring_epoch_duration,
+                absolute_start_datetime=abs_start,
+            )
+            if df is not None and not df.empty:
+                self.sleep_scoring_data = df
+                self.manual_scoring_data = df.copy()
+                self.scoring_dirty = False
+                logger.info("[SCORING] Imported embedded scoring: %d epochs", len(df))
+                return True
+        except Exception as exc:
+            logger.error("Embedded scoring import failed: %s", exc, exc_info=True)
+        return False
+
+    def ensure_scoring_dataframe(self) -> bool:
+        """Create a blank scoring DataFrame (all 'U') if none exists yet.
+
+        Returns True if a DataFrame is available after the call.
+        """
+        if self.sleep_scoring_data is not None and not self.sleep_scoring_data.empty:
+            return True
+        if self.raw is None or self.total_duration_s <= 0:
+            return False
+        epoch_len = self.scoring_epoch_duration
+        n_epochs = int(np.ceil(self.total_duration_s / epoch_len))
+        times = np.arange(n_epochs) * epoch_len
+        self.sleep_scoring_data = pd.DataFrame({
+            "time": times,
+            "stage": ["U"] * n_epochs,
+        })
+        self.scoring_dirty = True
+        logger.info("[SCORING] Created blank scoring: %d epochs of %.0f s", n_epochs, epoch_len)
+        return True
 
     def build_hypnogram_tuple(self) -> Optional[Tuple[List[str], float]]:
         """Return ``(labels, epoch_len)`` or None."""
@@ -515,29 +680,49 @@ class AppController:
             return []
 
     def import_scoring_excel(self, path: str) -> bool:
-        """Import scoring from an Excel file."""
+        """Import scoring from an Excel file and apply it as the active scoring."""
         try:
             from CESA.scoring_io import import_excel_scoring
-            df = import_excel_scoring(pd.read_excel(path))
+            abs_start = None
+            if self.raw is not None and self.raw.info.get("meas_date"):
+                abs_start = pd.Timestamp(self.raw.info["meas_date"])
+            df = import_excel_scoring(
+                pd.read_excel(path),
+                absolute_start_datetime=abs_start,
+                epoch_seconds=self.scoring_epoch_duration,
+                recording_duration_s=self.total_duration_s,
+            )
             if df is not None and not df.empty:
                 self.manual_scoring_data = df
+                self.sleep_scoring_data = df.copy()
                 self.scoring_dirty = True
+                logger.info("[SCORING] Imported Excel scoring: %d epochs from %s", len(df), path)
                 return True
         except Exception as exc:
-            logger.error("Excel scoring import failed: %s", exc)
+            logger.error("Excel scoring import failed: %s", exc, exc_info=True)
         return False
 
     def import_scoring_edf(self, path: str) -> bool:
-        """Import hypnogram from EDF+ annotations."""
+        """Import hypnogram from EDF+ annotations and apply it as the active scoring."""
         try:
             from CESA.scoring_io import import_edf_hypnogram
-            df = import_edf_hypnogram(path)
+            abs_start = None
+            if self.raw is not None and self.raw.info.get("meas_date"):
+                abs_start = pd.Timestamp(self.raw.info["meas_date"])
+            df = import_edf_hypnogram(
+                path,
+                recording_duration_s=self.total_duration_s,
+                epoch_seconds=self.scoring_epoch_duration,
+                absolute_start_datetime=abs_start,
+            )
             if df is not None and not df.empty:
                 self.manual_scoring_data = df
+                self.sleep_scoring_data = df.copy()
                 self.scoring_dirty = True
+                logger.info("[SCORING] Imported EDF scoring: %d epochs from %s", len(df), path)
                 return True
         except Exception as exc:
-            logger.error("EDF scoring import failed: %s", exc)
+            logger.error("EDF scoring import failed: %s", exc, exc_info=True)
         return False
 
     # ------------------------------------------------------------------

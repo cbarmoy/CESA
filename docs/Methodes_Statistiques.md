@@ -162,5 +162,5 @@ Le script détecte `os.cpu_count()` et répartit les tests sur plusieurs workers
 
 ---
 
-*CESA – méthodes statistiques & indicateurs (pré-release 0.0beta1.0)*
+*CESA – méthodes statistiques & indicateurs (pré-release 0.0beta1.1)*
 

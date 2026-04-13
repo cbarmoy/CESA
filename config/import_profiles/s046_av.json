@@ -1,0 +1,699 @@
+{
+  "profile_name": "S046_Av",
+  "global_filter_enabled": true,
+  "channels": [
+    {
+      "name": "1",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "1 Imp?dance",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "1-2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "1-F",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "2 Imp?dance",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "2-F",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Abdomen CaL",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Abdomen",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Activity",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "X Axis",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Y Axis",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Z Axis",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "C3",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "C3 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "C3-M2",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": true,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "C4",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "C4 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "C4-M1",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "E1",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "E1 Imp?dance",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "E1-M2",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 10.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "E2",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "E2 Imp?dance",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "E2-M1",
+      "alias": "",
+      "signal_type": "eog",
+      "gain": 200.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.3,
+            "high_hz": 10.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ECG",
+      "alias": "",
+      "signal_type": "ecg",
+      "gain": 500.0,
+      "selected": true
+    },
+    {
+      "name": "ECG Imp?dance",
+      "alias": "",
+      "signal_type": "ecg",
+      "gain": 500.0,
+      "selected": false
+    },
+    {
+      "name": "F",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "F Imp?dance",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "F3",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "F3 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "F3-M2",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "F4",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "F4 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "F4-M1",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "Airflow",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "RIP Flow Cal",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "RIP Flow",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Resp Rate",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Fr?quence cardia",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Heart Rate",
+      "alias": "",
+      "signal_type": "ecg",
+      "gain": 500.0,
+      "selected": false
+    },
+    {
+      "name": "Inductance Abdom",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Inductance Thora",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Right Leg",
+      "alias": "",
+      "signal_type": "emg",
+      "gain": 50.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 10.0,
+            "high_hz": 100.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Jambe droite Imp",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Left Leg",
+      "alias": "",
+      "signal_type": "emg",
+      "gain": 50.0,
+      "selected": false
+    },
+    {
+      "name": "Jambe gauche Imp",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "K",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Flow Limitation",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Light",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "M1",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "M1 Imp?dance",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "M1M2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "M2",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "M2 Imp?dance",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Elevation",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "O1",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "O1 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "O1-M2",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": true,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "O2",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "O2 Imp?dance",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false
+    },
+    {
+      "name": "O2-M1",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": false,
+      "filter_pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 70.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "RIP-Phase",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Pulse Waveform",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "PosAngle",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Pulse",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Nasal Pressure",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "PTT",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "PWA",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Snoring",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "RIP Sum Cal",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "RIP Sum",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Saturation",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "SpO2 B-B",
+      "alias": "",
+      "signal_type": "eeg",
+      "gain": 150.0,
+      "selected": true
+    },
+    {
+      "name": "Thermocouple",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Chest",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Voltage (battery",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Voltage (bluetoo",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Voltage (core)",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Volume audio",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    },
+    {
+      "name": "Audio Volume dB",
+      "alias": "",
+      "signal_type": "other",
+      "gain": 200.0,
+      "selected": false
+    }
+  ]
+}

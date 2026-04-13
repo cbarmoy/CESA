@@ -1,5 +1,5 @@
 """
-CESA v0.0beta1.0 - PSG Multi-Subplot Viewer
+CESA v0.0beta1.1 - PSG Multi-Subplot Viewer
 ====================================
 
 Modulaire, indépendant de Tkinter, ce module fournit une classe `PSGPlotter`

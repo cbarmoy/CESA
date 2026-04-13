@@ -232,6 +232,59 @@
           }
         ]
       }
+    },
+    {
+      "name": "EMG Jambe (PLM / Mouvements)",
+      "description": "Leg EMG for PLM detection (AASM): bandpass 10-100 Hz + 50 Hz notch. Optimise pour detecter les mouvements periodiques des jambes pendant le sommeil.",
+      "channel_type": "emg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 10.0,
+            "high_hz": 100.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "EMG Jambe - Mouvement simple",
+      "description": "Leg EMG simplifie: highpass 10 Hz + notch 50 Hz. Detection binaire mouvement/repos pour scoring.",
+      "channel_type": "emg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "HighpassFilter",
+            "enabled": true,
+            "cutoff_hz": 10.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          },
+          {
+            "type": "NotchFilter",
+            "enabled": true,
+            "freq_hz": 50.0,
+            "quality_factor": 30.0,
+            "harmonics": 1
+          }
+        ]
+      }
     }
   ]
 }
