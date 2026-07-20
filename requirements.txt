@@ -10,7 +10,7 @@
 
 # Main EEG processing and analysis
 mne>=1.4.0              # EDF+ support, source analysis, connectivity
-numpy>=1.21.0           # High-performance numerical computing
+numpy>=2.4.4           # High-performance numerical computing
 scipy>=1.7.0            # Signal processing, statistics (ANOVA, ADF)
 matplotlib>=3.5.0       # Visualization and plotting
 pandas>=1.3.0           # Data manipulation and scoring
