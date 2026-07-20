@@ -21,7 +21,7 @@ openpyxl>=3.0.0             # Excel file writing (.xlsx)
 yasa>=0.6.0                 # Automatic sleep scoring
 # PFTSleep (git) impose torch==2.3.1 ; pas de roues torch 2.3.x pour Python 3.13+ -> PFTSleep exclu sur 3.13+.
 torch==2.3.1; python_version < "3.13"
-torch>=2.1.0; python_version >= "3.13"
+torch>=2.11.0; python_version >= "3.13"
 braindecode>=1.2.0,<1.3.0; python_version < "3.11"   # Python 3.10 compatible
 braindecode>=1.3.0; python_version >= "3.11"         # Official USleep model implementation
 git+https://github.com/benmfox/PFTSleep.git; python_version < "3.13"  # PFTSleep (scoring DL) ; installez à part sur 3.13+
