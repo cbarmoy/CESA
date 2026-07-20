@@ -110,6 +110,7 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._plot.showGrid(x=True, y=False, alpha=0.15)
         self._plot.setMouseEnabled(x=True, y=False)
         self._plot.hideAxis("left")
+        self._plot.hideAxis("bottom")  # horodatage is on the scoring band below
         self._plot.setClipToView(True)
         self._plot.setDownsampling(mode="peak")
 
@@ -124,6 +125,10 @@ class EEGViewerWidget(QtWidgets.QWidget):
 
         # Epoch grid lines (managed pool)
         self._epoch_lines: List[pg.InfiniteLine] = []
+
+        # Named temporal markers (vertical labelled lines)
+        self._temporal_markers: List[Dict[str, Any]] = []
+        self._marker_lines: List[pg.InfiniteLine] = []
 
         # Epoch highlight (30s background rect for current epoch)
         self._epoch_highlight = pg.LinearRegionItem(
@@ -240,10 +245,16 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._refresh_view()
 
     def reset_gains(self) -> None:
-        """Reset all channel gains to 1.0."""
-        for strip in self._strips.values():
-            strip.set_gain(1.0)
+        """Reset gains to type defaults (ECG stays attenuated)."""
+        for name, strip in self._strips.items():
+            ch_type = self._channel_types.get(name, "eeg")
+            strip.set_gain(self._DEFAULT_TYPE_GAINS.get(ch_type, 1.0))
         self._refresh_view()
+
+    # Clinical defaults: ECG is mV-scale, EEG is µV-scale.
+    _DEFAULT_TYPE_GAINS = {
+        "eeg": 1.0, "eog": 1.0, "emg": 0.5, "ecg": 0.05,
+    }
 
     def apply_scaling(
         self,
@@ -254,31 +265,44 @@ class EEGViewerWidget(QtWidgets.QWidget):
 
         Effective gain per channel =
             global_gain * per_type_gain[type] * per_channel_gain.get(ch, 1.0)
+
+        Type gains (especially ECG attenuation) are always applied — even when
+        the scaling panel is "disabled" — otherwise ECG at 1:1 µV scale hides
+        every other channel.
         """
-        if not config.enabled:
-            for strip in self._strips.values():
-                strip.set_gain(1.0)
-                strip.set_clip(False)
-            if abs(self._spacing - config.spacing_uv) > 0.1:
-                self.set_spacing(config.spacing_uv)
-            else:
-                self._refresh_view()
-            return
+        per_type = dict(self._DEFAULT_TYPE_GAINS)
+        per_type.update(config.per_type_gains or {})
+        # Legacy profiles may still store ecg=1.0; force a safe default.
+        if float(per_type.get("ecg", 1.0)) >= 0.99:
+            per_type["ecg"] = self._DEFAULT_TYPE_GAINS["ecg"]
+        if float(per_type.get("emg", 1.0)) >= 0.99:
+            per_type["emg"] = self._DEFAULT_TYPE_GAINS["emg"]
 
         if abs(self._spacing - config.spacing_uv) > 0.1:
             self._spacing = max(10.0, config.spacing_uv)
             self._recompute_offsets()
 
-        per_type = config.per_type_gains or {}
         per_ch = config.per_channel_gains or {}
-        g_global = config.global_gain
+        g_global = float(config.global_gain) if config.enabled else 1.0
 
         for name, strip in self._strips.items():
             ch_type = channel_types.get(name, "eeg")
-            type_gain = per_type.get(ch_type, 1.0)
-            ch_gain = per_ch.get(name, 1.0)
-            effective = g_global * type_gain * ch_gain
-            strip.set_gain(max(0.01, effective))
+            type_gain = float(per_type.get(ch_type, 1.0))
+            if name in per_ch and config.enabled:
+                ch_gain = float(per_ch[name])
+                # Auto-gains for ECG are already amplitude-aware; don't also
+                # multiply by the strong type attenuation (would crush them).
+                # But if a per-channel gain looks like a forgotten default
+                # (>= 0.3 on ECG), fall back to type attenuation.
+                if ch_type == "ecg" and ch_gain >= 0.3:
+                    effective = g_global * type_gain
+                elif ch_type in ("ecg", "emg"):
+                    effective = g_global * ch_gain
+                else:
+                    effective = g_global * type_gain * ch_gain
+            else:
+                effective = g_global * type_gain
+            strip.set_gain(max(0.001, effective))
             strip.set_clip(config.clipping_enabled, config.clip_value_uv)
 
         self._refresh_view()
@@ -312,6 +336,37 @@ class EEGViewerWidget(QtWidgets.QWidget):
         for strip in self._strips.values():
             strip.set_show_baseline(show)
         self._refresh_view()
+
+    def set_temporal_markers(self, markers: List[Dict[str, Any]]) -> None:
+        """Set named temporal markers (each: ``{position, description, color}``)."""
+        self._temporal_markers = list(markers or [])
+        self._update_markers()
+
+    def _update_markers(self) -> None:
+        for line in self._marker_lines:
+            self._plot.removeItem(line)
+        self._marker_lines.clear()
+        start = self._start_s
+        end = start + self._duration_s
+        for m in self._temporal_markers:
+            try:
+                pos = float(m.get("position", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if pos < start - 1e-6 or pos > end + 1e-6:
+                continue
+            color = m.get("color", "#f9e2af")
+            label = str(m.get("description", ""))
+            line = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen(color, width=1.5, style=QtCore.Qt.PenStyle.SolidLine),
+                label=label or None,
+                labelOpts={"position": 0.92, "color": color, "movable": False},
+            )
+            line.setValue(pos)
+            line.setZValue(-5)
+            self._plot.addItem(line, ignoreBounds=True)
+            self._marker_lines.append(line)
 
     def set_show_amplitude_scale(self, show: bool) -> None:
         self._show_amplitude_scale = show
@@ -518,6 +573,10 @@ class EEGViewerWidget(QtWidgets.QWidget):
             strip.set_filter_enabled(self._global_filter)
             strip.set_show_baseline(self._show_baselines)
             strip.set_show_amplitude_scale(self._show_amplitude_scale)
+            # Immediate type attenuation so ECG never flashes at 1:1 before
+            # the scaling panel state is restored.
+            strip.set_gain(self._DEFAULT_TYPE_GAINS.get(ch_type, 1.0))
+            strip.set_lane_half_height(self._spacing * 0.48)
 
             self._strips[name] = strip
 
@@ -543,12 +602,18 @@ class EEGViewerWidget(QtWidgets.QWidget):
             ch_type = self._channel_types.get(name, "eeg")
             if layout and layout.enabled:
                 mult = layout.per_type_spacing_multiplier.get(ch_type, 1.0)
+                # Legacy auto-layout shrank ECG lanes to ~0.12 — bump the
+                # floor so soft-clip has a usable half-height.
+                if ch_type in ("ecg", "emg"):
+                    mult = max(mult, 0.5)
                 custom = layout.per_channel_offset.get(name, 0.0)
             else:
                 mult = 1.0
                 custom = 0.0
+            lane = self._spacing * mult
             strip.set_y_offset(-(cumulative + custom))
-            cumulative += self._spacing * mult
+            strip.set_lane_half_height(lane * 0.48)
+            cumulative += lane
             n_visible += 1
         if n_visible > 0:
             self._plot.setYRange(
@@ -567,6 +632,8 @@ class EEGViewerWidget(QtWidgets.QWidget):
             self._update_fine_grid()
         if self._show_artifact_highlight:
             self._update_artifact_highlights()
+        if self._temporal_markers:
+            self._update_markers()
 
         # Update annotation overlay
         if self._annotation_overlay is not None:

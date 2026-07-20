@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import logging
 
 import numpy as np
+
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 from scipy.signal import find_peaks, welch
 
 try:  # pragma: no cover - optionnel pour les tests
@@ -413,8 +415,8 @@ def _compute_frequency_powers(rr: np.ndarray, cfg: HRVConfig) -> Dict[str, float
 
     lf_mask = (freqs >= cfg.lf_band[0]) & (freqs < cfg.lf_band[1])
     hf_mask = (freqs >= cfg.hf_band[0]) & (freqs < cfg.hf_band[1])
-    lf_power = float(np.trapz(pxx[lf_mask], freqs[lf_mask])) if np.any(lf_mask) else np.nan
-    hf_power = float(np.trapz(pxx[hf_mask], freqs[hf_mask])) if np.any(hf_mask) else np.nan
+    lf_power = float(_trapz(pxx[lf_mask], freqs[lf_mask])) if np.any(lf_mask) else np.nan
+    hf_power = float(_trapz(pxx[hf_mask], freqs[hf_mask])) if np.any(hf_mask) else np.nan
     lf_hf = float(lf_power / hf_power) if (hf_power and not np.isnan(hf_power) and hf_power > 0) else np.nan
     return {"lf": lf_power, "hf": hf_power, "lf_hf": lf_hf}
 

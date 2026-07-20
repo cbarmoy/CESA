@@ -1,4 +1,4 @@
-# CESA 0.0beta1.1 - Requirements
+# CESA 0.0beta2.0 - Requirements
 # ===============================
 #
 # Core scientific libraries for EEG/PSG analysis.

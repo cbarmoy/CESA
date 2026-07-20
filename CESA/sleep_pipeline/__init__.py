@@ -12,4 +12,4 @@ evaluation     Accuracy, Cohen's kappa, confusion matrix, per-stage metrics
 transition     Bridge between legacy CESA scoring and this pipeline
 """
 
-__version__ = "0.0beta1.1"
+__version__ = "0.0beta2.0"

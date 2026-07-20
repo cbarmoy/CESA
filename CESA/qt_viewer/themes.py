@@ -121,7 +121,7 @@ CHANNEL_TYPE_COLORS: Dict[str, str] = {
 
 
 _STAGE_ALIASES: Dict[str, str] = {
-    "W": "W", "WAKE": "W", "EVEIL": "W", "AWAKE": "W", "0": "W",
+    "W": "W", "WK": "W", "WAKE": "W", "EVEIL": "W", "AWAKE": "W", "0": "W",
     "WAKEFULNESS": "W", "WACH": "W", "VEILLE": "W",
     "N1": "N1", "NREM1": "N1", "S1": "N1", "STAGE1": "N1", "1": "N1",
     "STADE1": "N1", "LEGER": "N1",
@@ -163,6 +163,33 @@ def stage_color(theme: ThemePalette, stage: str) -> str:
     canonical = normalize_stage(stage)
     key = f"stage_{canonical}"
     return theme.get(key, theme.get("stage_U", "#888888"))
+
+
+_STAGE_DISPLAY = {
+    "W": "Eveil",
+    "N1": "N1",
+    "N2": "N2",
+    "N3": "N3",
+    "R": "REM",
+    "U": "Inconnu",
+}
+
+
+def stage_display_name(stage: str) -> str:
+    """Human-readable French label for a sleep stage code."""
+    canonical = normalize_stage(stage)
+    return _STAGE_DISPLAY.get(canonical, canonical)
+
+
+def stage_badge_stylesheet(theme: ThemePalette, stage: str) -> str:
+    """Return a high-contrast badge style for the current sleep stage."""
+    canonical = normalize_stage(stage)
+    bg = stage_color(theme, canonical)
+    fg = "#111111" if canonical in ("W", "N1", "N2") else "#FFFFFF"
+    return (
+        f"background-color: {bg}; color: {fg}; font-weight: bold;"
+        " padding: 2px 8px; border-radius: 4px;"
+    )
 
 
 def event_color(theme: ThemePalette, event_type: str) -> str:

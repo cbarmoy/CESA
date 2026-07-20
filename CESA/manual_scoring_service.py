@@ -10,7 +10,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from CESA.scoring_io import import_edf_hypnogram, import_excel_scoring
+from CESA.scoring_io import (
+    import_edf_hypnogram,
+    import_excel_scoring,
+    import_scoring_json_with_meta,
+    import_scoring_table,
+    read_scoring_csv_metadata,
+    _is_calendar_datetime_series,
+    _is_cesa_native_format,
+)
 
 
 @dataclass
@@ -19,6 +27,8 @@ class ManualScoringResult:
 
     df: pd.DataFrame
     epoch_seconds: float
+    night_start_s: Optional[float] = None
+    night_end_s: Optional[float] = None
 
 
 class ManualScoringService:
@@ -26,21 +36,28 @@ class ManualScoringService:
 
     STAGE_MAP = {
         "w": "W",
+        "wk": "W",
+        "0": "W",
         "wake": "W",
         "eveil": "W",
         "eveil": "W",
         "e\u0301veil": "W",
         "veille": "W",
         "n1": "N1",
+        "1": "N1",
         "n2": "N2",
+        "2": "N2",
         "n3": "N3",
+        "3": "N3",
         "n4": "N3",
         "sws": "N3",
         "slow wave": "N3",
         "r": "R",
+        "4": "R",
         "rem": "R",
         "paradoxal": "R",
         "u": "U",
+        "5": "U",
         "unk": "U",
         "unknown": "U",
         "artefact": "U",
@@ -52,7 +69,7 @@ class ManualScoringService:
     ALLOWED_STAGES = {"W", "N1", "N2", "N3", "R", "U"}
 
     @classmethod
-    def import_excel_path(
+    def import_file_path(
         cls,
         file_path: str,
         *,
@@ -60,31 +77,69 @@ class ManualScoringService:
         recording_duration_s: float,
         default_epoch_seconds: float = 30.0,
     ) -> ManualScoringResult:
+        """Import scoring from CSV, Excel, or JSON."""
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            df, meta = import_scoring_json_with_meta(
+                path,
+                epoch_seconds=float(default_epoch_seconds),
+                recording_duration_s=float(recording_duration_s),
+            )
+            out = cls.validate(df)
+            epoch = cls.infer_epoch_seconds(out, default=float(default_epoch_seconds))
+            if meta.epoch_seconds is not None:
+                epoch = float(meta.epoch_seconds)
+            out = cls.fill_undefined(
+                out,
+                recording_duration_s=float(recording_duration_s),
+                epoch_seconds=float(epoch),
+            )
+            return ManualScoringResult(
+                df=out,
+                epoch_seconds=float(epoch),
+                night_start_s=meta.night_start_s,
+                night_end_s=meta.night_end_s,
+            )
+
+        meta = read_scoring_csv_metadata(path) if suffix == ".csv" else None
         raw = cls._read_table(file_path)
-        stage_col, time_col = cls._detect_columns(raw)
-        work = raw[[stage_col, time_col]].copy()
-        work.columns = ["stage", "time_like"]
-        work = work.dropna(subset=["stage", "time_like"]).reset_index(drop=True)
 
-        stage_norm = work["stage"].map(cls._normalize_stage)
-        stage_norm = stage_norm.fillna("U")
-
-        as_datetime = pd.to_datetime(work["time_like"], errors="coerce")
-        datetime_ratio = float(as_datetime.notna().mean()) if len(as_datetime) else 0.0
-
-        if datetime_ratio >= 0.7:
-            tmp = pd.DataFrame({"stage": stage_norm, "datetime": as_datetime}).dropna(subset=["datetime"])
-            if len(tmp) == 0:
-                raise ValueError("Aucune date/heure valide dans le fichier de scoring.")
-            df_time = import_excel_scoring(
-                tmp,
+        if _is_cesa_native_format(raw):
+            df_time = import_scoring_table(
+                raw,
                 absolute_start_datetime=absolute_start_datetime,
                 epoch_seconds=float(default_epoch_seconds),
+                recording_duration_s=float(recording_duration_s),
             )
-            out = pd.DataFrame({"time": df_time["time"].to_numpy(float), "stage": tmp["stage"].to_numpy(str)})
+            out = df_time[["time", "stage"]].copy()
         else:
-            times = pd.to_numeric(work["time_like"], errors="coerce")
-            out = pd.DataFrame({"time": times, "stage": stage_norm}).dropna(subset=["time"])
+            stage_col, time_col = cls._detect_columns(raw)
+            work = raw[[stage_col, time_col]].copy()
+            work.columns = ["stage", "time_like"]
+            work = work.dropna(subset=["stage", "time_like"]).reset_index(drop=True)
+            work = work[~work["stage"].map(cls._is_garbage_stage)].reset_index(drop=True)
+
+            stage_norm = work["stage"].map(cls._normalize_stage)
+            stage_norm = stage_norm.fillna("U")
+
+            if _is_calendar_datetime_series(work["time_like"]):
+                tmp = pd.DataFrame({
+                    "stage": stage_norm,
+                    "datetime": pd.to_datetime(work["time_like"], errors="coerce"),
+                }).dropna(subset=["datetime"])
+                if len(tmp) == 0:
+                    raise ValueError("Aucune date/heure valide dans le fichier de scoring.")
+                df_time = import_excel_scoring(
+                    tmp,
+                    absolute_start_datetime=absolute_start_datetime,
+                    epoch_seconds=float(default_epoch_seconds),
+                    recording_duration_s=float(recording_duration_s),
+                )
+                out = df_time[["time", "stage"]].copy()
+            else:
+                times = pd.to_numeric(work["time_like"], errors="coerce")
+                out = pd.DataFrame({"time": times, "stage": stage_norm}).dropna(subset=["time"])
 
         out = cls.validate(out)
         epoch = cls.infer_epoch_seconds(out, default=float(default_epoch_seconds))
@@ -93,7 +148,33 @@ class ManualScoringService:
             recording_duration_s=float(recording_duration_s),
             epoch_seconds=float(epoch),
         )
-        return ManualScoringResult(df=out, epoch_seconds=float(epoch))
+        night_start_s = meta.night_start_s if meta is not None else None
+        night_end_s = meta.night_end_s if meta is not None else None
+        if meta is not None and meta.epoch_seconds is not None:
+            epoch = float(meta.epoch_seconds)
+        return ManualScoringResult(
+            df=out,
+            epoch_seconds=float(epoch),
+            night_start_s=night_start_s,
+            night_end_s=night_end_s,
+        )
+
+    @classmethod
+    def import_excel_path(
+        cls,
+        file_path: str,
+        *,
+        absolute_start_datetime: Optional[pd.Timestamp],
+        recording_duration_s: float,
+        default_epoch_seconds: float = 30.0,
+    ) -> ManualScoringResult:
+        """Backward-compatible alias for :meth:`import_file_path`."""
+        return cls.import_file_path(
+            file_path,
+            absolute_start_datetime=absolute_start_datetime,
+            recording_duration_s=recording_duration_s,
+            default_epoch_seconds=default_epoch_seconds,
+        )
 
     @classmethod
     def import_edf_path(
@@ -206,12 +287,13 @@ class ManualScoringService:
 
     @classmethod
     def _normalize_stage(cls, value: object) -> str:
-        raw = str(value).strip().upper()
-        if raw in cls.ALLOWED_STAGES:
-            return raw
-        low = str(value).strip().lower()
-        mapped = cls.STAGE_MAP.get(low)
-        return mapped if mapped is not None else "U"
+        from CESA.scoring_io import _normalize_stage_label
+        return _normalize_stage_label(value)
+
+    @staticmethod
+    def _is_garbage_stage(value: object) -> bool:
+        text = str(value).strip()
+        return not text or text in ("[]", "nan", "None", "?")
 
     @staticmethod
     def _read_table(file_path: str) -> pd.DataFrame:
@@ -220,7 +302,25 @@ class ManualScoringService:
             raise FileNotFoundError(f"Fichier introuvable: {file_path}")
         suffix = path.suffix.lower()
         if suffix == ".csv":
-            return pd.read_csv(str(path), encoding="utf-8")
+            # Tolerate frequent French CSV variants (encoding + separator).
+            read_errors: list[str] = []
+            for encoding in ("utf-8", "cp1252", "latin-1"):
+                try:
+                    return pd.read_csv(
+                        str(path),
+                        sep=None,
+                        engine="python",
+                        encoding=encoding,
+                        comment="#",
+                    )
+                except Exception as exc:
+                    read_errors.append(f"{encoding}: {exc}")
+            raise ValueError(
+                "Impossible de lire le CSV. Vérifiez le séparateur et l'encodage. "
+                + " | ".join(read_errors)
+            )
         if suffix in {".xls", ".xlsx"}:
             return pd.read_excel(str(path))
-        raise ValueError("Format non supporte. Utilisez CSV, XLS ou XLSX.")
+        if suffix == ".json":
+            raise ValueError("Utilisez import_file_path pour les fichiers JSON.")
+        raise ValueError("Format non supporte. Utilisez CSV, XLS, XLSX ou JSON.")

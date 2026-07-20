@@ -44,6 +44,7 @@ class ReportBuilder:
         self._warnings: List[str] = []
         self._hypnogram_labels: List[str] = []
         self._epoch_len: float = 30.0
+        self._episodes: List[Dict[str, Any]] = []
 
     # ---- Builder methods -------------------------------------------
 
@@ -82,6 +83,10 @@ class ReportBuilder:
     def set_hypnogram(self, labels: List[str], epoch_len: float) -> "ReportBuilder":
         self._hypnogram_labels = labels
         self._epoch_len = epoch_len
+        return self
+
+    def set_episodes(self, episodes: List[Dict[str, Any]]) -> "ReportBuilder":
+        self._episodes = episodes
         return self
 
     def add_figure(self, title: str, base64_png: str) -> "ReportBuilder":
@@ -226,6 +231,24 @@ class ReportBuilder:
             <div class="section">
                 <h2>Distribution des Stades</h2>
                 {bars}
+            </div>""")
+
+        # Stage episodes
+        if self._episodes:
+            rows = "".join(
+                f"<tr><td>{ep.get('start_min', 0):.1f}</td>"
+                f"<td>{ep.get('end_min', 0):.1f}</td>"
+                f"<td>{ep.get('stage', '')}</td>"
+                f"<td>{ep.get('duration_min', 0):.1f}</td></tr>"
+                for ep in self._episodes[:200]
+            )
+            sections.append(f"""
+            <div class="section">
+                <h2>Episodes par stade ({len(self._episodes)})</h2>
+                <table>
+                    <tr><th>Debut (min)</th><th>Fin (min)</th><th>Stade</th><th>Duree (min)</th></tr>
+                    {rows}
+                </table>
             </div>""")
 
         # Annotations

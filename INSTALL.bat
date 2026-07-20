@@ -3,19 +3,19 @@ REM Toujours travailler dans le dossier du script (double-clic = sinon run.py in
 cd /d "%~dp0"
 REM Forcer l'encodage UTF-8 pour afficher correctement les caracteres Unicode
 chcp 65001 >nul
-REM CESA 0.0beta1.1 - Installation Complete
+REM CESA 0.0beta2.0 - Installation Complete
 REM ========================================
-REM Installation automatique complete de CESA 0.0beta1.1
+REM Installation automatique complete de CESA 0.0beta2.0
 REM Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 
 echo.
 echo ========================================
-echo    CESA 0.0beta1.1 - Installation Complete
+echo    CESA 0.0beta2.0 - Installation Complete
 echo ========================================
 echo.
 echo Developpe pour l'Unite Neuropsychologie du Stress (IRBA)
 echo Auteur: Come Barmoy
-echo Version: 0.0beta1.1
+echo Version: 0.0beta2.0
 echo.
 echo ========================================
 echo.
@@ -149,6 +149,44 @@ if not exist "requirements.txt" (
 echo [OK] Fichiers CESA detectes
 
 echo.
+echo [2b/7] Verification environnement Windows ^(runtime VC++ / bundle standalone^)...
+
+REM PySide6 / Qt necessitent le Visual C++ Redistributable 2015-2022 x64 sur la machine cible.
+REM Sans lui: erreurs Shiboken6, "DLL load failed", libShiboken introuvable sur un PC "propre".
+set "VCRT_OK=0"
+reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Version >nul 2>&1
+if !errorlevel! equ 0 set "VCRT_OK=1"
+if "!VCRT_OK!"=="0" (
+  reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Version >nul 2>&1
+  if !errorlevel! equ 0 set "VCRT_OK=1"
+)
+if "!VCRT_OK!"=="1" (
+  echo [OK] Microsoft Visual C++ Redistributable ^(x64, branche VS 2015-2022^) detecte dans le registre.
+) else (
+  echo [ATTENTION] Visual C++ Redistributable x64 ^(2015-2022^) non detecte.
+  echo    PySide6 / Qt peuvent echouer au lancement ^(Shiboken6, DLL manquante^) sur ce PC ou sur un PC cible.
+  echo    Telechargez depuis: https://visualstudio.microsoft.com/fr/downloads/
+  echo    Ouvrez "Tous les telechargements", rubrique Autres outils / redistribuables,
+  echo    puis "Microsoft Visual C++ v14 Redistributable" - installez la variante x64.
+)
+
+REM Si un build PyInstaller est present: verifier qu'on n'a pas seulement copie l'exe sans les DLL.
+set "STANDALONE_SHIBOKEN=0"
+if exist "dist\CESA\CESA.exe" (
+  where /r "dist\CESA" Shiboken6.dll >nul 2>&1
+  if !errorlevel! equ 0 set "STANDALONE_SHIBOKEN=1"
+  if "!STANDALONE_SHIBOKEN!"=="1" (
+    echo [OK] Bundle standalone detecte: dist\CESA\CESA.exe + Shiboken6.dll ^(PyInstaller^).
+    echo [INFO] Pour distribuer: copiez TOUT le dossier dist\CESA\ ^(zip complet^), pas seulement CESA.exe.
+  ) else (
+    echo [ATTENTION] dist\CESA\CESA.exe existe mais Shiboken6.dll introuvable ^(dossier _internal ou racine^).
+    echo    Build incomplet, suppression partielle, ou antivirus: relancez pyinstaller ou restaurez les fichiers.
+  )
+) else (
+  echo [INFO] Pas de dist\CESA\CESA.exe ici ^(normal si vous n^'avez pas encore lance PyInstaller^).
+)
+
+echo.
 echo [3/6] Installation des dependances principales...
 
 echo [INSTALLATION] Installation des dependances CESA...
@@ -241,7 +279,7 @@ if !errorlevel! neq 0 (
 echo.
 echo [6/7] Test de lancement d'CESA...
 
-echo [LANCEMENT] Test de lancement de CESA 0.0beta1.1...
+echo [LANCEMENT] Test de lancement de CESA 0.0beta2.0...
 echo    Veuillez patienter quelques secondes...
 echo.
 
@@ -270,18 +308,18 @@ echo [7/7] Creation du raccourci sur le bureau...
 REM Creer le raccourci sur le bureau
 set DESKTOP=%USERPROFILE%\Desktop
 set CURRENT_DIR=%~dp0
-set SHORTCUT_PATH=%DESKTOP%\CESA 0.0beta1.1.lnk
+set SHORTCUT_PATH=%DESKTOP%\CESA 0.0beta2.0.lnk
 
-echo [CREATION] Creation du raccourci CESA 0.0beta1.1 sur le bureau...
+echo [CREATION] Creation du raccourci CESA 0.0beta2.0 sur le bureau...
 echo    Chemin: %SHORTCUT_PATH%
 echo    Cible: %CURRENT_DIR%RUN.bat
 
 REM Creer le raccourci avec PowerShell
-powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0beta1.1 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
+powershell -Command "& {$WshShell = New-Object -comObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('%SHORTCUT_PATH%'); $Shortcut.TargetPath = '%CURRENT_DIR%RUN.bat'; $Shortcut.WorkingDirectory = '%CURRENT_DIR%'; $Shortcut.Description = 'CESA 0.0beta2.0 - EEG Studio Analysis'; $Shortcut.IconLocation = '%CURRENT_DIR%CESA\logo\Icone_CESA.ico'; $Shortcut.Save()}"
 
 if %errorlevel% == 0 (
     echo [OK] Raccourci cree avec succes sur le bureau
-    echo    Nom: CESA 0.0beta1.1.lnk
+    echo    Nom: CESA 0.0beta2.0.lnk
     echo    Cible: RUN.bat
 ) else (
     echo [ATTENTION] Erreur lors de la creation du raccourci
@@ -290,13 +328,13 @@ if %errorlevel% == 0 (
 
 echo.
 echo ========================================
-echo    Installation CESA 0.0beta1.1 Terminee
+echo    Installation CESA 0.0beta2.0 Terminee
 echo ========================================
 echo.
 echo [OK] Installation reussie avec succes!
 echo.
 echo [LANCEMENT] Pour lancer CESA:
-echo    1. Double-cliquez sur le raccourci "CESA 0.0beta1.1" sur le bureau
+echo    1. Double-cliquez sur le raccourci "CESA 0.0beta2.0" sur le bureau
 echo    2. Double-cliquez sur RUN.bat dans ce dossier
 echo    3. Ou utilisez: cd CESA && "%FOUND_PYTHON%" run.py
 echo.
@@ -311,7 +349,7 @@ echo Voulez-vous lancer CESA maintenant? (O/N)
 set /p LAUNCH_NOW=
 if /i "%LAUNCH_NOW%"=="O" (
     echo.
-    echo [LANCEMENT] Lancement de CESA 0.0beta1.1...
+    echo [LANCEMENT] Lancement de CESA 0.0beta2.0...
     echo.
     "%FOUND_PYTHON%" run.py
     if !errorlevel! neq 0 (

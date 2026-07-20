@@ -2,6 +2,34 @@
 
 All notable changes to CESA are documented in this file.
 
+## [0.0beta2.0] - 2026-07-20
+
+### Added
+- **Nettoyage oculaire non destructif** (`CESA/ocular_cleaning.py` + dialogue Qt) :
+  régression EOG → EEG en mémoire, aperçu avant/après obligatoire, restauration
+  possible ; le fichier d'enregistrement n'est jamais modifié.
+  Accès : **Filtres → Nettoyage oculaire...**
+- **Dialogues d'analyse Qt natifs** : détection d'artefacts, PSD par stade,
+  spectrogramme ondelettes, entropie, analyse temporelle, connectivité,
+  micro-états, périodes de sommeil, comparaison de scoring, éditeur de scoring,
+  rapport PSG, marqueurs temporels, export segment EDF, batch / multi-sujets.
+- **Spectrogrammes** : barres nuit / fenêtre (`spectrogram_bar`,
+  `spectrogram_compute`, `spectrogram_panel`) dans le viewer Qt.
+- **Métriques de sommeil** (`CESA/sleep_metrics.py`) et moteur batch
+  (`CESA/batch_engine.py`).
+- Profils d'import PSG (`config/import_profiles/`) et doc raccourcis clavier
+  (`docs/Raccourcis_Clavier.md`).
+- Tests unitaires pour le nettoyage oculaire et les métriques de sommeil.
+
+### Changed
+- Version unifiée **0.0beta2.0** (voir `docs/VERSION_INDEX.md`).
+- Viewer Qt : navigation, hypnogramme, annotations, thèmes et export rapport
+  enrichis.
+
+### Fixed
+- Contraintes zarr/numcodecs pour compatibilité Python 3.10 / 3.14
+  (déjà sur `main` avant ce tag).
+
 ## [0.0beta1.1] - 2026-04-05
 
 ### Added

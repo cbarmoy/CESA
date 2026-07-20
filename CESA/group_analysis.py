@@ -22,6 +22,8 @@ import unicodedata
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
+
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 import pandas as pd
 from scipy import stats
 
@@ -37,7 +39,7 @@ from .entropy import (
     compute_renormalized_entropy,
 )
 from .cardiac_hrv import HRVConfig, HRVComputationError, compute_epoch_hrv, _normalize_stage_label
-from .scoring_io import import_excel_scoring, import_edf_hypnogram
+from .scoring_io import import_scoring_table, import_edf_hypnogram
 from .advanced_spaghetti_plots import (
     permutation_test_median_diff,
     bootstrap_ci_median_diff,
@@ -1424,7 +1426,7 @@ def _process_entry(
                 # Calculer AUC et moyenne en excluant explicitement tau=0 si présent
                 valid_taus_for_auc = [tau for tau in sorted_tau if tau > 0]
                 values = [averaged_values[tau] for tau in valid_taus_for_auc if tau in averaged_values]
-                auc = float(np.trapz(values, valid_taus_for_auc)) if len(valid_taus_for_auc) > 1 else (float(values[0]) if values else float(np.nan))
+                auc = float(_trapz(values, valid_taus_for_auc)) if len(valid_taus_for_auc) > 1 else (float(values[0]) if values else float(np.nan))
                 summary_rows.append(
                     {
                         "subject": entry.subject,
@@ -1467,7 +1469,7 @@ def _process_entry(
                         }
                     )
 
-                auc = float(np.trapz(values, sorted_tau)) if len(sorted_tau) > 1 else float(values[0])
+                auc = float(_trapz(values, sorted_tau)) if len(sorted_tau) > 1 else float(values[0])
                 summary_rows.append(
                     {
                         "subject": entry.subject,
@@ -1550,12 +1552,17 @@ def _load_scoring(entry: GroupDesignEntry, raw, epoch_seconds: float) -> Optiona
             base_ts = pd.Timestamp(meas_date) if meas_date is not None else None
         except Exception:  # pragma: no cover - robuste aux formats exotiques
             base_ts = None
-        if suffix in {".xlsx", ".xls"}:
-            df = pd.read_excel(scoring_path)
-            scoring = import_excel_scoring(df, absolute_start_datetime=base_ts, epoch_seconds=epoch_seconds)
-        elif suffix in {".csv"}:
-            df = pd.read_csv(scoring_path)
-            scoring = import_excel_scoring(df, absolute_start_datetime=base_ts, epoch_seconds=epoch_seconds)
+        if suffix in {".xlsx", ".xls", ".csv"}:
+            if suffix in {".xlsx", ".xls"}:
+                df = pd.read_excel(scoring_path)
+            else:
+                df = pd.read_csv(scoring_path)
+            scoring = import_scoring_table(
+                df,
+                absolute_start_datetime=base_ts,
+                epoch_seconds=epoch_seconds,
+                recording_duration_s=float(raw.n_times / raw.info["sfreq"]),
+            )
         elif suffix in {".edf", ".edf+"}:
             duration = float(raw.n_times / raw.info["sfreq"])
             scoring = import_edf_hypnogram(

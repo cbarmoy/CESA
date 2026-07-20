@@ -66,6 +66,9 @@ class ChannelStrip:
         self._center_offset: float = 0.0
         self._clip_enabled: bool = False
         self._clip_value: float = 500.0
+        # Soft limit in display units (after gain): keep the trace inside its
+        # lane so a mis-scaled ECG cannot paint over neighbouring channels.
+        self._lane_half_uv: float = 0.0
         self._pipeline: Optional[Any] = None  # FilterPipeline
         self._filter_enabled: bool = True
         self._visible: bool = True
@@ -124,11 +127,16 @@ class ChannelStrip:
         self._cache = None
 
     def set_gain(self, gain: float) -> None:
-        self._gain = max(0.01, float(gain))
+        # Floor low enough for ECG (mV-scale) attenuation.
+        self._gain = max(0.001, float(gain))
 
     def set_clip(self, enabled: bool, value_uv: float = 500.0) -> None:
         self._clip_enabled = enabled
         self._clip_value = abs(value_uv)
+
+    def set_lane_half_height(self, half_uv: float) -> None:
+        """Max half-amplitude (display units) allowed inside this channel's lane."""
+        self._lane_half_uv = max(0.0, float(half_uv))
 
     def set_center_offset(self, offset_uv: float) -> None:
         """Set DC offset to subtract (e.g. signal median) for baseline centering."""
@@ -215,9 +223,15 @@ class ChannelStrip:
         if self._clip_enabled:
             filtered = np.clip(filtered, -self._clip_value, self._clip_value)
 
-        # Apply gain and centering
-        display = (filtered - self._center_offset) * self._gain + self._y_offset
-        raw_display = (raw_slice - self._center_offset) * self._gain + self._y_offset
+        # Apply gain and centering, then soft-clip to the lane so a
+        # mis-scaled ECG/EMG cannot overwrite neighbouring traces.
+        centered = (filtered - self._center_offset) * self._gain
+        raw_centered = (raw_slice - self._center_offset) * self._gain
+        if self._lane_half_uv > 0.0:
+            centered = np.clip(centered, -self._lane_half_uv, self._lane_half_uv)
+            raw_centered = np.clip(raw_centered, -self._lane_half_uv, self._lane_half_uv)
+        display = centered + self._y_offset
+        raw_display = raw_centered + self._y_offset
 
         # Downsample for rendering
         target_pts = compute_target_points(widget_width_px)

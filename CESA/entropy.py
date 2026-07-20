@@ -1,8 +1,8 @@
 """
-CESA (Complex EEG Studio Analysis) v0.0beta1.1 - Entropy Analysis Module
+CESA (Complex EEG Studio Analysis) v0.0beta2.0 - Entropy Analysis Module
 =========================================================
 
-Module d'analyse d'entropie renormée pour CESA v0.0beta1.1.
+Module d'analyse d'entropie renormée pour CESA v0.0beta2.0.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Ce module implémente l'analyse d'entropie renormée basée sur les travaux
@@ -17,7 +17,7 @@ Fonctionnalités principales:
 - Interface compatible avec MNE-Python
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.1
+Version: 0.0beta2.0
 Date: 2025-01-27
 Licence: MIT
 """

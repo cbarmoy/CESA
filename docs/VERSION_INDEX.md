@@ -1,6 +1,6 @@
 # Index des versions CESA
 
-> **Version actuelle : `0.0beta1.1`**
+> **Version actuelle : `0.0beta2.0`**
 >
 > Ce fichier recense **tous** les emplacements où le numéro de version apparaît dans le projet.
 > Lors d'un bump de version, parcourir cette checklist pour garantir la cohérence.
@@ -34,7 +34,8 @@ Toute mise à jour de version **doit commencer ici**.
 
 | Fichier | Occurrences | Détail |
 |---|---|---|
-| `eeg_studio_fixed.py` | ~17 | Docstring header (l. 3, 14, 17, 19), `root.title()` (l. 561), barre de statut `version_label` (l. 12905, 12945), support `messagebox` (l. 8241-8267), rapport de bug (l. 9366), fenêtre "À propos" (l. 12108, 12128), FFT batch (l. 13070), `print()` final (l. 18250), `logging.info` (l. 484) |
+| `eeg_studio_fixed.py` | ~17 | Docstring header, `root.title()`, barre de statut `version_label`, support `messagebox`, rapport de bug, fenêtre "À propos", FFT batch, `print()` final, `logging.info` |
+| `qt_viewer/main_window.py` | ~3 | Titre fenêtre, titre avec fichier ouvert, dialogue À propos |
 
 ### 3.2 Modules fonctionnels
 
@@ -46,6 +47,7 @@ Toute mise à jour de version **doit commencer ici**.
 | `scoring_io.py` | 3 | Docstring header + `Version:` |
 | `psg_plot.py` | 1 | Docstring header |
 | `sleep_pipeline/__init__.py` | 1 | `__version__ = "..."` |
+| `ocular_cleaning.py` | 0 | Pas de numéro de version dédié (suit `CESA.__version__`) |
 
 ### 3.3 Interface & thèmes
 
@@ -69,8 +71,8 @@ Toute mise à jour de version **doit commencer ici**.
 | `Methodes_Statistiques.md` | 1 | Pied de page |
 | `Import_Excel.md` | 1 | Pied de page |
 | `Guide_Navigation.md` | 1 | Pied de page |
-| `CHANGELOG.md` | variable | Entrée de la version courante (ne pas modifier les entrées historiques) |
-| `README.md` | ~3 | Badge version, section "What's new", arborescence |
+| `CHANGELOG.md` | variable | Entrée de la version courante (ne pas modifier les entrées historiques) — **à la racine du repo** |
+| `README.md` | ~3 | Badge version, section "What's new", arborescence — **à la racine du repo** |
 
 ---
 

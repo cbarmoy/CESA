@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 PROFILE_SCHEMA_VERSION = "1.0"
@@ -25,8 +25,10 @@ class ScalingConfig:
     global_gain: float = 1.0
     spacing_uv: float = 150.0
     per_channel_gains: Dict[str, float] = field(default_factory=dict)
+    # ECG is ~1–5 mV vs EEG ~50–100 µV → default attenuation ~20× so traces
+    # stay readable next to EEG without overflowing neighbouring lanes.
     per_type_gains: Dict[str, float] = field(default_factory=lambda: {
-        "eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0,
+        "eeg": 1.0, "eog": 1.0, "emg": 0.5, "ecg": 0.05,
     })
     clipping_enabled: bool = False
     clip_value_uv: float = 500.0
@@ -47,6 +49,14 @@ class ScalingConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "ScalingConfig":
         if not data:
             return cls()
+        defaults = {"eeg": 1.0, "eog": 1.0, "emg": 0.5, "ecg": 0.05}
+        raw_type = dict(data.get("per_type_gains") or defaults)
+        # Upgrade legacy profiles that still ship ecg/emg at 1.0 (unusable
+        # next to EEG on a µV scale).
+        if float(raw_type.get("ecg", 1.0)) >= 0.99:
+            raw_type["ecg"] = defaults["ecg"]
+        if float(raw_type.get("emg", 1.0)) >= 0.99:
+            raw_type["emg"] = defaults["emg"]
         return cls(
             enabled=bool(data.get("enabled", False)),
             mode=str(data.get("mode", "manual")),
@@ -56,21 +66,18 @@ class ScalingConfig:
                 str(k): float(v)
                 for k, v in (data.get("per_channel_gains") or {}).items()
             },
-            per_type_gains={
-                str(k): float(v)
-                for k, v in (data.get("per_type_gains") or {
-                    "eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0,
-                }).items()
-            },
+            per_type_gains={str(k): float(v) for k, v in raw_type.items()},
             clipping_enabled=bool(data.get("clipping_enabled", False)),
             clip_value_uv=float(data.get("clip_value_uv", 500.0)),
         )
 
 
 LAYOUT_PRESETS: Dict[str, Dict[str, float]] = {
-    "standard": {"eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0},
-    "clinical_eeg": {"eeg": 1.5, "eog": 1.0, "emg": 0.5, "ecg": 0.4},
-    "compact": {"eeg": 1.0, "eog": 0.7, "emg": 0.3, "ecg": 0.3},
+    # Lane-height multipliers only (amplitude is handled by per_type_gains).
+    # Keep ECG/EMG lanes reasonably tall — shrinking them causes overflow.
+    "standard": {"eeg": 1.0, "eog": 1.0, "emg": 0.8, "ecg": 0.8},
+    "clinical_eeg": {"eeg": 1.5, "eog": 1.0, "emg": 0.6, "ecg": 0.7},
+    "compact": {"eeg": 1.0, "eog": 0.7, "emg": 0.5, "ecg": 0.6},
 }
 
 
@@ -118,12 +125,9 @@ class LayoutConfig:
                 str(k): float(v)
                 for k, v in (data.get("per_channel_offset") or {}).items()
             },
-            per_type_spacing_multiplier={
-                str(k): float(v)
-                for k, v in (data.get("per_type_spacing_multiplier") or {
-                    "eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0,
-                }).items()
-            },
+            per_type_spacing_multiplier=_sanitize_layout_multipliers(
+                data.get("per_type_spacing_multiplier")
+            ),
             center_signal=bool(data.get("center_signal", False)),
             show_baselines=bool(data.get("show_baselines", False)),
             show_amplitude_scale=bool(data.get("show_amplitude_scale", False)),
@@ -143,6 +147,22 @@ class LayoutConfig:
             self.center_signal = True
 
 
+def _sanitize_layout_multipliers(raw: Any) -> Dict[str, float]:
+    """Load layout multipliers; bump legacy ECG/EMG lanes that were too small."""
+    defaults = {"eeg": 1.0, "eog": 1.0, "emg": 0.8, "ecg": 0.8}
+    src = raw or defaults
+    out: Dict[str, float] = {}
+    for k, v in src.items():
+        key = str(k)
+        val = float(v)
+        if key in ("ecg", "emg") and val < 0.5:
+            val = 0.7
+        out[key] = val
+    for k, v in defaults.items():
+        out.setdefault(k, v)
+    return out
+
+
 @dataclass
 class SignalSection:
     """One signal section rendered in PSG view."""
@@ -153,6 +173,86 @@ class SignalSection:
     signal_type: str = "eeg"
     enabled: bool = True
     color_palette: List[str] = field(default_factory=list)
+
+
+SPECTROGRAM_FREQ_PRESETS: Dict[str, Tuple[float, float]] = {
+    "wideband": (0.5, 30.0),
+    "delta": (0.5, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 12.0),
+    "sigma": (11.0, 16.0),
+    "beta": (16.0, 30.0),
+    "wideband_45": (0.5, 45.0),
+}
+
+
+@dataclass
+class SpectrogramConfig:
+    """Wavelet (Morlet) spectrogram bars, aligned with the hypnogram axis.
+
+    Two independent bands share this configuration:
+    - "night": full recording, below the hypnogram (computed once in the
+      background, shares its height with the hypnogram).
+    - "window": visible EEG window only, below the EEG trace (recomputed
+      at high resolution on navigation).
+    """
+
+    enabled_night: bool = False
+    enabled_window: bool = False
+    night_height_ratio: float = 0.4  # 0..1 share of the hypno+night height budget
+    window_height_px: int = 90
+    channel: str = ""  # "" -> auto-resolve (D11 > C3-M1/M2 > first EEG)
+    fmin: float = 0.5
+    fmax: float = 30.0
+    n_freqs: int = 40
+    freq_log: bool = False
+    colormap: str = "viridis"
+    scale: str = "db"  # "db" | "linear" | "zscore"
+    use_filtered: bool = False
+    onef_correction: bool = False
+    opacity: float = 1.0
+    overlay_hypnogram: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled_night": bool(self.enabled_night),
+            "enabled_window": bool(self.enabled_window),
+            "night_height_ratio": float(self.night_height_ratio),
+            "window_height_px": int(self.window_height_px),
+            "channel": str(self.channel),
+            "fmin": float(self.fmin),
+            "fmax": float(self.fmax),
+            "n_freqs": int(self.n_freqs),
+            "freq_log": bool(self.freq_log),
+            "colormap": str(self.colormap),
+            "scale": str(self.scale),
+            "use_filtered": bool(self.use_filtered),
+            "onef_correction": bool(self.onef_correction),
+            "opacity": float(self.opacity),
+            "overlay_hypnogram": bool(self.overlay_hypnogram),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SpectrogramConfig":
+        if not data:
+            return cls()
+        return cls(
+            enabled_night=bool(data.get("enabled_night", False)),
+            enabled_window=bool(data.get("enabled_window", False)),
+            night_height_ratio=float(data.get("night_height_ratio", 0.4)),
+            window_height_px=int(data.get("window_height_px", 90)),
+            channel=str(data.get("channel", "") or ""),
+            fmin=float(data.get("fmin", 0.5)),
+            fmax=float(data.get("fmax", 30.0)),
+            n_freqs=int(data.get("n_freqs", 40)),
+            freq_log=bool(data.get("freq_log", False)),
+            colormap=str(data.get("colormap", "viridis") or "viridis"),
+            scale=str(data.get("scale", "db") or "db"),
+            use_filtered=bool(data.get("use_filtered", False)),
+            onef_correction=bool(data.get("onef_correction", False)),
+            opacity=float(data.get("opacity", 1.0)),
+            overlay_hypnogram=bool(data.get("overlay_hypnogram", False)),
+        )
 
 
 @dataclass
@@ -179,6 +279,7 @@ class DisplayProcessingProfile:
     channel_filter_pipelines: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     scaling: ScalingConfig = field(default_factory=ScalingConfig)
     layout: LayoutConfig = field(default_factory=LayoutConfig)
+    spectrogram: SpectrogramConfig = field(default_factory=SpectrogramConfig)
 
     def touch(self) -> None:
         self.last_used_at = datetime.utcnow().isoformat(timespec="seconds")
@@ -209,6 +310,7 @@ class DisplayProcessingProfile:
             },
             "scaling": self.scaling.to_dict(),
             "layout": self.layout.to_dict(),
+            "spectrogram": self.spectrogram.to_dict(),
         }
 
     @classmethod
@@ -255,6 +357,7 @@ class DisplayProcessingProfile:
             },
             scaling=ScalingConfig.from_dict(data.get("scaling", {})),
             layout=LayoutConfig.from_dict(data.get("layout", {})),
+            spectrogram=SpectrogramConfig.from_dict(data.get("spectrogram", {})),
         )
 
 

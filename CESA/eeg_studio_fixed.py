@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CESA (Complex EEG Studio Analysis) v0.0beta1.1 - Professional EEG Analysis Interface
+CESA (Complex EEG Studio Analysis) v0.0beta2.0 - Professional EEG Analysis Interface
 ====================================================================
 
 Application professionnelle complète pour l'analyse de données EEG avec
@@ -11,12 +11,12 @@ scientifiques et les bonnes pratiques MNE-Python.
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
 Contact: come1.barmoy@supbiotech.fr
 GitHub: cbarmoy
-Version: 0.0beta1.1
+Version: 0.0beta2.0
 Date: 2026-04-05
 Licence: MIT
-Release: CESA_0.0beta1.1_release
+Release: CESA_0.0beta2.0_release
 
-Fonctionnalités principales v0.0beta1.1:
+Fonctionnalités principales v0.0beta2.0:
 - ✅ Chargement EDF+ avec diagnostic automatique et amplification
 - ✅ Interface graphique professionnelle (thèmes clair/sombre)
 - ✅ Scoring de sommeil (import Excel/EDF+ avec synchronisation)
@@ -420,9 +420,23 @@ class EEGAnalysisStudio:
         self.fft_main_name: str = "Condition 1"
         self.show_manual_scoring: bool = True
         self.scoring_epoch_duration: float = 30.0  # Durée d'une époque en secondes
+        self.manual_scoring_auto_advance: bool = True
+        self.last_scored_epoch_idx: Optional[int] = None
+        self._fft_scoring_window: Optional[tk.Toplevel] = None
+        self._fft_scoring_canvas = None
+        self._fft_scoring_axes = None
+        self._fft_scoring_info_var: Optional[tk.StringVar] = None
+        self._fft_scoring_source_var: Optional[tk.StringVar] = None
+        self._fft_scoring_channel_var: Optional[tk.StringVar] = None
+        self._fft_scoring_fmin_var: Optional[tk.DoubleVar] = None
+        self._fft_scoring_fmax_var: Optional[tk.DoubleVar] = None
+        self._fft_scoring_log_var: Optional[tk.BooleanVar] = None
+        self._fft_scoring_line_hz_var: Optional[tk.DoubleVar] = None
         # Plage nuit (optionnel) : ne comparer / analyser que de X à T minutes depuis le début
         self.night_start_min: Optional[float] = None  # Début nuit (min depuis t=0)
         self.night_end_min: Optional[float] = None    # Fin nuit (min depuis t=0)
+        self.night_start_s: Optional[float] = None
+        self.night_end_s: Optional[float] = None
         # Cache PSG
         self._psg_cached_hypnogram: Optional[Tuple[List[str], float]] = None
         self._psg_cached_scoring_rows: int = 0
@@ -517,7 +531,7 @@ class EEGAnalysisStudio:
         self._update_version_display()
         
         # Log de l'initialisation
-        logging.info("CESA (Complex EEG Studio Analysis) v0.0beta1.1 initialisé avec succès")
+        logging.info("CESA (Complex EEG Studio Analysis) v0.0beta2.0 initialisé avec succès")
         logging.info("Application initialized successfully")
 
         # Optimisation rendu: exécuteur en arrière-plan + debouncing
@@ -594,7 +608,7 @@ class EEGAnalysisStudio:
         self.control_width = control_width
         
         # Configuration de la fenêtre principale
-        self.root.title("CESA (Complex EEG Studio Analysis) v0.0beta1.1 - Interface Moderne")
+        self.root.title("CESA (Complex EEG Studio Analysis) v0.0beta2.0 - Interface Moderne")
         self.root.geometry(f"{window_width}x{window_height}")
         self.root.minsize(1000, 600)
         
@@ -958,6 +972,20 @@ class EEGAnalysisStudio:
         sleep_menu.add_command(label="💾 Sauvegarder Scoring (CSV)", command=self._save_active_scoring)
         sleep_menu.add_command(label="📈 Informations Scoring", command=self._show_sleep_scoring_info)
         sleep_menu.add_command(label="✍️ Scorer manuellement (éditeur)", command=self._open_manual_scoring_editor, accelerator="Ctrl+Shift+S")
+        sleep_menu.add_command(
+            label="⏭️ Auto-avance après scoring manuel",
+            command=self._toggle_manual_scoring_auto_advance,
+            accelerator="Ctrl+Shift+A",
+        )
+        sleep_menu.add_command(
+            label="📈 FFT scoring (époque ciblée)",
+            command=self._toggle_fft_scoring_view,
+            accelerator="F",
+        )
+        sleep_menu.add_command(
+            label="⚙️ Paramètres scoring manuel...",
+            command=self._open_manual_scoring_settings,
+        )
         sleep_menu.add_command(label="⚙️ Ajuster Durée Époque", command=self._adjust_epoch_duration)
         
         # Menu Outils
@@ -2738,6 +2766,7 @@ class EEGAnalysisStudio:
         if not labels:
             return
         idx = int(max(0, min(len(labels) - 1, onset_s // epoch_len)))
+        self.last_scored_epoch_idx = int(idx)
         labels[idx] = norm
         n = len(labels)
         times = (np.arange(n, dtype=float) * epoch_len).tolist()
@@ -2757,6 +2786,7 @@ class EEGAnalysisStudio:
                     self._qt_viewer_bridge.set_hypnogram((list(tup2[0]), float(tup2[1])))
             except Exception:
                 logging.warning("[VIEW] set_hypnogram après scoring rapide a échoué.", exc_info=True)
+        self._refresh_fft_scoring_view_if_open()
 
     def _qt_apply_sleep_stage_at_epoch_time(self, onset_s: float, stage: str) -> None:
         self._qt_mutate_hypnogram_stage_at_time(float(onset_s), stage)
@@ -2771,6 +2801,308 @@ class EEGAnalysisStudio:
         el = float(el)
         onset = float(int(float(self.current_time) // el) * el)
         self._qt_mutate_hypnogram_stage_at_time(onset, stage)
+        if bool(getattr(self, "manual_scoring_auto_advance", True)):
+            self._advance_after_manual_scoring(onset + el)
+
+    def _advance_after_manual_scoring(self, target_time_s: float) -> None:
+        """Advance to next epoch while keeping current window duration."""
+        try:
+            target = float(max(0.0, float(target_time_s)))
+        except Exception:
+            return
+        if getattr(self, "raw", None) is not None:
+            try:
+                max_time = max(0.0, float(len(self.raw.times) / float(self.sfreq)))
+                target = min(target, max_time)
+            except Exception:
+                pass
+        self.current_time = target
+        if hasattr(self, "time_var"):
+            try:
+                self.time_var.set(target)
+            except Exception:
+                pass
+        if hasattr(self, "bottom_time_var"):
+            try:
+                self.bottom_time_var.set(target)
+            except Exception:
+                pass
+        self._update_time_display()
+        if self._qt_psg_plot_active() and getattr(self, "_qt_viewer_bridge", None) is not None:
+            try:
+                self._qt_viewer_bridge.set_time_window(float(self.current_time), float(self.duration))
+            except Exception:
+                self.update_plot()
+        else:
+            self.update_plot()
+
+    def _set_manual_scoring_auto_advance(self, enabled: bool) -> None:
+        self.manual_scoring_auto_advance = bool(enabled)
+        state = "activée" if self.manual_scoring_auto_advance else "désactivée"
+        logging.info("[SCORING] Auto-avance %s", state)
+
+    def _toggle_manual_scoring_auto_advance(self) -> None:
+        self._set_manual_scoring_auto_advance(not bool(getattr(self, "manual_scoring_auto_advance", True)))
+        state = "activée" if self.manual_scoring_auto_advance else "désactivée"
+        messagebox.showinfo("Scoring manuel", f"Auto-avance {state}.")
+
+    def _open_manual_scoring_settings(self) -> None:
+        """Settings dialog for manual scoring behavior."""
+        win = tk.Toplevel(self.root)
+        win.title("Paramètres scoring manuel")
+        win.geometry("560x300")
+        win.transient(self.root)
+        win.grab_set()
+
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        tab_workflow = ttk.Frame(notebook, padding=12)
+        notebook.add(tab_workflow, text="Workflow")
+
+        auto_adv_var = tk.BooleanVar(value=bool(getattr(self, "manual_scoring_auto_advance", True)))
+        ttk.Label(
+            tab_workflow,
+            text="Options de saisie manuelle des stades (raccourcis 0..5).",
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Checkbutton(
+            tab_workflow,
+            text="Passer automatiquement à l'époque suivante après un scoring manuel",
+            variable=auto_adv_var,
+        ).pack(anchor="w", pady=6)
+        ttk.Label(
+            tab_workflow,
+            text="Raccourci rapide: Ctrl+Shift+A",
+            foreground="gray",
+        ).pack(anchor="w", pady=(4, 0))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def _apply():
+            self._set_manual_scoring_auto_advance(bool(auto_adv_var.get()))
+            messagebox.showinfo("Scoring manuel", "Paramètres enregistrés.")
+            win.destroy()
+
+        ttk.Button(btns, text="Annuler", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="Appliquer", command=_apply).pack(side=tk.RIGHT)
+
+    def _toggle_fft_scoring_view(self) -> None:
+        logging.info("[FFT-SHORTCUT] _toggle_fft_scoring_view called")
+        print("🔍 FFT-SHORTCUT-CHECKPOINT: _toggle_fft_scoring_view called")
+        if self._fft_scoring_window is not None and self._fft_scoring_window.winfo_exists():
+            logging.info("[FFT-SHORTCUT] closing FFT scoring window")
+            print("🔍 FFT-SHORTCUT-CHECKPOINT: closing FFT scoring window")
+            try:
+                self._fft_scoring_window.destroy()
+            except Exception:
+                pass
+            self._fft_scoring_window = None
+            return
+        logging.info("[FFT-SHORTCUT] opening FFT scoring window")
+        print("🔍 FFT-SHORTCUT-CHECKPOINT: opening FFT scoring window")
+        self._open_fft_scoring_view()
+
+    def _debug_toggle_fft_scoring_view(self, source: str) -> None:
+        logging.info("[FFT-SHORTCUT] trigger source=%s", source)
+        print(f"🔍 FFT-SHORTCUT-CHECKPOINT: trigger source={source}")
+        self._toggle_fft_scoring_view()
+
+    def _on_key_f_fft_scoring(self, event=None) -> None:
+        """Ouvre/ferme la FFT scoring sur la touche F (hors champs de saisie)."""
+        try:
+            w = self.root.focus_get()
+            if w is not None and w.winfo_class() in ("Entry", "TEntry", "Text", "Spinbox"):
+                return
+        except Exception:
+            pass
+        self._debug_toggle_fft_scoring_view("tk_bind_f")
+
+    def _open_fft_scoring_view(self) -> None:
+        logging.info(
+            "[FFT-SHORTCUT] _open_fft_scoring_view entered raw=%s derivations=%d",
+            bool(self.raw),
+            len(self.derivations) if hasattr(self, "derivations") else -1,
+        )
+        print(
+            "🔍 FFT-SHORTCUT-CHECKPOINT: _open_fft_scoring_view "
+            f"raw={self.raw is not None} derivations={len(self.derivations) if hasattr(self, 'derivations') else -1}"
+        )
+        if not self.raw or not self.derivations:
+            messagebox.showwarning("FFT scoring", "Chargez un enregistrement avec dérivations disponibles.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("FFT scoring (époque ciblée)")
+        win.geometry("980x620")
+        win.transient(self.root)
+        self._fft_scoring_window = win
+        win.protocol("WM_DELETE_WINDOW", self._close_fft_scoring_view)
+
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill=tk.X)
+        self._fft_scoring_source_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self._fft_scoring_source_var, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Button(top, text="Rafraîchir", command=self._refresh_fft_scoring_view).pack(side=tk.RIGHT, padx=(6, 0))
+
+        controls = ttk.Frame(win, padding=8)
+        controls.pack(fill=tk.X)
+        ttk.Label(controls, text="Canal").pack(side=tk.LEFT)
+        default_ch = self._choose_fft_scoring_channel()
+        self._fft_scoring_channel_var = tk.StringVar(value=default_ch)
+        chan_values = list(self.derivations.keys())
+        channel_combo = ttk.Combobox(
+            controls,
+            textvariable=self._fft_scoring_channel_var,
+            values=chan_values,
+            state="readonly",
+            width=24,
+        )
+        channel_combo.pack(side=tk.LEFT, padx=(6, 12))
+        channel_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_fft_scoring_view())
+
+        self._fft_scoring_fmin_var = tk.DoubleVar(value=0.3)
+        self._fft_scoring_fmax_var = tk.DoubleVar(value=min(35.0, float(self.sfreq) / 2.0))
+        ttk.Label(controls, text="fmin").pack(side=tk.LEFT)
+        ttk.Entry(controls, textvariable=self._fft_scoring_fmin_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(controls, text="fmax").pack(side=tk.LEFT)
+        ttk.Entry(controls, textvariable=self._fft_scoring_fmax_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
+
+        self._fft_scoring_log_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls,
+            text="Échelle log",
+            variable=self._fft_scoring_log_var,
+            command=self._refresh_fft_scoring_view,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self._fft_scoring_line_hz_var = tk.DoubleVar(value=50.0)
+        ttk.Label(controls, text="Ligne secteur").pack(side=tk.LEFT)
+        ttk.Entry(controls, textvariable=self._fft_scoring_line_hz_var, width=6).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Label(controls, text="Hz").pack(side=tk.LEFT)
+
+        content = ttk.Frame(win)
+        content.pack(fill=tk.BOTH, expand=True)
+        fig, ax = plt.subplots(1, 1, figsize=(8.6, 4.5))
+        self._fft_scoring_axes = ax
+        self._fft_scoring_canvas = FigureCanvasTkAgg(fig, master=content)
+        self._fft_scoring_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        info_frame = ttk.LabelFrame(win, text="Indicateurs scoring", padding=8)
+        info_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._fft_scoring_info_var = tk.StringVar(value="")
+        ttk.Label(info_frame, textvariable=self._fft_scoring_info_var, justify=tk.LEFT).pack(anchor="w")
+        self._refresh_fft_scoring_view()
+
+    def _close_fft_scoring_view(self) -> None:
+        try:
+            if self._fft_scoring_window is not None and self._fft_scoring_window.winfo_exists():
+                self._fft_scoring_window.destroy()
+        except Exception:
+            pass
+        self._fft_scoring_window = None
+        self._fft_scoring_canvas = None
+        self._fft_scoring_axes = None
+        self._fft_scoring_info_var = None
+        self._fft_scoring_source_var = None
+
+    def _choose_fft_scoring_channel(self) -> str:
+        preferred = ["EEG Fpz-Cz", "Fpz-Cz", "Pz", "EEG Pz-Oz", "E101", "PZ"]
+        for name in preferred + list(getattr(self, "selected_channels", [])) + list(self.derivations.keys()):
+            if name in self.derivations:
+                return str(name)
+        return next(iter(self.derivations.keys()))
+
+    def _resolve_fft_scoring_epoch(self) -> tuple[int, float, float, str]:
+        epoch_len = float(max(1.0, getattr(self, "scoring_epoch_duration", 30.0)))
+        if self.last_scored_epoch_idx is not None and self.last_scored_epoch_idx >= 0:
+            idx = int(self.last_scored_epoch_idx)
+            source = "current_scored_epoch"
+        else:
+            center_t = float(self.current_time) + float(self.duration) / 2.0
+            idx = int(max(0, np.floor(center_t / epoch_len)))
+            source = "middle_of_window"
+        start_s = idx * epoch_len
+        end_s = start_s + epoch_len
+        return idx, start_s, end_s, source
+
+    def _refresh_fft_scoring_view_if_open(self) -> None:
+        if self._fft_scoring_window is not None and self._fft_scoring_window.winfo_exists():
+            self._refresh_fft_scoring_view()
+
+    def _refresh_fft_scoring_view(self) -> None:
+        if (
+            self._fft_scoring_window is None
+            or not self._fft_scoring_window.winfo_exists()
+            or self._fft_scoring_axes is None
+            or self._fft_scoring_canvas is None
+        ):
+            return
+        try:
+            channel = self._choose_fft_scoring_channel()
+            if self._fft_scoring_channel_var is not None:
+                candidate = str(self._fft_scoring_channel_var.get()).strip()
+                if candidate in self.derivations:
+                    channel = candidate
+            signal = self.derivations.get(channel)
+            if signal is None or len(signal) < 8:
+                return
+            idx, start_s, end_s, source = self._resolve_fft_scoring_epoch()
+            fs = float(self.sfreq)
+            i0 = int(max(0, round(start_s * fs)))
+            i1 = int(min(len(signal), round(end_s * fs)))
+            epoch_signal = np.asarray(signal[i0:i1], dtype=float)
+            freqs, spec = compute_psd_fft(epoch_signal, fs)
+            if freqs.size == 0 or spec.size == 0:
+                return
+
+            fmin = float(self._fft_scoring_fmin_var.get()) if self._fft_scoring_fmin_var is not None else 0.3
+            fmax = float(self._fft_scoring_fmax_var.get()) if self._fft_scoring_fmax_var is not None else min(35.0, fs / 2.0)
+            if fmax <= fmin:
+                fmax = min(fs / 2.0, fmin + 20.0)
+            mask = (freqs >= fmin) & (freqs <= fmax)
+            pfreqs = freqs[mask]
+            pspec = spec[mask]
+            if pfreqs.size == 0:
+                return
+            bands = compute_band_powers(freqs, spec)
+            total_05_45 = float(np.sum(spec[(freqs >= 0.5) & (freqs <= 45.0)])) + 1e-12
+            line_hz = float(self._fft_scoring_line_hz_var.get()) if self._fft_scoring_line_hz_var is not None else 50.0
+            line_ratio = float(np.sum(spec[(freqs >= line_hz - 1.0) & (freqs <= line_hz + 1.0)])) / total_05_45
+            hf_ratio = float(np.sum(spec[(freqs >= 20.0) & (freqs <= 45.0)])) / total_05_45
+            drift_ratio = float(np.sum(spec[(freqs >= 0.3) & (freqs <= 1.0)])) / total_05_45
+            delta = float(bands.get("Delta", 0.0))
+            theta = float(bands.get("Theta", 0.0))
+            sigma_beta = float(bands.get("Beta", 0.0)) + 1e-12
+            ratio_dt = delta / (theta + 1e-12)
+            ratio_db = delta / sigma_beta
+
+            ax = self._fft_scoring_axes
+            ax.clear()
+            ax.plot(pfreqs, pspec, color="#1f77b4", lw=1.2, label="FFT magnitude")
+            if self._fft_scoring_log_var is not None and bool(self._fft_scoring_log_var.get()):
+                ax.set_yscale("log")
+            ax.axvline(line_hz, color="#d62728", linestyle="--", alpha=0.7, label=f"Secteur {line_hz:.0f}Hz")
+            ax.set_xlim(float(fmin), float(fmax))
+            ax.set_xlabel("Fréquence (Hz)")
+            ax.set_ylabel("Magnitude FFT")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right", fontsize=8)
+            ax.set_title(f"FFT scoring | canal={channel} | epoch={idx}")
+            self._fft_scoring_canvas.draw_idle()
+
+            if self._fft_scoring_source_var is not None:
+                self._fft_scoring_source_var.set(
+                    f"Epoch #{idx} | t={start_s:.1f}-{end_s:.1f}s | source={source} | canal={channel}"
+                )
+            if self._fft_scoring_info_var is not None:
+                self._fft_scoring_info_var.set(
+                    "Bandes: "
+                    f"Delta={bands.get('Delta', 0.0):.1f}  Theta={bands.get('Theta', 0.0):.1f}  "
+                    f"Alpha={bands.get('Alpha', 0.0):.1f}  Beta={bands.get('Beta', 0.0):.1f}  Gamma={bands.get('Gamma', 0.0):.1f}\n"
+                    f"Ratios: Delta/Theta={ratio_dt:.2f}  Delta/Beta={ratio_db:.2f}\n"
+                    f"Artefacts: secteur±1Hz={line_ratio:.1%}  HF(20-45Hz)={hf_ratio:.1%}  drift(0.3-1Hz)={drift_ratio:.1%}"
+                )
+        except Exception as exc:
+            logging.debug("[FFT-SCORING] refresh failed: %s", exc, exc_info=True)
 
     def _qt_on_viewer_navigate(self, target_time: float) -> None:
         """Appelé par le viewer Qt (pendant processEvents).
@@ -3158,6 +3490,16 @@ class EEGAnalysisStudio:
                 on_global_filter_toggled=lambda en: self._qt_defer_to_studio(
                     lambda e=en: self._qt_sync_global_filter_from_viewer(e),
                 ),
+                on_set_manual_auto_advance=lambda en: self._qt_defer_to_studio(
+                    lambda e=en: self._set_manual_scoring_auto_advance(bool(e)),
+                ),
+                on_get_manual_auto_advance=lambda: bool(getattr(self, "manual_scoring_auto_advance", True)),
+                on_open_stage_psd_fft=lambda: self._qt_defer_to_studio(self._show_stage_psd_fft),
+                on_open_stage_psd_before_after=lambda: self._qt_defer_to_studio(self._show_stage_psd_before_after),
+                on_open_wavelet_spectrogram=lambda: self._qt_defer_to_studio(self._show_wavelet_spectrogram_before_after),
+                on_open_batch_fft_automation=lambda: self._qt_defer_to_studio(self._show_batch_fft_automation),
+                on_open_group_analysis=lambda: self._qt_defer_to_studio(self._show_group_analysis),
+                on_toggle_fft_scoring_view=lambda: self._qt_defer_to_studio(self._toggle_fft_scoring_view),
             )
             _log_viewer_checkpoint("21", "ensure_qt_viewer launch_viewer returned ok")
             return True
@@ -4295,7 +4637,7 @@ class EEGAnalysisStudio:
             return
         
         try:
-            epoch_len = 30.0
+            epoch_len = float(getattr(self, "scoring_epoch_duration", 30.0) or 30.0)
             
             # Normalisation simple des stades
             auto = self.sleep_scoring_data.copy()
@@ -4435,11 +4777,11 @@ class EEGAnalysisStudio:
             macro_f1 = np.mean([stage_metrics[s]["f1"] for s in labels]) if stage_metrics else 0.0
             
             # Calculs globaux supplémentaires
-            total_time_hours = total * 30 / 3600  # 30 secondes par époque
+            total_time_hours = total * epoch_len / 3600.0
             sleep_epochs_manual = total - counts_manual[0] if counts_manual else 0  # Total - Wake
             sleep_epochs_auto = total - counts_auto[0] if counts_auto else 0
-            sleep_time_manual = sleep_epochs_manual * 30 / 3600
-            sleep_time_auto = sleep_epochs_auto * 30 / 3600
+            sleep_time_manual = sleep_epochs_manual * epoch_len / 3600.0
+            sleep_time_auto = sleep_epochs_auto * epoch_len / 3600.0
             
             # Affichage détaillé
             self._show_detailed_comparison(
@@ -4469,7 +4811,7 @@ class EEGAnalysisStudio:
             messagebox.showerror("Erreur", f"Impossible d'effectuer la comparaison: {e}")
 
     def _open_night_range_dialog(self):
-        """Ouvre un dialogue pour définir la plage de nuit (X à T) en minutes depuis le début d'enregistrement."""
+        """Ouvre un dialogue pour définir la plage de nuit (HH:MM ou minutes depuis t=0)."""
         win = tk.Toplevel(self.root)
         win.title("Plage nuit (X à T)")
         win.geometry("420x200")
@@ -4477,18 +4819,39 @@ class EEGAnalysisStudio:
         win.grab_set()
 
         ttk.Label(win, text="Définir la plage de nuit pour les comparaisons Auto vs Manuel.", font=("Segoe UI", 10, "bold")).pack(pady=(12, 8))
-        ttk.Label(win, text="Les valeurs sont en minutes depuis le début de l'enregistrement (t = 0).").pack(pady=(0, 12))
+        ttk.Label(
+            win,
+            text="Formats acceptés: HH:MM / HH:MM:SS ou minutes depuis le début (t = 0).",
+        ).pack(pady=(0, 12))
 
         row = ttk.Frame(win)
         row.pack(fill=tk.X, padx=12, pady=6)
-        ttk.Label(row, text="Début nuit (min):", width=18).pack(side=tk.LEFT)
+        ttk.Label(row, text="Début nuit:", width=18).pack(side=tk.LEFT)
         start_var = tk.StringVar(value=str(int(self.night_start_min)) if self.night_start_min is not None else "")
         ttk.Entry(row, textvariable=start_var, width=12).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row, text="Fin nuit (min):", width=14).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(row, text="Fin nuit:", width=14).pack(side=tk.LEFT, padx=(12, 0))
         end_var = tk.StringVar(value=str(int(self.night_end_min)) if self.night_end_min is not None else "")
         ttk.Entry(row, textvariable=end_var, width=12).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(win, text="Exemple: 10 et 450 → nuit de 10 min à 7 h 30.", foreground="gray").pack(pady=(0, 12))
+        ttk.Label(
+            win,
+            text="Exemples: 03:00 et 22:00  |  10 et 450",
+            foreground="gray",
+        ).pack(pady=(0, 12))
+
+        def _parse_time_to_minutes(raw: str) -> float:
+            txt = (raw or "").strip()
+            if ":" not in txt:
+                return float(txt)
+            parts = txt.split(":")
+            if len(parts) not in (2, 3):
+                raise ValueError("Format horaire invalide.")
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2]) if len(parts) == 3 else 0
+            if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
+                raise ValueError("Format horaire invalide.")
+            return hours * 60.0 + minutes + (seconds / 60.0)
 
         def apply_range():
             try:
@@ -4497,28 +4860,47 @@ class EEGAnalysisStudio:
                 if not s or not e:
                     self.night_start_min = None
                     self.night_end_min = None
+                    self.night_start_s = None
+                    self.night_end_s = None
                     logging.info("[NUIT] Plage nuit désactivée.")
                     messagebox.showinfo("Plage nuit", "Plage nuit désactivée. La comparaison utilisera toute la durée.")
                 else:
-                    start_min = float(s)
-                    end_min = float(e)
+                    start_min = _parse_time_to_minutes(s)
+                    end_min = _parse_time_to_minutes(e)
                     if start_min < 0 or end_min < 0:
                         messagebox.showwarning("Plage nuit", "Les valeurs doivent être positives.")
                         return
                     if start_min >= end_min:
                         messagebox.showwarning("Plage nuit", "Le début doit être strictement inférieur à la fin.")
                         return
+                    if (end_min - start_min) < 60.0:
+                        proceed = messagebox.askyesno(
+                            "Plage nuit",
+                            (
+                                "La plage saisie est inférieure à 60 minutes.\n"
+                                "Vérifiez le format (ex: 03:00 et 22:00), puis confirmez si c'est volontaire."
+                            ),
+                        )
+                        if not proceed:
+                            return
                     self.night_start_min = start_min
                     self.night_end_min = end_min
+                    self.night_start_s = start_min * 60.0
+                    self.night_end_s = end_min * 60.0
                     logging.info("[NUIT] Plage nuit: %.0f – %.0f min", start_min, end_min)
                     messagebox.showinfo("Plage nuit", f"Plage nuit enregistrée: de {start_min:.0f} à {end_min:.0f} minutes.")
                 win.destroy()
             except ValueError:
-                messagebox.showwarning("Plage nuit", "Veuillez entrer des nombres valides (minutes).")
+                messagebox.showwarning(
+                    "Plage nuit",
+                    "Format invalide. Utilisez HH:MM / HH:MM:SS ou des minutes (ex: 180).",
+                )
 
         def clear_range():
             self.night_start_min = None
             self.night_end_min = None
+            self.night_start_s = None
+            self.night_end_s = None
             start_var.set("")
             end_var.set("")
             logging.info("[NUIT] Plage nuit désactivée.")
@@ -6282,11 +6664,18 @@ class EEGAnalysisStudio:
                     ),
                 ).grid(row=0, column=2, padx=(5,0), pady=5)
                 
-                ttk.Label(files_frame, text="Scoring (XLS):").grid(row=1, column=0, sticky='w', pady=5)
+                ttk.Label(files_frame, text="Scoring (Excel/CSV):").grid(row=1, column=0, sticky='w', pady=5)
                 ttk.Entry(files_frame, textvariable=scoring_path_var, width=30).grid(row=1, column=1, padx=(10,0), pady=5)
                 ttk.Button(files_frame, text="Browse...", command=lambda: scoring_path_var.set(
-                    filedialog.askopenfilename(title="Select Scoring file", 
-                                               filetypes=[("Excel files", "*.xlsx;*.xls"), ("All files", "*.*")])
+                    filedialog.askopenfilename(
+                        title="Select Scoring file",
+                        filetypes=[
+                            ("Scoring files", "*.csv *.xlsx *.xls"),
+                            ("CSV files", "*.csv"),
+                            ("Excel files", "*.xlsx *.xls"),
+                            ("All files", "*.*"),
+                        ],
+                    )
                 )).grid(row=1, column=2, padx=(5,0), pady=5)
                 
                 # Buttons
@@ -9154,7 +9543,7 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
             self.user_assistant._open_support()
         else:
             support_info = """
-📞 SUPPORT CESA v0.0beta1.1
+📞 SUPPORT CESA v0.0beta2.0
 
 🆘 EN CAS DE PROBLÈME :
 
@@ -9175,12 +9564,12 @@ Canaux sélectionnés: {', '.join(self.selected_channels)}
 • Joignez des captures d'écran si utile
 
 🎯 DÉVELOPPEMENT :
-CESA v0.0beta1.1 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
+CESA v0.0beta2.0 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
 Auteur : Côme Barmoy
-Version : 0.0beta1.1
+Version : 0.0beta2.0
 Licence : MIT
             """
-            messagebox.showinfo("Support CESA v0.0beta1.1", support_info)
+            messagebox.showinfo("Support CESA v0.0beta2.0", support_info)
     
     def _open_reference_guide(self):
         """Ouvre le guide de référence complet."""
@@ -9991,76 +10380,38 @@ Licence : MIT
             canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
             
-            # Définir les catégories de raccourcis
+            # Définir les catégories de raccourcis réellement câblés.
             shortcuts_categories = {
-                "📁 Fichier": [
+                "Mode Tk (eeg_studio_fixed.py)": [
                     ("Ctrl+O", "Ouvrir fichier EDF"),
                     ("Ctrl+S", "Exporter données"),
-                    ("Ctrl+Shift+S", "Exporter segment EDF"),
-                    ("Ctrl+Shift+R", "Générer rapport complet"),
-                    ("Ctrl+Q", "Quitter l'application")
-                ],
-                "🧭 Navigation Temporelle": [
-                    ("Z", "Époque précédente"),
-                    ("Q", "Époque précédente (alternatif)"),
-                    ("S", "Époque suivante"),
-                    ("D", "Époque suivante (alternatif)"),
-                    ("←", "Navigation temporelle (gauche)"),
-                    ("→", "Navigation temporelle (droite)"),
-                    ("Ctrl+←", "Navigation rapide (gauche)"),
-                    ("Ctrl+→", "Navigation rapide (droite)"),
-                    ("Home", "Aller au début"),
-                    ("End", "Aller à la fin")
-                ],
-                "📊 Amplitude et Zoom": [
-                    ("↑", "Augmenter amplitude"),
-                    ("↓", "Diminuer amplitude"),
-                    ("Ctrl+↑", "Augmenter amplitude (grand pas)"),
-                    ("Ctrl+↓", "Diminuer amplitude (grand pas)"),
-                    ("+", "Zoom avant"),
-                    ("-", "Zoom arrière"),
-                    ("Ctrl+0", "Réinitialiser zoom")
-                ],
-                "🎯 Scoring de Sommeil": [
-                    ("Ctrl+Y", "Scoring automatique (YASA)"),
-                    ("Ctrl+Shift+M", "Importer scoring manuel (Excel)"),
-                    ("Ctrl+C", "Comparer scoring auto vs manuel"),
-                    ("1", "Marquer comme Éveil (W)"),
-                    ("2", "Marquer comme N1"),
-                    ("3", "Marquer comme N2"),
-                    ("4", "Marquer comme N3"),
-                    ("5", "Marquer comme REM (R)")
-                ],
-                "⚙️ Interface et Affichage": [
+                    ("Ctrl+Q", "Quitter l'application"),
                     ("Ctrl+A", "Activer/Désactiver autoscale"),
                     ("Ctrl+F", "Activer/Désactiver filtre"),
-                    ("Ctrl+T", "Basculer thème sombre/clair"),
-                    ("Ctrl+1", "Sélectionner canaux"),
-                    ("Ctrl+P", "Basculer panneau commandes"),
-                    ("F2", "Basculer panneau commandes (alternatif)"),
-                    ("F5", "Actualiser graphique"),
-                    ("Ctrl+R", "Actualiser graphique (alternatif)")
-                ],
-                "📈 Analyse et Outils": [
-                    ("Ctrl+Shift+T", "Analyse temporelle"),
-                    ("Ctrl+Shift+K", "Système de marqueurs"),
-                    ("Ctrl+Shift+L", "Outils de mesure"),
-                    ("Ctrl+Shift+F", "Configuration filtres avancée"),
-                    ("Ctrl+Shift+P", "Analyse spectrale (PSD)"),
-                    ("Ctrl+Shift+W", "Analyse TFR (Time-Frequency)")
-                ],
-                "🐛 Debug et Support": [
-                    ("Ctrl+Shift+B", "Générer rapport de bug"),
-                    ("Ctrl+Shift+D", "Afficher informations debug"),
-                    ("Ctrl+Shift+I", "Informations système")
-                ],
-                "❓ Aide et Navigation": [
+                    ("Ctrl+Y", "Scoring automatique"),
+                    ("Ctrl+C", "Comparer scoring auto vs manuel"),
+                    ("Ctrl+Shift+A", "Activer/Désactiver auto-avance scoring manuel"),
+                    ("Ctrl+Shift+F ou Ctrl+Alt+X", "Afficher/Masquer FFT de scoring"),
+                    ("Z/Q/S/D", "Navigation d'époques"),
+                    ("←/→/↑/↓", "Navigation et amplitude"),
                     ("F1", "Assistant de bienvenue"),
-                    ("F3", "Rechercher dans les données"),
-                    ("F4", "Afficher statistiques canaux"),
-                    ("Escape", "Fermer les dialogues"),
-                    ("Ctrl+?", "Afficher cette aide (raccourcis)")
-                ]
+                    ("F5", "Actualiser graphique"),
+                    ("Ctrl+?", "Afficher cette aide"),
+                ],
+                "Mode Qt (run.py ou viewer Qt focalisé)": [
+                    ("Ctrl+O", "Ouvrir un enregistrement"),
+                    ("Ctrl+Q", "Quitter"),
+                    ("Ctrl+A", "Autoscale (navigation Qt)"),
+                    ("Ctrl+N", "Normaliser les amplitudes"),
+                    ("Ctrl+Shift+N", "Nouvelle annotation"),
+                    ("Ctrl+Alt+F", "Configuration des filtres"),
+                    ("Ctrl+Shift+A", "Auto-avance après scoring"),
+                    ("Ctrl+Shift+F ou Ctrl+Alt+X", "FFT scoring (époque ciblée)"),
+                    ("0/1/2/3/4/5", "Scoring W/N1/N2/N3/R/U"),
+                    ("F8", "Panneau inspection"),
+                    ("F9", "Panneau dashboard"),
+                    ("Z/Q/S/D, N/P/T", "Navigation rapide/smart"),
+                ],
             }
             
             # Créer les sections pour chaque catégorie
@@ -10095,11 +10446,11 @@ Licence : MIT
             info_frame.pack(fill=tk.X, pady=(10, 0))
             
             info_text = """
-• Les raccourcis ZQSD fonctionnent uniquement quand la fenêtre principale a le focus
-• Les flèches directionnelles peuvent temporairement désactiver ZQSD (utilisez les raccourcis avec Ctrl pour réactiver)
-• Certains raccourcis peuvent varier selon le contexte (dialogue ouvert, etc.)
-• Utilisez Escape pour fermer la plupart des fenêtres et dialogues
-• Les raccourcis sont également disponibles dans les menus contextuels
+• Le comportement dépend du mode: Tk seul, Qt seul (run.py), ou mode hybride.
+• En mode hybride, la fenêtre qui a le focus reçoit les touches.
+• Les actions critiques de scoring/FFT existent aussi côté Qt pour plus de robustesse.
+• Référence complète: docs/Raccourcis_Clavier.md
+• Si un raccourci ne marche pas: vérifier focus, mode de lancement, et layout clavier.
             """
             
             info_label = ttk.Label(info_frame, text=info_text.strip(), 
@@ -10279,7 +10630,7 @@ Licence : MIT
             report_lines.append("EEG ANALYSIS STUDIO - RAPPORT DE BUG")
             report_lines.append("=" * 80)
             report_lines.append(f"Date de génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            report_lines.append(f"Version de l'application : v0.0beta1.1")
+            report_lines.append(f"Version de l'application : v0.0beta2.0")
             report_lines.append("")
             
             # Informations système
@@ -10528,6 +10879,16 @@ Licence : MIT
         self.manual_scoring_data = result.df.copy()
         self.show_manual_scoring = True
         self.scoring_epoch_duration = float(result.epoch_seconds)
+        if result.night_start_s is not None and result.night_end_s is not None:
+            self.night_start_s = float(result.night_start_s)
+            self.night_end_s = float(result.night_end_s)
+            self.night_start_min = self.night_start_s / 60.0
+            self.night_end_min = self.night_end_s / 60.0
+            logging.info(
+                "[NUIT] Restauree depuis import: %.1f–%.1f min",
+                self.night_start_min,
+                self.night_end_min,
+            )
         logging.info(
             "[MANUAL] %s loaded: n_epochs=%d, epoch=%.2fs",
             source,
@@ -10812,65 +11173,53 @@ Licence : MIT
 
     def _analyze_sleep_periods(self):
         """Analyse des périodes de sommeil (type SleepEEGpy)."""
-        # Utiliser le scoring manuel s'il est non vide, sinon auto
         df = self._get_active_scoring_df()
         if df is None or len(df) == 0:
             messagebox.showwarning("Avertissement", "Aucun scoring de sommeil chargé.")
             return
 
         try:
+            from CESA.sleep_metrics import compute_psg_summary, export_psg_summary_csv
+
             epoch_len = float(getattr(self, 'scoring_epoch_duration', 30.0))
-            stages = df['stage'].astype(str).str.upper().values
-            times = df['time'].values
+            night_start_s = (
+                float(self.night_start_s)
+                if getattr(self, "night_start_s", None) is not None
+                else (
+                    float(self.night_start_min) * 60.0
+                    if getattr(self, "night_start_min", None) is not None
+                    else None
+                )
+            )
+            night_end_s = (
+                float(self.night_end_s)
+                if getattr(self, "night_end_s", None) is not None
+                else (
+                    float(self.night_end_min) * 60.0
+                    if getattr(self, "night_end_min", None) is not None
+                    else None
+                )
+            )
+            summary = compute_psg_summary(
+                df,
+                epoch_len,
+                night_start_s=night_start_s,
+                night_end_s=night_end_s,
+            )
+            cm = summary.clinical
+            periods = [
+                (ep.start_min, ep.end_min, ep.stage)
+                for ep in summary.episodes
+            ]
+            stage_durations_min = summary.stage_durations_min
+            tib = cm.time_in_bed_min
+            sol = cm.sleep_onset_latency_min
+            tst_sec = cm.total_sleep_time_min * 60.0
+            waso_sec = cm.waso_min * 60.0
+            se = cm.sleep_efficiency_pct
+            rem_lat = cm.rem_latency_min
+            awakenings = summary.awakenings
 
-            # Basic metrics (SleepEEGpy-like)
-            t_start = float(times.min())
-            t_end = float(times.max() + epoch_len)
-            tib = (t_end - t_start) / 60.0  # Time in bed (min)
-
-            # Sleep onset latency (first epoch in sleep N1/N2/N3/R)
-            sleep_mask = np.isin(stages, ['N1', 'N2', 'N3', 'R'])
-            if sleep_mask.any():
-                first_sleep_idx = int(np.where(sleep_mask)[0][0])
-                sol = (float(times[first_sleep_idx]) - t_start) / 60.0
-            else:
-                sol = float('nan')
-
-            # Time asleep and WASO
-            tst_sec = int(np.sum(np.isin(stages, ['N1','N2','N3','R'])) * epoch_len)
-            waso_sec = int(np.sum(stages == 'W') * epoch_len)
-            se = (tst_sec / (tib * 60.0)) * 100.0 if tib > 0 else float('nan')
-
-            # REM latency from sleep onset
-            if sleep_mask.any() and np.any(stages == 'R'):
-                rem_idxs = np.where(stages == 'R')[0]
-                rem_lat = (float(times[rem_idxs[0]]) - float(times[first_sleep_idx])) / 60.0
-            else:
-                rem_lat = float('nan')
-
-            # Stage durations (min)
-            stage_durations_min = {
-                s: (int(np.sum(stages == s)) * epoch_len) / 60.0 for s in ['W', 'N1', 'N2', 'N3', 'R']
-            }
-
-            # Awakenings: count transitions into W with at least 1 epoch
-            awakenings = 0
-            for i in range(1, len(stages)):
-                if stages[i] == 'W' and stages[i-1] != 'W':
-                    awakenings += 1
-
-            # Build contiguous periods (start-end in minutes, label)
-            periods = []
-            if len(stages) > 0:
-                start_idx = 0
-                for i in range(1, len(stages)):
-                    if stages[i] != stages[i-1]:
-                        periods.append((float(times[start_idx]) / 60.0, float(times[i]) / 60.0, stages[i-1]))
-                        start_idx = i
-                # last
-                periods.append((float(times[start_idx]) / 60.0, float((times[-1] + epoch_len)) / 60.0, stages[-1]))
-
-            # UI: window with summary + table of periods
             top = tk.Toplevel(self.root)
             top.title("Analyse des périodes de sommeil (type SleepEEGpy)")
             top.geometry("1100x900")
@@ -10880,18 +11229,71 @@ Licence : MIT
             container = ttk.Frame(top, padding=10)
             container.pack(fill=tk.BOTH, expand=True)
 
-            summary = (
+            window_note = ""
+            if night_start_s is not None and night_end_s is not None:
+                window_note = (
+                    f"\nFenêtre analyse: {night_start_s / 60.0:.1f}–{night_end_s / 60.0:.1f} min"
+                )
+
+            summary_text = (
                 f"TIB: {tib:.1f} min | SOL: {sol:.1f} min | TST: {tst_sec/60.0:.1f} min\n"
                 f"WASO: {waso_sec/60.0:.1f} min | SE: {se:.1f}% | REM lat.: {rem_lat:.1f} min\n"
-                f"W: {stage_durations_min['W']:.1f} | N1: {stage_durations_min['N1']:.1f} | N2: {stage_durations_min['N2']:.1f} | "
-                f"N3: {stage_durations_min['N3']:.1f} | R: {stage_durations_min['R']:.1f} | Réveils: {awakenings}"
+                f"W: {stage_durations_min.get('W', 0.0):.1f} | N1: {stage_durations_min.get('N1', 0.0):.1f} | "
+                f"N2: {stage_durations_min.get('N2', 0.0):.1f} | N3: {stage_durations_min.get('N3', 0.0):.1f} | "
+                f"R: {stage_durations_min.get('R', 0.0):.1f} | Réveils: {awakenings}"
+                f"{window_note}"
             )
-            ttk.Label(container, text=summary, font=('Segoe UI', 10)).pack(anchor='w', pady=(0,10))
+            ttk.Label(container, text=summary_text, font=('Segoe UI', 10)).pack(anchor='w', pady=(0,10))
 
-            # Boutons d'export
+            charts_frame = ttk.LabelFrame(container, text="Repartition des stades", padding=6)
+            charts_frame.pack(fill=tk.X, pady=(0, 10))
+            fig_pie, (ax_tst, ax_tib) = plt.subplots(1, 2, figsize=(10, 3.8))
+            fig_pie.set_facecolor('#1E1E2E')
+            stage_colors = {
+                'W': '#EBA0AC', 'N1': '#89B4FA', 'N2': '#74C7EC',
+                'N3': '#89DCEB', 'R': '#CBA6F7', 'REM': '#CBA6F7',
+            }
+
+            def _draw_pie(ax, data_pairs, title):
+                ax.set_facecolor('#1E1E2E')
+                pairs = [(v, lb, stage_colors.get(lb, '#6C7086'))
+                         for lb, v in data_pairs if v > 0.05]
+                if not pairs:
+                    ax.text(0.5, 0.5, 'Aucune donnée', ha='center', va='center',
+                            color='#6C7086', transform=ax.transAxes)
+                    ax.axis('off')
+                    return
+                vals, labs, cols = zip(*pairs)
+                ax.pie(
+                    vals, labels=labs, colors=cols, autopct='%1.1f%%',
+                    startangle=90, textprops={'color': '#CDD6F4', 'fontsize': 8},
+                    wedgeprops={'edgecolor': '#1E1E2E', 'linewidth': 1},
+                )
+                ax.set_title(title, color='#CDD6F4', fontsize=10, fontweight='bold')
+
+            tst_pairs = [
+                (st, summary.stage_pct_of_tst.get(st, 0.0))
+                for st in ('N1', 'N2', 'N3', 'R')
+            ]
+            tib_total = max(tib, 1e-6)
+            tib_pairs = [
+                (st, 100.0 * stage_durations_min.get(st, 0.0) / tib_total)
+                for st in ('W', 'N1', 'N2', 'N3', 'R')
+            ]
+            _draw_pie(ax_tst, tst_pairs, 'Sommeil (% TST)')
+            _draw_pie(ax_tib, tib_pairs, 'Temps au lit (% TIB)')
+            fig_pie.tight_layout()
+            canvas_pie = FigureCanvasTkAgg(fig_pie, charts_frame)
+            canvas_pie.draw()
+            canvas_pie.get_tk_widget().pack(fill=tk.X)
+
             btns = ttk.Frame(container)
             btns.pack(fill=tk.X, pady=(0,10))
-            ttk.Button(btns, text="Exporter CSV", command=lambda: _export_periods_and_metrics_csv(periods, tib, sol, tst_sec, waso_sec, se, rem_lat, stage_durations_min, awakenings)).pack(side=tk.RIGHT)
+            ttk.Button(
+                btns,
+                text="Exporter CSV",
+                command=lambda: _export_periods_and_metrics_csv(summary),
+            ).pack(side=tk.RIGHT)
             ttk.Button(btns, text="Enregistrer Figure", command=lambda: _save_periods_figure(tree)).pack(side=tk.RIGHT, padx=(10,0))
 
             cols = ("Début (min)", "Fin (min)", "Stade")
@@ -10904,31 +11306,16 @@ Licence : MIT
             for (a, b, s) in periods:
                 tree.insert("", tk.END, values=(f"{a:.1f}", f"{b:.1f}", s))
 
-            def _export_periods_and_metrics_csv(periods_list, tib_min, sol_min, tst_seconds, waso_seconds, se_pct, rem_latency_min, stage_dur_min_dict, n_awaken):
+            def _export_periods_and_metrics_csv(psg_summary):
                 try:
-                    file_path = filedialog.asksaveasfilename(title="Exporter CSV", defaultextension=".csv",
-                                                             filetypes=[("CSV", "*.csv")])
+                    file_path = filedialog.asksaveasfilename(
+                        title="Exporter CSV",
+                        defaultextension=".csv",
+                        filetypes=[("CSV", "*.csv")],
+                    )
                     if not file_path:
                         return
-                    import csv
-                    with open(file_path, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        # Metrics
-                        writer.writerow(["metric", "value"]) 
-                        writer.writerow(["TIB_min", f"{tib_min:.2f}"])
-                        writer.writerow(["SOL_min", f"{sol_min:.2f}"])
-                        writer.writerow(["TST_min", f"{tst_seconds/60.0:.2f}"])
-                        writer.writerow(["WASO_min", f"{waso_seconds/60.0:.2f}"])
-                        writer.writerow(["SE_percent", f"{se_pct:.2f}"])
-                        writer.writerow(["REM_latency_min", f"{rem_latency_min:.2f}"])
-                        for sname, minutes in stage_dur_min_dict.items():
-                            writer.writerow([f"Duration_{sname}_min", f"{minutes:.2f}"])
-                        writer.writerow(["Awakenings", n_awaken])
-                        writer.writerow([])
-                        # Periods table
-                        writer.writerow(["start_min", "end_min", "stage"]) 
-                        for (a, b, s) in periods_list:
-                            writer.writerow([f"{a:.2f}", f"{b:.2f}", s])
+                    export_psg_summary_csv(psg_summary, file_path)
                 except Exception as e:
                     messagebox.showerror("Erreur", f"Echec de l'export CSV: {e}")
 
@@ -12922,10 +13309,16 @@ Licence : MIT
             return
         
         try:
+            from CESA.scoring_io import export_scoring_csv
             if file_path.endswith('.csv'):
-                df.to_csv(file_path, index=False, encoding='utf-8')
+                export_scoring_csv(
+                    df,
+                    file_path,
+                    epoch_seconds=float(getattr(self, 'scoring_epoch_duration', 30.0)),
+                    night_start_s=getattr(self, 'night_start_s', None),
+                    night_end_s=getattr(self, 'night_end_s', None),
+                )
             else:
-                # Si extension .xlsx choisie, exporter le manuel si dispo, sinon auto
                 df.to_excel(file_path, index=False)
             
             messagebox.showinfo("Succès", f"Scoring de sommeil exporté avec succès!\n{file_path}")
@@ -12949,7 +13342,14 @@ Licence : MIT
         if not file_path:
             return
         try:
-            df[['time', 'stage']].to_csv(file_path, index=False, encoding='utf-8')
+            from CESA.scoring_io import export_scoring_csv
+            export_scoring_csv(
+                df,
+                file_path,
+                epoch_seconds=float(getattr(self, 'scoring_epoch_duration', 30.0)),
+                night_start_s=getattr(self, 'night_start_s', None),
+                night_end_s=getattr(self, 'night_end_s', None),
+            )
             self.scoring_dirty = False
             messagebox.showinfo("Scoring", f"Scoring sauvegardé: {file_path}")
         except Exception as e:
@@ -13036,7 +13436,7 @@ Licence : MIT
     def _show_about(self):
         """Affiche la boîte de dialogue À propos."""
         about_text = """
-CESA (Complex EEG Studio Analysis) v0.0beta1.1
+CESA (Complex EEG Studio Analysis) v0.0beta2.0
 
 Application professionnelle pour l'analyse de données EEG
 avec amplification automatique des signaux de faible amplitude
@@ -13056,7 +13456,7 @@ Fonctionnalités:
 
 Développé avec Python, MNE-Python, Matplotlib et Tkinter.
 
-Version: 0.0beta1.1
+Version: 0.0beta2.0
 Date: 2025-09-09
         """
         messagebox.showinfo("À propos", about_text)
@@ -13811,6 +14211,38 @@ Date: 2025-09-09
         
         # Raccourci pour basculer le thème sombre/clair
         self.root.bind('<Control-t>', lambda e: self._toggle_dark_theme())
+        self.root.bind('<Control-Shift-A>', lambda e: self._toggle_manual_scoring_auto_advance())
+        self.root.bind('<Control-Shift-F>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_Control-Shift-F"))
+        self.root.bind('<Control-Shift-f>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_Control-Shift-f"))
+        self.root.bind_all('<Control-Shift-F>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_all_Control-Shift-F"))
+        self.root.bind_all('<Control-Shift-f>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_all_Control-Shift-f"))
+        self.root.bind('<Control-Alt-x>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_Control-Alt-x"))
+        self.root.bind('<Control-Alt-X>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_Control-Alt-X"))
+        self.root.bind_all('<Control-Alt-x>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_all_Control-Alt-x"))
+        self.root.bind_all('<Control-Alt-X>', lambda e: self._debug_toggle_fft_scoring_view("tk_bind_all_Control-Alt-X"))
+        self.root.bind_all('<KeyPress-f>', lambda e: self._on_key_f_fft_scoring(e))
+        self.root.bind_all('<KeyPress-F>', lambda e: self._on_key_f_fft_scoring(e))
+        # Bas niveau: log des événements clavier bruts correspondant à Ctrl+Shift+F
+        def _fft_shortcut_raw_probe(event):
+            try:
+                ctrl = bool(event.state & 0x4)
+                shift = bool(event.state & 0x1)
+                key = str(getattr(event, "keysym", "")).lower()
+                if ctrl and shift and key == "f":
+                    logging.info(
+                        "[FFT-SHORTCUT] raw keypress detected state=%s keysym=%s keycode=%s",
+                        getattr(event, "state", None),
+                        getattr(event, "keysym", None),
+                        getattr(event, "keycode", None),
+                    )
+                    print(
+                        "🔍 FFT-SHORTCUT-CHECKPOINT: raw keypress "
+                        f"state={getattr(event, 'state', None)} keysym={getattr(event, 'keysym', None)}"
+                    )
+            except Exception:
+                pass
+        self.root.bind_all('<KeyPress>', _fft_shortcut_raw_probe, add='+')
+        logging.info("[FFT-SHORTCUT] Tk bindings installed for F, Ctrl+Shift+F and Ctrl+Alt+X (bind + bind_all)")
         
         # Navigation avec réinitialisation des bindings ZQSD
         self.root.bind('<Left>', lambda e: self._step_backward_with_zqsd_reset())
@@ -13842,7 +14274,7 @@ Date: 2025-09-09
         # Version de l'application
         self.version_label = ttk.Label(
             status_frame, 
-            text="v0.0beta1.1", 
+            text="v0.0beta2.0", 
             style='Version.TLabel',
             font=('Segoe UI', 8, 'bold')
         )
@@ -13882,7 +14314,7 @@ Date: 2025-09-09
         """Met à jour l'affichage de la version dans l'interface."""
         if hasattr(self, 'version_label'):
             try:
-                self.version_label.config(text="v0.0beta1.1")
+                self.version_label.config(text="v0.0beta2.0")
             except Exception:
                 pass
 
@@ -14007,7 +14439,7 @@ Date: 2025-09-09
 
         # Fenêtre principale d'automatisation
         batch_window = tk.Toplevel(self.root)
-        batch_window.title("🤖 Automatisation FFT en Lot - CESA v0.0beta1.1")
+        batch_window.title("🤖 Automatisation FFT en Lot - CESA v0.0beta2.0")
         batch_window.geometry("1100x900")
         batch_window.configure(bg='#f8f9fa')
         
@@ -19295,7 +19727,7 @@ Date: 2025-09-09
 
 def main(ms_path: Optional[str] = None) -> int:
     """Fonction principale"""
-    print("CESA (Complex EEG Studio Analysis) v0.0beta1.1")
+    print("CESA (Complex EEG Studio Analysis) v0.0beta2.0")
     print("=" * 50)
     print("Vérification des dépendances...")
     

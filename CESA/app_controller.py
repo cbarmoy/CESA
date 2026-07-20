@@ -26,7 +26,10 @@ except ImportError:
 from core.telemetry import telemetry
 from core.raw_loader import open_raw_file, SUPPORTED_RECORDING_EXTENSIONS
 from CESA.profile_store import ProfileStore
-from CESA.profile_schema import DisplayProcessingProfile, LayoutConfig, ScalingConfig, SignalSection
+from CESA.profile_schema import (
+    DisplayProcessingProfile, LayoutConfig, ScalingConfig, SignalSection,
+    SpectrogramConfig,
+)
 from CESA.filter_engine import FilterAuditLog, FilterPipeline, pipeline_from_legacy_params
 from CESA.filters import (
     apply_filter as cesa_apply_filter,
@@ -70,6 +73,7 @@ class AppController:
         self.baseline_window_duration: float = 30.0
         self.scaling: ScalingConfig = ScalingConfig()
         self.layout: LayoutConfig = LayoutConfig()
+        self.spectrogram: SpectrogramConfig = SpectrogramConfig()
 
         self.channel_filter_params: Dict[str, Dict[str, float]] = {}
         self.channel_filter_pipelines: Dict[str, FilterPipeline] = {}
@@ -100,9 +104,13 @@ class AppController:
         self.scoring_epoch_duration: float = 30.0
         self.scoring_dirty: bool = False
         self.show_manual_scoring: bool = True
+        #: Après un stade (toolbar / touches 0–5), avancer d'une époque dans le viewer Qt.
+        self.manual_scoring_auto_advance: bool = True
 
         self.night_start_min: Optional[float] = None
         self.night_end_min: Optional[float] = None
+        self.night_start_s: Optional[float] = None
+        self.night_end_s: Optional[float] = None
 
         # YASA-specific
         self.yasa_eeg_candidates: List[str] = [
@@ -149,6 +157,9 @@ class AppController:
         self.dark_theme_enabled: bool = True
         self.edf_path: Optional[str] = None
 
+        # In-memory ocular cleaning backup (never written to disk)
+        self._ocular_backup: Optional[Dict[str, np.ndarray]] = None
+
     # ------------------------------------------------------------------
     # Profile helpers
     # ------------------------------------------------------------------
@@ -180,6 +191,9 @@ class AppController:
             self.layout = LayoutConfig.from_dict(
                 p.layout.to_dict() if isinstance(p.layout, LayoutConfig) else {}
             )
+            self.spectrogram = SpectrogramConfig.from_dict(
+                p.spectrogram.to_dict() if isinstance(p.spectrogram, SpectrogramConfig) else {}
+            )
         except Exception:
             pass
 
@@ -198,6 +212,7 @@ class AppController:
         }
         p.scaling = ScalingConfig.from_dict(self.scaling.to_dict())
         p.layout = LayoutConfig.from_dict(self.layout.to_dict())
+        p.spectrogram = SpectrogramConfig.from_dict(self.spectrogram.to_dict())
         self.profile_store.save_profile(p)
         self.profile_store.set_last_profile_name(p.name)
 
@@ -273,17 +288,21 @@ class AppController:
         else:
             context = "balanced"
 
-        base = {"eeg": 1.0, "eog": 1.0, "emg": 1.0, "ecg": 1.0}
+        # Lane heights only — ECG/EMG amplitude is handled by per_type_gains
+        # (shrinking the ECG lane made high-amplitude traces overflow worse).
         if context == "eeg_detailed":
-            base = {"eeg": 1.6, "eog": 1.2, "emg": 0.5, "ecg": 0.4}
+            base = {"eeg": 1.6, "eog": 1.2, "emg": 0.6, "ecg": 0.7}
         elif context == "muscle_focus":
-            base = {"eeg": 1.2, "eog": 1.0, "emg": 0.8, "ecg": 0.5}
+            base = {"eeg": 1.2, "eog": 1.0, "emg": 0.8, "ecg": 0.7}
         else:
-            base = {"eeg": 1.3, "eog": 1.0, "emg": 0.6, "ecg": 0.5}
+            base = {"eeg": 1.3, "eog": 1.0, "emg": 0.7, "ecg": 0.7}
 
         ref_amp = 50.0
         for sig_type, amps in type_amplitudes.items():
             if not amps:
+                continue
+            # Do not shrink ECG/EMG lanes based on raw amplitude.
+            if sig_type in ("ecg", "emg"):
                 continue
             mean_amp = sum(amps) / len(amps)
             if mean_amp < 1e-3:
@@ -293,7 +312,8 @@ class AppController:
             base[sig_type] = base.get(sig_type, 1.0) * ratio
 
         for k in base:
-            base[k] = round(max(0.1, min(base[k], 3.0)), 2)
+            floor = 0.5 if k in ("ecg", "emg") else 0.1
+            base[k] = round(max(floor, min(base[k], 3.0)), 2)
 
         return {
             "multipliers": base,
@@ -334,6 +354,7 @@ class AppController:
 
             _progress("Creation des derivations...")
             self._create_derivations()
+            self._ocular_backup = None
 
             self.total_duration_s = len(self.raw.times) / self.sfreq if self.sfreq > 0 else 0.0
             self.current_time = 0.0
@@ -452,6 +473,86 @@ class AppController:
     def build_viewer_filter_pipelines(self) -> Dict[str, FilterPipeline]:
         return dict(self.channel_filter_pipelines)
 
+    # ------------------------------------------------------------------
+    # Ocular cleaning (in-memory only; never writes recording files)
+    # ------------------------------------------------------------------
+
+    def has_ocular_cleaning(self) -> bool:
+        """True if an in-memory ocular cleaning backup is active."""
+        return bool(self._ocular_backup)
+
+    def apply_ocular_cleaning(
+        self,
+        cleaned: Dict[str, np.ndarray],
+        *,
+        originals: Optional[Dict[str, np.ndarray]] = None,
+    ) -> int:
+        """Replace EEG arrays with cleaned versions (memory only).
+
+        Backs up each channel the first time it is cleaned so
+        :meth:`restore_ocular_backup` can undo. Updates ``derivations``
+        when the channel name matches; otherwise only the backup is kept
+        for viewer-level restore. Does not touch ``raw`` or write files.
+
+        Parameters
+        ----------
+        cleaned :
+            ``{channel: cleaned_array}``
+        originals :
+            Optional ``{channel: original_array}`` used for backup when the
+            channel is not present in ``derivations`` (e.g. renamed display
+            names). Ignored for channels already backed up.
+
+        Returns
+        -------
+        int
+            Number of channels cleaned (backup entries created or updated).
+        """
+        if not cleaned:
+            return 0
+        if self._ocular_backup is None:
+            self._ocular_backup = {}
+        originals = originals or {}
+        n = 0
+        for name, arr in cleaned.items():
+            if name not in self._ocular_backup:
+                if name in self.derivations:
+                    self._ocular_backup[name] = np.asarray(
+                        self.derivations[name], dtype=float
+                    ).copy()
+                elif name in originals:
+                    self._ocular_backup[name] = np.asarray(
+                        originals[name], dtype=float
+                    ).copy()
+                else:
+                    continue
+            if name in self.derivations:
+                self.derivations[name] = np.asarray(arr, dtype=float)
+            n += 1
+        logger.info(
+            "[OCULAR] Applied in-memory cleaning to %d channel(s) (file unchanged)",
+            n,
+        )
+        return n
+
+    def restore_ocular_backup(self) -> Dict[str, np.ndarray]:
+        """Restore EEG arrays from the ocular cleaning backup.
+
+        Writes matching keys back into ``derivations`` and returns a copy
+        of all restored arrays so the viewer can refresh display names.
+        """
+        if not self._ocular_backup:
+            return {}
+        restored: Dict[str, np.ndarray] = {}
+        for name, arr in self._ocular_backup.items():
+            copy = np.asarray(arr, dtype=float).copy()
+            restored[name] = copy
+            if name in self.derivations:
+                self.derivations[name] = copy
+        self._ocular_backup = None
+        logger.info("[OCULAR] Restored %d channel(s) from backup", len(restored))
+        return restored
+
     def has_embedded_scoring(self) -> bool:
         """Check if the loaded EDF+ file contains sleep stage annotations."""
         if self.raw is None:
@@ -537,6 +638,29 @@ class AppController:
             return {}
         return {ch: cesa_detect_signal_type(ch) for ch in self.raw.ch_names}
 
+    @staticmethod
+    def resolve_default_spectrogram_channel(available: Sequence[str]) -> str:
+        """Pick a sensible default channel for the wavelet spectrogram bars.
+
+        Priority: exact ``D11`` (case-insensitive) > a C3 derivation
+        referenced to M1/M2/A1/A2 (e.g. ``C3-M1``) > first channel detected
+        as EEG > first available channel.
+        """
+        names = list(available)
+        if not names:
+            return ""
+        for n in names:
+            if n.strip().lower() == "d11":
+                return n
+        for n in names:
+            low = n.lower()
+            if "c3" in low and any(ref in low for ref in ("m1", "m2", "a1", "a2")):
+                return n
+        for n in names:
+            if cesa_detect_signal_type(n) == "eeg":
+                return n
+        return names[0]
+
     # ------------------------------------------------------------------
     # Scoring
     # ------------------------------------------------------------------
@@ -602,6 +726,12 @@ class AppController:
                 on='epoch', how='inner',
             )
             merged['match'] = merged['auto'] == merged['manual']
+            if self.has_night_window:
+                start_s = float(self.night_start_s)  # type: ignore[arg-type]
+                end_s = float(self.night_end_s)  # type: ignore[arg-type]
+                ep = float(epoch_len)
+                time_min = merged['epoch'] * (ep / 60.0)
+                merged = merged[(time_min >= start_s / 60.0) & (time_min <= end_s / 60.0)]
             return merged
         except Exception as exc:
             logger.error("Scoring comparison failed: %s", exc)
@@ -613,12 +743,98 @@ class AppController:
         if df is None or df.empty:
             return False
         try:
-            df.to_csv(path, index=False)
+            from CESA.scoring_io import export_scoring_csv
+            export_scoring_csv(
+                df,
+                path,
+                epoch_seconds=self.scoring_epoch_duration,
+                night_start_s=self.night_start_s,
+                night_end_s=self.night_end_s,
+            )
             logger.info("[SCORING] Saved %d epochs to %s", len(df), path)
             return True
         except Exception as exc:
             logger.error("Scoring CSV export failed: %s", exc)
             return False
+
+    def save_scoring_json(self, path: str) -> bool:
+        """Export current scoring to JSON."""
+        df = self.sleep_scoring_data
+        if df is None or df.empty:
+            return False
+        try:
+            from CESA.scoring_io import export_scoring_json
+            export_scoring_json(
+                df,
+                path,
+                epoch_seconds=self.scoring_epoch_duration,
+                night_start_s=self.night_start_s,
+                night_end_s=self.night_end_s,
+            )
+            logger.info("[SCORING] Saved %d epochs to %s", len(df), path)
+            return True
+        except Exception as exc:
+            logger.error("Scoring JSON export failed: %s", exc)
+            return False
+
+    def save_scoring_file(self, path: str) -> bool:
+        """Export scoring to CSV or JSON based on file extension."""
+        suffix = Path(path).suffix.lower()
+        if suffix == ".json":
+            return self.save_scoring_json(path)
+        return self.save_scoring_csv(path)
+
+    # ------------------------------------------------------------------
+    # Night analysis window
+    # ------------------------------------------------------------------
+
+    def set_night_window(self, start_s: float, end_s: float) -> bool:
+        """Set analysis window (seconds from recording start)."""
+        start_s = float(start_s)
+        end_s = float(end_s)
+        if start_s >= end_s:
+            logger.warning("[NIGHT] Invalid window: start (%.1f) >= end (%.1f)", start_s, end_s)
+            return False
+        if self.total_duration_s > 0 and end_s > self.total_duration_s + 1e-6:
+            end_s = float(self.total_duration_s)
+        self.night_start_s = start_s
+        self.night_end_s = end_s
+        self.night_start_min = start_s / 60.0
+        self.night_end_min = end_s / 60.0
+        logger.info("[NIGHT] Window set: %.1f–%.1f s (%.1f–%.1f min)", start_s, end_s, self.night_start_min, self.night_end_min)
+        return True
+
+    def clear_night_window(self) -> None:
+        """Remove analysis window filter."""
+        self.night_start_s = None
+        self.night_end_s = None
+        self.night_start_min = None
+        self.night_end_min = None
+
+    @property
+    def has_night_window(self) -> bool:
+        return self.night_start_s is not None and self.night_end_s is not None
+
+    def filter_scoring_to_night_window(self, df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+        """Return scoring DataFrame restricted to the night analysis window."""
+        if df is None:
+            df = self.sleep_scoring_data
+        if df is None or df.empty or not self.has_night_window:
+            return df
+        start_s = float(self.night_start_s)  # type: ignore[arg-type]
+        end_s = float(self.night_end_s)  # type: ignore[arg-type]
+        ep = float(self.scoring_epoch_duration)
+        times = pd.to_numeric(df["time"], errors="coerce")
+        mask = (times >= start_s - 1e-6) & (times + ep <= end_s + 1e-6)
+        filtered = df.loc[mask].copy().reset_index(drop=True)
+        return filtered if len(filtered) else df.iloc[0:0].copy()
+
+    def get_active_scoring_df(self) -> Optional[pd.DataFrame]:
+        """Return active scoring, optionally filtered by night window."""
+        df = self.sleep_scoring_data
+        if df is None or df.empty:
+            return None
+        return self.filter_scoring_to_night_window(df)
 
     def detect_events(
         self,
@@ -639,7 +855,7 @@ class AppController:
                 detect_apneas_hypopneas,
                 detect_desaturations,
             )
-            from CESA.sleep_pipeline.contracts import ScoringResult, EpochScoring
+            from CESA.sleep_pipeline.contracts import ScoringResult  # noqa: F401 (not used directly)
 
             data = self.raw.get_data()
             sfreq = self.sfreq
@@ -679,28 +895,36 @@ class AppController:
             logger.error("Event detection failed (%s): %s", event_type, exc, exc_info=True)
             return []
 
-    def import_scoring_excel(self, path: str) -> bool:
-        """Import scoring from an Excel file and apply it as the active scoring."""
+    def import_scoring_file(self, path: str) -> bool:
+        """Import scoring from CSV, Excel, or JSON."""
         try:
-            from CESA.scoring_io import import_excel_scoring
+            from CESA.manual_scoring_service import ManualScoringService
             abs_start = None
             if self.raw is not None and self.raw.info.get("meas_date"):
                 abs_start = pd.Timestamp(self.raw.info["meas_date"])
-            df = import_excel_scoring(
-                pd.read_excel(path),
+            result = ManualScoringService.import_file_path(
+                path,
                 absolute_start_datetime=abs_start,
-                epoch_seconds=self.scoring_epoch_duration,
                 recording_duration_s=self.total_duration_s,
+                default_epoch_seconds=self.scoring_epoch_duration,
             )
+            df = result.df
             if df is not None and not df.empty:
                 self.manual_scoring_data = df
                 self.sleep_scoring_data = df.copy()
+                self.scoring_epoch_duration = float(result.epoch_seconds)
                 self.scoring_dirty = True
-                logger.info("[SCORING] Imported Excel scoring: %d epochs from %s", len(df), path)
+                if result.night_start_s is not None and result.night_end_s is not None:
+                    self.set_night_window(float(result.night_start_s), float(result.night_end_s))
+                logger.info("[SCORING] Imported scoring: %d epochs from %s", len(df), path)
                 return True
         except Exception as exc:
-            logger.error("Excel scoring import failed: %s", exc, exc_info=True)
+            logger.error("Scoring import failed: %s", exc, exc_info=True)
         return False
+
+    def import_scoring_excel(self, path: str) -> bool:
+        """Import scoring from an Excel file and apply it as the active scoring."""
+        return self.import_scoring_file(path)
 
     def import_scoring_edf(self, path: str) -> bool:
         """Import hypnogram from EDF+ annotations and apply it as the active scoring."""

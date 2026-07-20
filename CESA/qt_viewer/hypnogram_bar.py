@@ -12,7 +12,7 @@ Renders the full-night hypnogram as colour-coded stage blocks with:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -87,6 +87,8 @@ class HypnogramBar(QtWidgets.QWidget):
     epoch_context_stage = QtCore.Signal(float, str)
     navigate_to = QtCore.Signal(float)
     zoom_requested = QtCore.Signal(float)
+    night_start_requested = QtCore.Signal(float)
+    night_end_requested = QtCore.Signal(float)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -103,7 +105,7 @@ class HypnogramBar(QtWidgets.QWidget):
         self._drag_origin_x: float = 0.0
         self._drag_origin_start: float = 0.0
 
-        self.setFixedHeight(90)
+        self.setFixedHeight(100)
         self.setMouseTracking(True)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -115,10 +117,18 @@ class HypnogramBar(QtWidgets.QWidget):
         layout.addWidget(self._pw)
 
         self._plot.setMouseEnabled(x=False, y=False)
-        self._plot.hideAxis("left")
+        # Left axis kept visible (fixed width) so the plot area lines up
+        # with the night spectrogram band below (same reserved left gutter).
         self._plot.hideAxis("bottom")
         self._plot.setMenuEnabled(False)
         self._plot.hideButtons()
+        self._plot.getAxis("left").setWidth(40)
+        self._plot.getAxis("left").setTicks([
+            [(y + 0.5, name) for y, name in _Y_LABELS]
+        ])
+        self._plot.getAxis("left").setStyle(tickLength=0)
+        self._plot.disableAutoRange(axis="x")
+        self._plot.setLimits(xMin=0)
 
         self._pw.viewport().setMouseTracking(True)
         self._pw.viewport().installEventFilter(self)
@@ -126,6 +136,11 @@ class HypnogramBar(QtWidgets.QWidget):
         self._stage_items: list = []
         self._cycle_lines: list = []
         self._y_labels: list = []
+        self._night_marker_items: list = []
+        self._annotation_items: list = []
+        self._annotations: List[Dict[str, Any]] = []
+        self._night_start_s: Optional[float] = None
+        self._night_end_s: Optional[float] = None
 
         # Window highlight
         self._highlight = pg.LinearRegionItem(
@@ -161,7 +176,12 @@ class HypnogramBar(QtWidgets.QWidget):
         self._labels = list(labels)
         self._epoch_len = max(1.0, float(epoch_len))
         n = len(labels)
-        self._total_duration_s = max(total_duration_s, n * self._epoch_len)
+        # Prefer the caller-provided total so hypno and spectro share the
+        # exact same X span; fall back to n * epoch_len if missing.
+        if total_duration_s and total_duration_s > 0:
+            self._total_duration_s = float(total_duration_s)
+        else:
+            self._total_duration_s = n * self._epoch_len
         self._confidences = []
         self._redraw()
 
@@ -176,13 +196,31 @@ class HypnogramBar(QtWidgets.QWidget):
         self._confidences = list(confidences)
         self._epoch_len = max(1.0, float(epoch_len))
         n = len(labels)
-        self._total_duration_s = max(total_duration_s, n * self._epoch_len)
+        if total_duration_s and total_duration_s > 0:
+            self._total_duration_s = float(total_duration_s)
+        else:
+            self._total_duration_s = n * self._epoch_len
         self._redraw()
 
     def set_window(self, start_s: float, duration_s: float) -> None:
         self._window_start = start_s
         self._window_dur = duration_s
         self._highlight.setRegion([start_s, start_s + duration_s])
+
+    def set_night_window(
+        self,
+        start_s: Optional[float],
+        end_s: Optional[float],
+    ) -> None:
+        """Display analysis window markers (seconds from recording start)."""
+        self._night_start_s = float(start_s) if start_s is not None else None
+        self._night_end_s = float(end_s) if end_s is not None else None
+        self._draw_night_markers()
+
+    def set_annotations(self, events: List[Dict[str, Any]]) -> None:
+        """Display clinical annotations as markers above the hypnogram."""
+        self._annotations = list(events)
+        self._draw_annotations()
 
     def set_theme(self, theme: ThemePalette) -> None:
         self._theme = dict(theme)
@@ -212,18 +250,8 @@ class HypnogramBar(QtWidgets.QWidget):
         theme = self._theme
         has_conf = len(self._confidences) == n
 
-        # --- Y-axis stage labels (left side) ---
-        for y_pos, stage_name in _Y_LABELS:
-            txt = pg.TextItem(
-                text=stage_name,
-                color=theme.get("text_dim", "#6C7086"),
-                anchor=(1.0, 0.5),
-            )
-            txt.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Weight.Bold))
-            txt.setPos(-self._total_duration_s * 0.005, y_pos + 0.5)
-            txt.setZValue(20)
-            self._plot.addItem(txt)
-            self._y_labels.append(txt)
+        # Stage labels live on the left axis (fixed 40 px) so the plot
+        # content starts at the same pixel column as the spectrogram below.
 
         # --- Stage rectangles ---
         for i in range(n):
@@ -266,6 +294,12 @@ class HypnogramBar(QtWidgets.QWidget):
 
         # --- Sleep cycle boundaries ---
         self._draw_cycle_markers()
+
+        # --- Night analysis window markers ---
+        self._draw_night_markers()
+
+        # --- Clinical annotation markers ---
+        self._draw_annotations()
 
         # --- Horizontal grid lines for each stage level ---
         for y_pos, _ in _Y_LABELS:
@@ -310,12 +344,62 @@ class HypnogramBar(QtWidgets.QWidget):
             self._stage_items.append(lbl)
             t += hour_s
 
-        self._plot.setXRange(
-            -self._total_duration_s * 0.02,
-            self._total_duration_s * 1.01,
-            padding=0,
-        )
-        self._plot.setYRange(-0.8, 6.5, padding=0)
+        self._plot.setXRange(0.0, max(self._total_duration_s, 1.0), padding=0)
+        self._plot.setYRange(-0.8, 6.8, padding=0)
+
+    @staticmethod
+    def _format_time_min(t_s: float) -> str:
+        mins = int(t_s // 60)
+        secs = int(t_s % 60)
+        return f"{mins}:{secs:02d}"
+
+    def _draw_annotations(self) -> None:
+        """Draw user annotations in a dedicated lane above the hypnogram."""
+        for item in self._annotation_items:
+            self._plot.removeItem(item)
+        self._annotation_items.clear()
+
+        if not self._annotations:
+            return
+
+        lane_y = 6.05
+        lane_h = 0.55
+        for ev in self._annotations:
+            onset = float(ev.get("onset", 0.0))
+            dur = max(float(ev.get("duration", 1.0)), 0.5)
+            color = str(ev.get("color") or "#F9E2AF")
+            etype = str(ev.get("type") or ev.get("label") or "note")
+            label = str(ev.get("label") or ev.get("text") or etype)[:16]
+
+            rect = _RoundedRectItem(
+                onset, lane_y, dur, lane_h,
+                brush=pg.mkBrush(color),
+                pen=pg.mkPen(color, width=1.5),
+                radius=2.0, opacity=0.92,
+            )
+            rect.setZValue(8)
+            self._plot.addItem(rect)
+            self._annotation_items.append(rect)
+
+            tick = pg.InfiniteLine(
+                pos=onset, angle=90,
+                pen=pg.mkPen(color, width=1.5, style=QtCore.Qt.PenStyle.DashLine),
+            )
+            tick.setZValue(8)
+            self._plot.addItem(tick)
+            self._annotation_items.append(tick)
+
+            if dur >= self._epoch_len * 0.5:
+                lbl_item = pg.TextItem(
+                    text=label,
+                    color="#FFFFFF",
+                    anchor=(0.0, 0.5),
+                )
+                lbl_item.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Weight.Bold))
+                lbl_item.setPos(onset + 2, lane_y + lane_h * 0.5)
+                lbl_item.setZValue(9)
+                self._plot.addItem(lbl_item)
+                self._annotation_items.append(lbl_item)
 
     def _draw_cycle_markers(self) -> None:
         """Detect and mark approximate sleep cycle boundaries.
@@ -362,6 +446,71 @@ class HypnogramBar(QtWidgets.QWidget):
                 self._plot.addItem(lbl_item)
                 self._cycle_lines.append(lbl_item)
 
+    def _clear_night_markers(self) -> None:
+        for item in self._night_marker_items:
+            self._plot.removeItem(item)
+        self._night_marker_items.clear()
+
+    def _draw_night_markers(self) -> None:
+        """Draw vertical lines and shaded region for the analysis window."""
+        self._clear_night_markers()
+        if self._night_start_s is None or self._night_end_s is None:
+            return
+        if self._night_start_s >= self._night_end_s:
+            return
+
+        theme = self._theme
+        start_s = float(self._night_start_s)
+        end_s = float(self._night_end_s)
+
+        region = pg.LinearRegionItem(
+            values=[start_s, end_s],
+            movable=False,
+            brush=pg.mkBrush(76, 175, 80, 90),
+        )
+        for line in region.lines:
+            line.setPen(pg.mkPen("#4CAF50", width=2.5))
+        region.setZValue(4)
+        self._plot.addItem(region)
+        self._night_marker_items.append(region)
+
+        for pos, color, label in (
+            (start_s, "#66BB6A", "Lights off"),
+            (end_s, "#EF5350", "Lights on"),
+        ):
+            line = pg.InfiniteLine(
+                pos=pos, angle=90,
+                pen=pg.mkPen(color, width=3.0),
+            )
+            line.setZValue(6)
+            self._plot.addItem(line)
+            self._night_marker_items.append(line)
+
+            time_txt = self._format_time_min(pos)
+            lbl_item = pg.TextItem(
+                text=f"{label}\n{time_txt}",
+                color=color,
+                anchor=(0.5, 1.0),
+            )
+            lbl_item.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Weight.Bold))
+            lbl_item.setPos(pos, 6.75)
+            lbl_item.setZValue(7)
+            self._plot.addItem(lbl_item)
+            self._night_marker_items.append(lbl_item)
+
+        dur_min = (end_s - start_s) / 60.0
+        mid = (start_s + end_s) * 0.5
+        banner = pg.TextItem(
+            text=f"Fenetre analyse  {dur_min:.0f} min",
+            color="#A5D6A7",
+            anchor=(0.5, 0.0),
+        )
+        banner.setFont(QtGui.QFont("Segoe UI", 8, QtGui.QFont.Weight.Bold))
+        banner.setPos(mid, 6.78)
+        banner.setZValue(7)
+        self._plot.addItem(banner)
+        self._night_marker_items.append(banner)
+
     # ================================================================
     # Theme
     # ================================================================
@@ -370,6 +519,8 @@ class HypnogramBar(QtWidgets.QWidget):
         t = self._theme
         bg = t.get("hypno_bg", t.get("surface", "#121826"))
         self._pw.setBackground(bg)
+        self._plot.getAxis("left").setTextPen(t.get("text_dim", "#6C7086"))
+        self._plot.getAxis("left").setPen(t.get("hypno_grid", t.get("grid", "#2A2F3A")))
 
         win_brush = t.get("hypno_window", "#FFFFFF28")
         self._highlight.setBrush(pg.mkBrush(win_brush))
@@ -530,6 +681,16 @@ class HypnogramBar(QtWidgets.QWidget):
         mins = int((epoch_start % 3600) // 60)
         header = menu.addAction(f"Ep {ep_idx}  ({hours:02d}:{mins:02d})")
         header.setEnabled(False)
+        menu.addSeparator()
+
+        act_night_start = menu.addAction("Definir debut nuit ici (Lights off)")
+        act_night_start.triggered.connect(
+            lambda _c=False, es=epoch_start: self.night_start_requested.emit(float(es))
+        )
+        act_night_end = menu.addAction("Definir fin nuit ici (Lights on)")
+        act_night_end.triggered.connect(
+            lambda _c=False, es=epoch_start: self.night_end_requested.emit(float(es))
+        )
         menu.addSeparator()
 
         for st, label in [("W", "Wake"), ("N1", "N1"), ("N2", "N2"),

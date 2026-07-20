@@ -1,27 +1,19 @@
 # CESA
 
-![Version](https://img.shields.io/badge/version-0.0beta1.1-blue)
+![Version](https://img.shields.io/badge/version-0.0beta2.0-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green)
 ![Tests](https://img.shields.io/badge/tests-217%20passed-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **CESA** (Complex EEG Studio Analysis) is a Windows workstation for clinicians and researchers working with long-form EEG or polysomnography recordings. It sits on top of MNE-Python and bundles everything needed to inspect raw EDF+, run standard sleep scorings, compute advanced metrics (coherence, microstates, renormalised entropy) and export publication-ready plots.
 
-## What's new in v0.0beta1.1
+## What's new in v0.0beta2.0
 
-- **Composable filter engine** -- typed filter nodes (Bandpass, Highpass, Lowpass, Notch, Smoothing) with `FilterPipeline` chaining, JSON serialization, frequency-response visualisation.
-- **Clinical filter presets** -- 11 built-in presets (EEG Standard PSG, AASM Scoring, EOG, EMG, ECG, Notch 50/60 Hz, etc.) + user presets with import/export.
-- **Physiological range validation** -- AASM-based parameter ranges with visual warnings on every slider.
-- **Audit logging** -- timestamped record of every filter configuration change, exportable to JSON.
-- **Undo/Redo** -- 60-level stack with Ctrl+Z / Ctrl+Y shortcuts.
-- **Adaptive filter suggestions** -- rule-based and spectral-analysis-driven preset recommendations (delta/alpha/beta detection, 50/60 Hz mains contamination).
-- **Professional filter dialog** -- dark/light theme, channel search, batch apply, collapsible filter cards with color-coded tags, 3-panel preview (signal overlay + frequency response + PSD) with SNR indicator.
-- **Favorite presets** -- star/unstar presets for quick access, persisted to JSON.
-- **Channel annotations** -- per-channel text notes, visible in the dialog and included in reports.
-- **HTML report generator** -- combined pipeline summary, audit log, embedded SVG charts, annotations, and adaptive suggestions in a single styled HTML document. CLI and UI export.
-- **Mini-dashboard** -- popup summary of filtering state (active channels, warnings, SNR per channel, recent audit actions).
-- **Sleep pipeline** v4 -- HMM with Viterbi decoding, SHAP explainability, Transformer/Attention DL models, clinical metrics (TST, SE, SOL, WASO), temporal context features.
-- **217+ unit tests** with zero regressions.
+- **Ocular cleaning (non-destructive)** -- EOG→EEG regression in memory with mandatory before/after preview and restore; recording files are never modified (`Filtres → Nettoyage oculaire...`).
+- **Native Qt analysis dialogs** -- artifact detection, stage PSD, wavelet spectrogram, entropy, temporal metrics, connectivity, microstates, sleep periods, scoring editor/comparison, PSG report, markers, EDF segment export, batch/multi-subject.
+- **Spectrogram bars** -- night-long and window spectrograms in the Qt viewer.
+- **Sleep metrics & batch engine** -- clinical sleep stats helpers and batch processing utilities.
+- **Import profiles** -- PSG / PSG-HD import presets under `config/import_profiles/`.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -61,12 +53,24 @@ The CLI auto-detects the number of CPU cores and can run analyses in parallel (`
 4. For scripted pipelines, call the functions in `CESA/entropy.py` or use the CSV analysis CLI.
 5. To generate a standalone filter report: `python -m CESA.report_generator --audit audit.json --output report.html`.
 
+## Windows standalone (PyInstaller)
+
+The frozen build is produced with `pyinstaller cesa.spec` and lands under **`dist/CESA/`** (one-folder layout: `CESA.exe` plus DLLs, Qt plugins, and usually an `_internal` tree).
+
+**Rules for distribution**
+
+- **Copy the entire `dist/CESA/` folder** (zip it, ship it, extract it as-is on the target PC). Copying **only** `CESA.exe` will fail with errors such as **Shiboken6 / libShiboken not found** or **DLL load failed**, because PySide6’s native libraries live next to the executable inside that folder.
+- On the **target** machine, install the **Microsoft Visual C++ Redistributable (x64)** (v14 covers VS 2015–2022-era runtimes used by Qt/PySide6). Many developer PCs already have it; clean laptops often do not. **Download hub (French):** [visualstudio.microsoft.com/fr/downloads](https://visualstudio.microsoft.com/fr/downloads/) — expand **« Tous les téléchargements »** / **« Autres outils, infrastructure et redistribuables »**, then **« Microsoft Visual C++ v14 Redistributable »** and pick **x64**. Technical reference: [Latest supported VC++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist).
+- Prefer a short path without sync quirks; some antivirus or OneDrive policies can block or strip DLLs from the bundle.
+
+`INSTALL.bat` (developer setup) includes checks for the VC++ runtime and, if `dist/CESA/CESA.exe` is present, for a coherent Shiboken6 DLL next to the PyInstaller output.
+
 ## Project structure
 
 ```
 CESA-main/
 ├── CESA/                    # Core package
-│   ├── __init__.py          # Version 0.0beta1.1
+│   ├── __init__.py          # Version 0.0beta2.0
 │   ├── filter_engine.py     # Composable filter engine
 │   ├── filters.py           # Legacy wrapper (backward-compat)
 │   ├── report_generator.py  # HTML report generator

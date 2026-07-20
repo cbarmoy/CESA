@@ -156,14 +156,18 @@ class AnnotationStore:
         return count
 
     def to_event_list(self) -> List[Dict[str, Any]]:
-        """Convert to the event list format used by EventsBar."""
+        """Convert to the event list format used by EventsBar / hypnogram."""
         return [
             {
                 "onset": a.onset_s,
                 "duration": a.duration_s,
                 "type": a.ann_type,
                 "label": a.text or a.ann_type,
+                "text": a.text,
                 "id": a.id,
+                "channel": a.channel,
+                "color": a.effective_color(),
+                "source": a.source,
             }
             for a in self.all()
         ]

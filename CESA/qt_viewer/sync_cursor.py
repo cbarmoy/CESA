@@ -36,6 +36,7 @@ class SyncCursorManager(QtCore.QObject):
         self._hover_label: Optional[QtWidgets.QLabel] = None
         self._signals: Dict[str, Tuple[np.ndarray, float]] = {}
         self._epoch_len: float = 30.0
+        self._hypnogram_labels: List[str] = []
 
     def register_panel(self, plot_item: pg.PlotItem) -> pg.InfiniteLine:
         """Add a plot panel and return the cursor line added to it."""
@@ -58,6 +59,10 @@ class SyncCursorManager(QtCore.QObject):
 
     def set_epoch_length(self, epoch_len: float) -> None:
         self._epoch_len = max(1.0, epoch_len)
+
+    def set_hypnogram_labels(self, labels: List[str]) -> None:
+        self._hypnogram_labels = list(labels or [])
+        self._update_hover_text(self._time_s)
 
     def set_theme(self, theme: ThemePalette) -> None:
         self._theme = dict(theme)
@@ -95,7 +100,13 @@ class SyncCursorManager(QtCore.QObject):
         m = int((t % 3600) // 60)
         s = t % 60
         parts = [f"{h:02d}:{m:02d}:{s:05.2f}"]
-        parts.append(f"Ep {self.epoch_index()}")
+        ep_idx = self.epoch_index()
+        parts.append(f"Ep {ep_idx}")
+        if self._hypnogram_labels:
+            ep_idx = max(0, min(ep_idx, len(self._hypnogram_labels) - 1))
+            from .themes import stage_display_name, normalize_stage
+            code = normalize_stage(self._hypnogram_labels[ep_idx])
+            parts.append(stage_display_name(code))
 
         for name, (data, fs) in list(self._signals.items())[:4]:
             idx = int(t * fs)

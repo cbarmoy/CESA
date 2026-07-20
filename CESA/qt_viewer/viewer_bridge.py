@@ -76,10 +76,18 @@ class ViewerBridge:
         self._win._on_navigate = callback
 
     def set_baseline_enabled(self, enabled: bool) -> None:
-        pass
+        try:
+            self._win._viewer.set_show_baselines(bool(enabled))
+        except Exception as exc:
+            logger.warning("set_baseline_enabled failed: %s", exc)
 
     def set_autoscale_enabled(self, enabled: bool) -> None:
-        pass
+        if not enabled:
+            return
+        try:
+            self._win._on_scaling_auto()
+        except Exception as exc:
+            logger.warning("set_autoscale_enabled failed: %s", exc)
 
     def set_scoring_annotations(self, events: List[Dict[str, Any]]) -> None:
         self._win.set_scoring_annotations(events)
@@ -140,7 +148,13 @@ class ViewerBridge:
             logger.warning("PDF export failed: %s", exc)
 
     def export_scoring_csv(self, filepath: str) -> None:
-        pass
+        try:
+            ctrl = getattr(self._win, "_app_controller", None)
+            if ctrl is not None and ctrl.save_scoring_csv(filepath):
+                return
+            logger.warning("export_scoring_csv: no scoring data to export")
+        except Exception as exc:
+            logger.warning("export_scoring_csv failed: %s", exc)
 
     @property
     def filter_pipelines_by_channel(self) -> Dict[str, Any]:
@@ -213,6 +227,14 @@ def create_and_launch(
     on_request_stage_for_current_epoch: Optional[Callable[[str], None]] = None,
     on_request_stage_at_epoch_time: Optional[Callable[[float, str], None]] = None,
     on_global_filter_toggled: Optional[Callable[[bool], None]] = None,
+    on_set_manual_auto_advance: Optional[Callable[[bool], None]] = None,
+    on_get_manual_auto_advance: Optional[Callable[[], bool]] = None,
+    on_open_stage_psd_fft: Optional[Callable[[], None]] = None,
+    on_open_stage_psd_before_after: Optional[Callable[[], None]] = None,
+    on_open_wavelet_spectrogram: Optional[Callable[[], None]] = None,
+    on_open_batch_fft_automation: Optional[Callable[[], None]] = None,
+    on_open_group_analysis: Optional[Callable[[], None]] = None,
+    on_toggle_fft_scoring_view: Optional[Callable[[], None]] = None,
 ) -> ViewerBridge:
     """Create and show the Qt EEG viewer, returning a :class:`ViewerBridge`.
 
@@ -245,6 +267,14 @@ def create_and_launch(
         on_request_stage_for_current_epoch=on_request_stage_for_current_epoch,
         on_request_stage_at_epoch_time=on_request_stage_at_epoch_time,
         on_global_filter_toggled=on_global_filter_toggled,
+        on_set_manual_auto_advance=on_set_manual_auto_advance,
+        on_get_manual_auto_advance=on_get_manual_auto_advance,
+        on_open_stage_psd_fft=on_open_stage_psd_fft,
+        on_open_stage_psd_before_after=on_open_stage_psd_before_after,
+        on_open_wavelet_spectrogram=on_open_wavelet_spectrogram,
+        on_open_batch_fft_automation=on_open_batch_fft_automation,
+        on_open_group_analysis=on_open_group_analysis,
+        on_toggle_fft_scoring_view=on_toggle_fft_scoring_view,
     )
     window.show()
 

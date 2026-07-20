@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -134,7 +136,7 @@ def _load_fft_group(folder_path: str, group_name: str) -> pd.DataFrame:
 # Calculs de bande et métriques
 # =====================
 def _integrate_auc_sorted(freq: np.ndarray, amp: np.ndarray) -> float:
-    return float(np.trapz(amp, freq))
+    return float(_trapz(amp, freq))
 
 
 def _assign_band(freq_value: float, bands: Dict[str, Tuple[float, float]]) -> Optional[str]:
@@ -1544,7 +1546,7 @@ def _band_auc_from_epoch(seg: np.ndarray, fs: float, bands: Dict[str, Tuple[floa
     freqs_t = freqs[mask_total]
     spec_t = spec[mask_total]
     eps = np.finfo(float).eps
-    total_auc = float(np.trapz(spec_t, freqs_t)) + eps
+    total_auc = float(_trapz(spec_t, freqs_t)) + eps
     out: Dict[str, Dict[str, float]] = {}
     for name, (lo, hi) in bands.items():
         m = (freqs >= lo) & (freqs <= hi)
@@ -1558,7 +1560,7 @@ def _band_auc_from_epoch(seg: np.ndarray, fs: float, bands: Dict[str, Tuple[floa
                 'Barycenter': np.nan,
             }
             continue
-        auc_b = float(np.trapz(s, f))
+        auc_b = float(_trapz(s, f))
         rel = auc_b / total_auc if total_auc > 0 else np.nan
         peak_amp = float(s.max())
         peak_freq = float(f[np.argmax(s)])

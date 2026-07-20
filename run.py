@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-CESA (Complex EEG Studio Analysis) 0.0beta1.1 - Main Launcher
+CESA (Complex EEG Studio Analysis) 0.0beta2.0 - Main Launcher
 ===============================================================
 
 Script de lancement principal pour l'application CESA.
 Lance l'interface Qt unique avec verification des dependances.
 
 Auteur: Come Barmoy (Unite Neuropsychologie du Stress - IRBA)
-Version: 0.0beta1.1
+Version: 0.0beta2.0
 Date: 2026-04-05
 """
 
@@ -284,7 +284,7 @@ def _build_splash_pixmap():
         painter = QtGui.QPainter(pm)
         painter.setPen(QtGui.QColor("white"))
         painter.setFont(QtGui.QFont("Segoe UI", 16, QtGui.QFont.Weight.Bold))
-        painter.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "CESA 0.0beta1.1")
+        painter.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "CESA 0.0beta2.0")
         painter.end()
         return pm
 
@@ -321,7 +321,7 @@ def main():
     )
     telemetry.expect_modes(["lazy", "precomputed"])
 
-    print("CESA (Complex EEG Studio Analysis) 0.0beta1.1")
+    print("CESA (Complex EEG Studio Analysis) 0.0beta2.0")
     print("=" * 50)
 
     logging.info("Checking dependencies...")
@@ -332,7 +332,7 @@ def main():
     logging.info("All dependencies available")
 
     try:
-        logging.info("Launching CESA 0.0beta1.1...")
+        logging.info("Launching CESA 0.0beta2.0...")
 
         from PySide6 import QtWidgets, QtGui, QtCore
 
@@ -351,7 +351,7 @@ def main():
             app = QtWidgets.QApplication(sys.argv)
 
         app.setApplicationName("CESA")
-        app.setApplicationVersion("0.0beta1.1")
+        app.setApplicationVersion("0.0beta2.0")
 
         icon_path = _find_icon_path()
         if icon_path:

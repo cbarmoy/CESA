@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -45,6 +45,7 @@ class NavigationBar(QtWidgets.QWidget):
     time_slider_released = QtCore.Signal()
     scaling_panel_toggled = QtCore.Signal(bool)
     layout_panel_toggled = QtCore.Signal(bool)
+    spectrogram_panel_toggled = QtCore.Signal(bool)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -54,6 +55,8 @@ class NavigationBar(QtWidgets.QWidget):
         self._current_time: float = 0.0
         self._duration: float = 30.0
         self._playing: bool = False
+        self._hypnogram_labels: List[str] = []
+        self._stage_theme: dict = {}
 
         self._play_timer = QtCore.QTimer(self)
         self._play_timer.setInterval(1000)
@@ -84,6 +87,15 @@ class NavigationBar(QtWidgets.QWidget):
 
     def set_epoch_length(self, epoch_len: float) -> None:
         self._epoch_len = max(1.0, float(epoch_len))
+        self._update_time_label()
+
+    def set_hypnogram_labels(self, labels: List[str]) -> None:
+        self._hypnogram_labels = list(labels or [])
+        self._update_time_label()
+
+    def set_stage_theme(self, theme: dict) -> None:
+        self._stage_theme = dict(theme)
+        self._update_stage_label()
 
     # ----- UI construction ----------------------------------------------
 
@@ -149,6 +161,14 @@ class NavigationBar(QtWidgets.QWidget):
         self._time_label.setFont(QtGui.QFont("Consolas", 9))
         main.addWidget(self._time_label)
 
+        main.addWidget(QtWidgets.QLabel("Stade:"))
+        self._stage_label = QtWidgets.QLabel("—")
+        self._stage_label.setObjectName("stageBadge")
+        self._stage_label.setMinimumWidth(84)
+        self._stage_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._stage_label.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+        main.addWidget(self._stage_label)
+
         main.addSpacing(8)
 
         # -- Duration control --
@@ -202,6 +222,13 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_layout.setChecked(False)
         main.addWidget(self._btn_layout)
 
+        # -- Spectrogram panel toggle (opens dock) --
+        self._btn_spectro = QtWidgets.QPushButton("Spectro")
+        self._btn_spectro.setToolTip("Ouvrir/fermer le panneau Spectrogramme ondelette")
+        self._btn_spectro.setCheckable(True)
+        self._btn_spectro.setChecked(False)
+        main.addWidget(self._btn_spectro)
+
     def _connect_signals(self) -> None:
         self._slider.valueChanged.connect(self._on_slider)
         self._slider.sliderReleased.connect(self.time_slider_released.emit)
@@ -219,6 +246,7 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_normalize.toggled.connect(self.normalize_toggled.emit)
         self._btn_scaling.toggled.connect(self.scaling_panel_toggled.emit)
         self._btn_layout.toggled.connect(self.layout_panel_toggled.emit)
+        self._btn_spectro.toggled.connect(self.spectrogram_panel_toggled.emit)
 
     # ----- slots --------------------------------------------------------
 
@@ -311,6 +339,26 @@ class NavigationBar(QtWidgets.QWidget):
         m = int((s % 3600) // 60)
         sec = int(s % 60)
         self._time_label.setText(f"{h:02d}:{m:02d}:{sec:02d}")
+        self._update_stage_label()
+
+    def _update_stage_label(self) -> None:
+        from .themes import DARK, normalize_stage, stage_badge_stylesheet, stage_display_name
+
+        theme = self._stage_theme or DARK
+        if not self._hypnogram_labels:
+            self._stage_label.setText("—")
+            self._stage_label.setToolTip("Aucun scoring charge")
+            self._stage_label.setStyleSheet(
+                f"color: {theme.get('text_dim', '#888')}; padding: 2px 8px;"
+            )
+            return
+        ep = int(self._current_time / self._epoch_len) if self._epoch_len > 0 else 0
+        ep = max(0, min(ep, len(self._hypnogram_labels) - 1))
+        code = normalize_stage(self._hypnogram_labels[ep])
+        label = stage_display_name(code)
+        self._stage_label.setText(f"{label} ({code})")
+        self._stage_label.setToolTip(f"Epoque {ep} — {label}")
+        self._stage_label.setStyleSheet(stage_badge_stylesheet(theme, code))
 
     # ----- public helpers for syncing button state -----------------------
 
@@ -323,6 +371,11 @@ class NavigationBar(QtWidgets.QWidget):
         self._btn_layout.blockSignals(True)
         self._btn_layout.setChecked(checked)
         self._btn_layout.blockSignals(False)
+
+    def set_spectrogram_button(self, checked: bool) -> None:
+        self._btn_spectro.blockSignals(True)
+        self._btn_spectro.setChecked(checked)
+        self._btn_spectro.blockSignals(False)
 
     # ----- keyboard shortcuts (forwarded from main window) ---------------
 
