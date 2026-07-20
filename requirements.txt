@@ -40,7 +40,7 @@ neurokit2>=0.2.7        # HRV RR cleaning methods (NeuroKit2/Kubios)
 # High-performance EEG viewer (PyQtGraph) — requis pour la vue PSG par défaut
 # Si pip échoue : vérifiez une version Python supportée par PySide6 (souvent 3.9–3.12 sur PyPI).
 PySide6>=6.5.0
-pyqtgraph>=0.13.0
+pyqtgraph>=0.14.0
 
 # Benchmark & publication pipeline
 seaborn>=0.13.0         # Publication-quality statistical plots
