@@ -59,6 +59,8 @@ DARK: ThemePalette = {
     "event_apnea": "#F38BA8",
     "event_hypopnea": "#FAB387",
     "event_rem": "#CBA6F7",
+    "event_spindle": "#89B4FA",
+    "event_slow_wave": "#74C7EC",
     "event_default": "#89B4FA",
 }
 
@@ -106,6 +108,8 @@ LIGHT: ThemePalette = {
     "event_apnea": "#DC2626",
     "event_hypopnea": "#EA580C",
     "event_rem": "#7C3AED",
+    "event_spindle": "#2563EB",
+    "event_slow_wave": "#0891B2",
     "event_default": "#3B82F6",
 }
 
@@ -197,10 +201,14 @@ def event_color(theme: ThemePalette, event_type: str) -> str:
     t = event_type.lower()
     if "arousal" in t:
         return theme["event_arousal"]
-    if "apnea" in t or "apnée" in t:
+    if "apnea" in t or "apnée" in t or "apnee" in t:
         return theme["event_apnea"]
-    if "hypopnea" in t or "hypopnée" in t:
+    if "hypopnea" in t or "hypopnée" in t or "hypopnee" in t:
         return theme["event_hypopnea"]
+    if "spindle" in t or "fuseau" in t:
+        return theme.get("event_spindle", theme["event_default"])
+    if "slow_wave" in t or "slow wave" in t or "onde lente" in t or t in ("so", "sw"):
+        return theme.get("event_slow_wave", theme["event_default"])
     if "rem" in t:
         return theme["event_rem"]
     return theme["event_default"]

@@ -36,7 +36,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "sigma_n2_min": 0.04,           # sigma / total power -- spindle proxy
     "theta_n1_min": 0.25,           # theta dominance for N1
     # Cross-channel
-    "eog_rem_activity_min": 50.0,   # EOG derivative variance threshold for REMs
+    "eog_rem_activity_min": 50.0,   # absolute fallback, uV^2 (see below)
+    "eog_rem_relative_min": 2.0,    # times the night's own quiet-eye baseline
+    "eog_rem_count_min": 3.0,       # discrete REMs in a 30 s epoch (AASM: present)
     "emg_atonia_max": 5.0,          # EMG RMS below this ≈ atonia (REM)
     # General
     "emg_wake_min": 10.0,           # EMG RMS high => likely Wake
@@ -47,6 +49,37 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
 # ---------------------------------------------------------------------------
 # Core rule engine
 # ---------------------------------------------------------------------------
+
+def _eyes_moving(
+    feats: Dict[str, float],
+    thresholds: Dict[str, float],
+) -> tuple[bool, str]:
+    """Whether this epoch shows rapid eye movements, relative to the night.
+
+    Two complementary cues, because AASM scores REM on discrete REMs and a
+    30 s variance of the EOG derivative barely moves when those REMs are
+    sparse. Either cue is enough. When no night-wide baseline could be
+    established, the absolute fallbacks apply.
+    """
+    relative = feats.get("eog_rem_relative")
+    count_rel = feats.get("eog_rem_count_relative")
+    count = float(feats.get("eog_rem_count", 0.0))
+    eog_rem = float(feats.get("eog_rem_activity", 0.0))
+    rel_min = thresholds["eog_rem_relative_min"]
+    count_min = thresholds["eog_rem_count_min"]
+    has_baseline = relative is not None or count_rel is not None
+
+    if relative is not None and relative >= rel_min:
+        return True, f"rem_eog_x{relative:.1f}_baseline"
+    if count_rel is not None and count_rel >= rel_min and count >= count_min:
+        return True, f"rem_count_x{count_rel:.1f}_baseline"
+    if not has_baseline:
+        if eog_rem >= thresholds["eog_rem_activity_min"]:
+            return True, f"rem_eog={eog_rem:.1f}"
+        if count >= count_min:
+            return True, f"rem_count={count:.0f}"
+    return False, "yeux_calmes"
+
 
 def _classify_epoch(
     feats: Dict[str, float],
@@ -65,26 +98,44 @@ def _classify_epoch(
     rp_theta = feats.get("relpow_theta", 0.0)
     rp_sigma = feats.get("relpow_sigma", 0.0)
     emg_rms = feats.get("emg_rms", 0.0)
-    eog_rem = feats.get("eog_rem_activity", 0.0)
     delta_beta = feats.get("ratio_delta_beta", 0.0)
 
-    # --- Wake (AASM: alpha rhythm present, eyes-open or eyes-closed) ------
-    if rp_alpha >= thresholds["alpha_wake_min"] and emg_rms >= thresholds["emg_wake_min"]:
-        return StageLabel.W, 0.85, f"alpha={rp_alpha:.2f}>=thr,emg={emg_rms:.1f}"
+    # An absent channel reports 0.0, which must not be read as a measurement:
+    # requiring a high EMG for Wake makes Wake unreachable on a montage without
+    # a chin EMG, and requiring atonia is trivially satisfied there.
+    has_emg = feats.get("has_emg", 1.0) > 0.5
+    has_eog = feats.get("has_eog", 1.0) > 0.5
+    atonia = emg_rms <= thresholds["emg_atonia_max"] if has_emg else True
+    eyes_moving, eog_detail = _eyes_moving(feats, thresholds)
 
-    if emg_rms >= thresholds["emg_wake_min"] * 1.5 and rp_alpha >= thresholds["alpha_wake_min"] * 0.6:
-        return StageLabel.W, 0.70, f"high_emg={emg_rms:.1f},alpha={rp_alpha:.2f}"
+    # --- Wake with EMG (AASM: alpha + elevated chin tone) -----------------
+    # Checked before REM: blinks and saccades of Wake must not be scored as
+    # REM when the chin EMG is high.
+    if has_emg:
+        if rp_alpha >= thresholds["alpha_wake_min"] and emg_rms >= thresholds["emg_wake_min"]:
+            return StageLabel.W, 0.85, f"alpha={rp_alpha:.2f}>=thr,emg={emg_rms:.1f}"
+
+        if emg_rms >= thresholds["emg_wake_min"] * 1.5 and rp_alpha >= thresholds["alpha_wake_min"] * 0.6:
+            return StageLabel.W, 0.70, f"high_emg={emg_rms:.1f},alpha={rp_alpha:.2f}"
 
     # --- N3 / Slow-wave sleep (AASM: >= 20% delta) -----------------------
     if rp_delta >= thresholds["delta_n3_min"] and delta_beta >= thresholds["delta_beta_n3_min"]:
         return StageLabel.N3, 0.80, f"delta={rp_delta:.2f}>=thr,d/b={delta_beta:.1f}"
 
-    # --- REM (AASM: low-voltage mixed-frequency EEG + REMs + atonia) ------
+    # --- REM (AASM: mixed-frequency EEG + REMs + atonia) ------------------
+    # Must run before the no-EMG Wake rule. Without a chin EMG, alpha in a
+    # mixed-frequency epoch is ambiguous; the EOG is the discriminator.
+    if has_eog and eyes_moving and atonia:
+        detail = f"atonia_emg={emg_rms:.1f}" if has_emg else "sans_emg"
+        return StageLabel.R, 0.75 if has_emg else 0.60, f"{eog_detail},{detail}"
+
+    # --- Wake without EMG: alpha, quiet eyes, little slow activity --------
     if (
-        eog_rem >= thresholds["eog_rem_activity_min"]
-        and emg_rms <= thresholds["emg_atonia_max"]
+        not has_emg
+        and rp_alpha >= thresholds["alpha_wake_min"]
+        and rp_delta < thresholds["delta_n3_min"]
     ):
-        return StageLabel.R, 0.75, f"rem_eog={eog_rem:.1f},atonia_emg={emg_rms:.1f}"
+        return StageLabel.W, 0.60, f"alpha={rp_alpha:.2f}>=thr,sans_emg"
 
     # --- N2 (AASM: sleep spindles / K-complexes on background theta) ------
     if rp_sigma >= thresholds["sigma_n2_min"] and rp_delta < thresholds["delta_n3_min"]:
@@ -101,6 +152,81 @@ def _classify_epoch(
     fallback_map = {"delta": StageLabel.N3, "theta": StageLabel.N1, "alpha": StageLabel.W, "sigma": StageLabel.N2}
     stage = fallback_map.get(dominant, StageLabel.N1)
     return stage, 0.40, f"fallback_dominant_{dominant}={bands[dominant]:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Night-relative eye-movement activity
+# ---------------------------------------------------------------------------
+
+#: Below this many epochs the median is too noisy to serve as a baseline.
+_MIN_EPOCHS_FOR_BASELINE = 20
+
+
+def _night_median(
+    feature_list: Sequence[Dict[str, float]],
+    key: str,
+    *,
+    require_positive: bool = True,
+) -> Optional[float]:
+    values = [
+        float(f.get(key, 0.0))
+        for f in feature_list
+        if f.get("has_eog", 1.0) > 0.5
+    ]
+    usable = [
+        v for v in values
+        if np.isfinite(v) and (v > 0.0 if require_positive else True)
+    ]
+    if len(usable) < _MIN_EPOCHS_FOR_BASELINE:
+        return None
+    baseline = float(np.median(usable))
+    if require_positive and baseline <= 0.0:
+        return None
+    return baseline
+
+
+def eog_activity_baseline(feature_list: Sequence[Dict[str, float]]) -> Optional[float]:
+    """Quiet-eye reference of a recording, or ``None`` if it cannot be measured.
+
+    The variance of the EOG derivative scales with the amplifier range and
+    shrinks as the sampling rate rises, so no fixed value transfers from one
+    recording to the next. Most of a night is quiet NREM, so the median over the
+    night is a usable "eyes still" reference that REM and wake epochs stand out
+    from, whatever the scale.
+    """
+    return _night_median(feature_list, "eog_rem_activity", require_positive=True)
+
+
+def add_relative_eog_activity(
+    feature_list: List[Dict[str, float]],
+) -> List[Dict[str, float]]:
+    """Add night-relative EOG descriptors used by the REM rule.
+
+    ``eog_rem_relative`` is the derivative-variance in units of the night
+    median. ``eog_rem_count_relative`` is the same for the discrete REM count.
+    Left absent when no baseline can be established, in which case the rules
+    fall back to the absolute thresholds.
+    """
+    activity_base = eog_activity_baseline(feature_list)
+    count_base = _night_median(
+        feature_list, "eog_rem_count", require_positive=False,
+    )
+    if count_base is not None and count_base <= 0.0:
+        count_base = None
+    if activity_base is None and count_base is None:
+        return feature_list
+    for feats in feature_list:
+        if feats.get("has_eog", 1.0) <= 0.5:
+            continue
+        if activity_base is not None:
+            feats["eog_rem_relative"] = (
+                float(feats.get("eog_rem_activity", 0.0)) / activity_base
+            )
+        if count_base is not None:
+            feats["eog_rem_count_relative"] = (
+                float(feats.get("eog_rem_count", 0.0)) / count_base
+            )
+    return feature_list
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +305,7 @@ def score_rule_based(
     ScoringResult
     """
     thr = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    add_relative_eog_activity(feature_list)
 
     epochs: List[Epoch] = []
     prev_stage: Optional[StageLabel] = None

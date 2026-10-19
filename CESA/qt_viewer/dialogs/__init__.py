@@ -22,6 +22,11 @@ from .artifact_detection_dialog import ArtifactDetectionDialog
 from .ocular_cleaning_dialog import OcularCleaningDialog
 from .connectivity_dialog import ConnectivityDialog
 from .microstates_dialog import MicrostatesDialog
+from .micro_events_dialog import MicroEventsDialog
+from .specparam_dialog import SpecParamDialog
+from .night_qc_dialog import NightQcDialog
+from .ica_cleaning_dialog import IcaCleaningDialog
+from .feature_search_dialog import FeatureSearchDialog
 
 __all__ = [
     "OpenDatasetDialog",
@@ -48,4 +53,9 @@ __all__ = [
     "OcularCleaningDialog",
     "ConnectivityDialog",
     "MicrostatesDialog",
+    "MicroEventsDialog",
+    "SpecParamDialog",
+    "NightQcDialog",
+    "IcaCleaningDialog",
+    "FeatureSearchDialog",
 ]

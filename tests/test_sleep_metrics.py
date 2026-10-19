@@ -8,7 +8,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from CESA.sleep_metrics import compute_psg_summary, export_psg_summary_csv
+from CESA.sleep_metrics import (
+    compute_psg_summary,
+    count_sleep_cycles,
+    export_psg_summary_csv,
+    stage_transition_matrix,
+    transition_probabilities,
+)
 
 
 def _sample_df() -> pd.DataFrame:
@@ -87,3 +93,34 @@ class TestPsgSummary:
         assert "arousal" in text
         assert "Arousal test" in text
         assert "2.00" in text  # onset_min
+
+
+class TestCyclesAndTransitions:
+    def test_count_sleep_cycles(self):
+        stages = ["W", "N2", "N3", "R", "R", "N2", "N3", "R", "N1"]
+        cycles = count_sleep_cycles(stages, epoch_s=30.0)
+        assert cycles.n_cycles == 2
+        assert len(cycles.boundaries_s) == 2
+
+    def test_transition_matrix(self):
+        stages = ["W", "N1", "N2", "N2", "R"]
+        counts, labels = stage_transition_matrix(stages)
+        assert labels == ["W", "N1", "N2", "N3", "R"]
+        assert counts.shape == (5, 5)
+        assert counts[0, 1] == 1  # W -> N1
+        probs = transition_probabilities(counts)
+        assert abs(probs[0].sum() - 1.0) < 1e-9
+
+    def test_psg_summary_includes_cycles_and_lights_alias(self):
+        stages = ["W", "N2", "R", "N2", "R", "N3"]
+        df = pd.DataFrame({
+            "time": [i * 30.0 for i in range(len(stages))],
+            "stage": stages,
+        })
+        summary = compute_psg_summary(
+            df, 30.0, night_start_s=0.0, night_end_s=180.0,
+        )
+        assert summary.n_cycles >= 1
+        assert summary.transition_counts is not None
+        assert summary.lights_off_s == 0.0
+        assert summary.lights_on_s == 180.0

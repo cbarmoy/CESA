@@ -7,7 +7,7 @@ loaded recording, updated as scoring / annotations change.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -88,7 +88,18 @@ class DashboardPanel(QtWidgets.QDockWidget):
         )
         self._snr_table.setMaximumHeight(140)
         quality_lay.addRow(self._snr_table)
+        self._qc_bad_label = QtWidgets.QLabel("0")
+        quality_lay.addRow("Canaux suspects:", self._qc_bad_label)
         layout.addWidget(self._quality_group)
+
+        # Night QC summary
+        self._qc_group = QtWidgets.QGroupBox("Qualite nuit")
+        qc_lay = QtWidgets.QFormLayout(self._qc_group)
+        self._qc_n_label = QtWidgets.QLabel("--")
+        self._qc_flat_label = QtWidgets.QLabel("--")
+        qc_lay.addRow("Canaux analyses:", self._qc_n_label)
+        qc_lay.addRow("Plats:", self._qc_flat_label)
+        layout.addWidget(self._qc_group)
 
         # Filter status
         self._filter_group = QtWidgets.QGroupBox("Filtres")
@@ -182,6 +193,24 @@ class DashboardPanel(QtWidgets.QDockWidget):
             item = QtWidgets.QListWidgetItem(w)
             item.setForeground(QtGui.QColor("#F9E2AF"))
             self._warnings_list.addItem(item)
+
+    def set_night_qc(
+        self,
+        *,
+        n_channels: int = 0,
+        n_bad: int = 0,
+        n_flat: int = 0,
+        warnings: Optional[List[str]] = None,
+    ) -> None:
+        self._qc_n_label.setText(str(n_channels))
+        self._qc_flat_label.setText(str(n_flat))
+        self._qc_bad_label.setText(str(n_bad))
+        if n_bad > 0:
+            self._qc_bad_label.setStyleSheet("color: #F38BA8;")
+        else:
+            self._qc_bad_label.setStyleSheet("color: #A6E3A1;")
+        if warnings is not None:
+            self.set_warnings(warnings)
 
     def compute_snr(
         self, signals: Dict[str, Any], epoch_len: float = 30.0,

@@ -46,14 +46,17 @@ BANDS: Dict[str, tuple[float, float]] = {
 # Single-epoch helpers
 # ---------------------------------------------------------------------------
 
+# np.trapz was removed in NumPy 2.0; use np.trapezoid when available.
+_TRAPZ = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
+
 def _band_power(psd: np.ndarray, freqs: np.ndarray, fmin: float, fmax: float) -> float:
     """Absolute band power (uV^2) between *fmin* and *fmax*."""
     mask = (freqs >= fmin) & (freqs < fmax)
     if not mask.any():
         return 0.0
     df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
-    _trapz = getattr(np, "trapezoid", np.trapz)
-    return float(_trapz(psd[mask], dx=df))
+    return float(_TRAPZ(psd[mask], dx=df))
 
 
 def _zero_crossing_rate(x: np.ndarray) -> float:
@@ -400,11 +403,15 @@ def extract_all_features(epoched: EpochedSignals) -> List[Dict[str, float]]:
     """Extract features for every epoch.
 
     Returns a list of dicts (one per epoch).  Features from unavailable
-    modalities are filled with 0.0.
+    modalities are filled with 0.0, and ``has_eog`` / ``has_emg`` record which
+    modalities were really measured: a zero that means "absent channel" must
+    not be read as a zero that means "no muscle tone".
     """
     all_feats: List[Dict[str, float]] = []
+    has_eog = 1.0 if epoched.eog_epochs is not None else 0.0
+    has_emg = 1.0 if epoched.emg_epochs is not None else 0.0
     for i in range(epoched.n_epochs):
-        f: Dict[str, float] = {}
+        f: Dict[str, float] = {"has_eog": has_eog, "has_emg": has_emg}
         f.update(epoch_features_eeg(epoched.eeg_epochs[i], epoched.sfreq))
         if epoched.eog_epochs is not None:
             f.update(epoch_features_eog(epoched.eog_epochs[i], epoched.sfreq))

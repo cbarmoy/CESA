@@ -51,8 +51,9 @@ Raw EDF --> SleepScorer(YASA|USleep|PFTSleep) --> DataFrame(time, stage)
 ### 2.5 Indicateurs de sommeil
 - TIB, TST, SE, SOL, WASO, latence REM : formules conformes AASM
 - Option inclure/exclure U dans les calculs
-- **Ecart** : SOL calcule comme index * epoch_duration (approximation si les epochs U du debut ne sont pas exclus)
-- **Ecart** : pas de detection du "lights off" / "lights on" (essentiel en clinique)
+- **Lights off/on** : alias de `night_start_s` / `night_end_s` (fenetre d'analyse UI) ; TIB/SOL fenetre-aware via `_apply_night_window_tib`
+- Cycles + matrice de transitions empirique : `count_sleep_cycles` / `stage_transition_matrix` dans `sleep_metrics.py`
+- **Ecart** : SOL sans fenetre reste `index * epoch_duration` (approximation si les epochs U du debut ne sont pas exclus)
 
 ### 2.6 Detection d'evenements
 - **ABSENT** : aucune detection d'arousal, apnee, hypopnee, desaturation

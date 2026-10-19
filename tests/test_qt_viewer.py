@@ -331,3 +331,45 @@ class TestViewerBridge:
         bridge.update_signals(signals)
         bridge.set_hypnogram((["W"], 30.0))
         # No crash is the assertion
+
+
+@qt_required
+class TestFeatureSearch:
+
+    def test_fold_and_alias_match(self):
+        from CESA.qt_viewer.dialogs.feature_search_dialog import (
+            action_search_haystack, query_matches,
+        )
+        hay = action_search_haystack(
+            "Detecter micro-architecture (spindles/SO/REM)...",
+            "Sommeil > Evenements",
+            "",
+        )
+        assert query_matches("spindle", hay)
+        assert query_matches("fuseaux", hay)
+        assert not query_matches("fooof", hay)
+
+    def test_indexes_reorganized_menus(self):
+        from CESA.qt_viewer.dialogs.feature_search_dialog import (
+            collect_menu_features, query_matches, action_search_haystack,
+        )
+        from CESA.qt_viewer.main_window import EEGViewerMainWindow
+
+        win = EEGViewerMainWindow()
+        rows = collect_menu_features(
+            win.menuBar(), skip_object_names=("featureSearch",),
+        )
+        labels = {label.casefold() for _, label, _, _ in rows}
+        assert any("scoring automatique" in lab for lab in labels)
+        assert any("nettoyage ica" in lab for lab in labels)
+        paths = " | ".join(path for _, _, path, _ in rows)
+        assert "Evenements" in paths
+        assert "Spectrale" in paths
+
+        matches = [
+            (label, path)
+            for _, label, path, shortcut in rows
+            if query_matches("filtre", action_search_haystack(label, path, shortcut))
+        ]
+        assert matches
+

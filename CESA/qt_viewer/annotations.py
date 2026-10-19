@@ -32,6 +32,7 @@ ANNOTATION_TYPES: Dict[str, str] = {
     "hypopnea": "#FAB387",
     "rem_burst": "#CBA6F7",
     "spindle": "#89B4FA",
+    "slow_wave": "#74C7EC",
     "k_complex": "#A6E3A1",
     "note": "#94E2D5",
     "custom": "#6C7086",

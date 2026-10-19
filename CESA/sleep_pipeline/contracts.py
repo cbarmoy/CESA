@@ -70,6 +70,10 @@ class EventType(str, Enum):
     APNEA_MIXED = "apnea_mixed"
     HYPOPNEA = "hypopnea"
     DESAT = "desaturation"
+    SPINDLE = "spindle"
+    SLOW_WAVE = "slow_wave"
+    REM_BURST = "rem_burst"
+    K_COMPLEX = "k_complex"
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,24 @@ class ScoredEvent:
     duration_s: float
     confidence: float = 1.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """UI-stable dict (``onset`` / ``duration`` / ``type`` / ``channel``)."""
+        meta = dict(self.metadata) if self.metadata else {}
+        channel = str(meta.pop("channel", meta.pop("Channel", "")) or "")
+        return {
+            "onset": float(self.onset_s),
+            "duration": float(self.duration_s),
+            "type": self.event_type.value,
+            "description": self.event_type.value,
+            "confidence": float(self.confidence),
+            "channel": channel,
+            "metadata": meta,
+            # Legacy aliases kept for older callers
+            "onset_s": float(self.onset_s),
+            "duration_s": float(self.duration_s),
+            "event_type": self.event_type.value,
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -40,12 +40,16 @@ class PsgReportDialog(QtWidgets.QDialog):
         annotations: Optional[List[Dict[str, Any]]] = None,
         scoring_epochs: Optional[List[Tuple[float, str]]] = None,
         epoch_seconds: float = 30.0,
+        controller: Any = None,
+        qc_report: Any = None,
     ) -> None:
         super().__init__(parent)
         self._summary = summary
         self._annotations = list(annotations or summary.annotations or [])
         self._scoring_epochs = list(scoring_epochs or [])
         self._epoch_seconds = float(epoch_seconds)
+        self._ctrl = controller
+        self._qc_report = qc_report
         suffix = f" — {title_suffix}" if title_suffix else ""
         self.setWindowTitle(f"Rapport PSG{suffix}")
         self.resize(1180, 900)
@@ -110,6 +114,19 @@ class PsgReportDialog(QtWidgets.QDialog):
             suffix = (
                 f"fenetre {ctrl.night_start_s / 60.0:.0f}–{ctrl.night_end_s / 60.0:.0f} min"
             )
+        qc_report = None
+        try:
+            from CESA.prep_qc import compute_night_qc
+
+            if ctrl.derivations:
+                qc_report = compute_night_qc(
+                    ctrl.derivations,
+                    ctrl.sfreq,
+                    ctrl.channel_types_dict(),
+                )
+        except Exception as exc:
+            logger.warning("QC nuit pour rapport PSG: %s", exc)
+
         dlg = cls(
             parent,
             summary,
@@ -117,6 +134,8 @@ class PsgReportDialog(QtWidgets.QDialog):
             annotations=annotations,
             scoring_epochs=scoring_epochs,
             epoch_seconds=ctrl.scoring_epoch_duration,
+            controller=ctrl,
+            qc_report=qc_report,
         )
         dlg.show()
         return dlg
@@ -170,6 +189,7 @@ class PsgReportDialog(QtWidgets.QDialog):
             ("waso", "Eveil intra-sommeil (WASO)"),
             ("rem_lat", "Latence REM"),
             ("awakenings", "Reveils"),
+            ("n_cycles", "Cycles de sommeil"),
             ("ann_count", "Annotations"),
         ):
             lbl = QtWidgets.QLabel("--")
@@ -232,6 +252,39 @@ class PsgReportDialog(QtWidgets.QDialog):
         self._annotation_table.setAlternatingRowColors(True)
         tables.addTab(self._annotation_table, "Annotations")
 
+        # Transitions tab
+        trans_page = QtWidgets.QWidget()
+        trans_lay = QtWidgets.QVBoxLayout(trans_page)
+        self._trans_info = QtWidgets.QLabel("")
+        self._trans_info.setWordWrap(True)
+        self._trans_info.setStyleSheet("color: #CDD6F4;")
+        trans_lay.addWidget(self._trans_info)
+        self._trans_fig = Figure(figsize=(6, 4), dpi=100)
+        self._trans_fig.set_facecolor("#1E1E2E")
+        self._trans_canvas = FigureCanvasQTAgg(self._trans_fig)
+        trans_lay.addWidget(self._trans_canvas, stretch=1)
+        tables.addTab(trans_page, "Transitions")
+
+        # Signal quality tab
+        qc_page = QtWidgets.QWidget()
+        qc_lay = QtWidgets.QVBoxLayout(qc_page)
+        self._qc_summary = QtWidgets.QLabel("QC non calcule")
+        self._qc_summary.setWordWrap(True)
+        self._qc_summary.setStyleSheet("color: #CDD6F4;")
+        qc_lay.addWidget(self._qc_summary)
+        self._qc_table = QtWidgets.QTableWidget(0, 5)
+        self._qc_table.setHorizontalHeaderLabels([
+            "Canal", "Type", "SNR (dB)", "Extreme", "Raisons",
+        ])
+        self._qc_table.horizontalHeader().setStretchLastSection(True)
+        self._qc_table.verticalHeader().setVisible(False)
+        self._qc_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers,
+        )
+        self._qc_table.setAlternatingRowColors(True)
+        qc_lay.addWidget(self._qc_table, stretch=1)
+        tables.addTab(qc_page, "Qualite signal")
+
         root.addWidget(tables, stretch=1)
 
         close_btn = QtWidgets.QPushButton("Fermer")
@@ -279,11 +332,15 @@ class PsgReportDialog(QtWidgets.QDialog):
         self._metric_labels["waso"].setText(f"{cm.waso_min:.1f} min")
         self._metric_labels["rem_lat"].setText(f"{cm.rem_latency_min:.1f} min")
         self._metric_labels["awakenings"].setText(str(s.awakenings))
+        if "n_cycles" in self._metric_labels:
+            self._metric_labels["n_cycles"].setText(str(s.n_cycles))
         self._metric_labels["ann_count"].setText(str(len(self._annotations)))
 
         self._fill_stage_table(s)
         self._fill_episode_table(s)
         self._fill_annotation_table()
+        self._fill_transitions(s)
+        self._fill_qc()
         self._draw_timeline()
         self._draw_pies(s)
 
@@ -319,6 +376,130 @@ class PsgReportDialog(QtWidgets.QDialog):
                 color = _STAGE_COLORS.get(ep.stage.upper(), "#CDD6F4")
                 item.setForeground(QtGui.QColor(color))
                 self._episode_table.setItem(i, j, item)
+
+    def _fill_transitions(self, s: PsgSummary) -> None:
+        bounds = getattr(s, "cycle_boundaries_s", None) or []
+        n_bounds = len(bounds)
+        self._trans_info.setText(
+            f"Cycles de sommeil: {s.n_cycles}  ·  "
+            f"Frontieres REM→NREM: {n_bounds}"
+            + (
+                f" ({', '.join(f'{b / 60.0:.0f} min' for b in bounds[:8])}"
+                + ("…" if n_bounds > 8 else "")
+                + ")"
+                if n_bounds
+                else ""
+            )
+        )
+        self._trans_fig.clear()
+        ax = self._trans_fig.add_subplot(111)
+        ax.set_facecolor("#1E1E2E")
+        for spine in ax.spines.values():
+            spine.set_color("#45475A")
+        ax.tick_params(colors="#CDD6F4", labelsize=9)
+
+        probs = s.transition_probs
+        labels = list(s.transition_labels or ("W", "N1", "N2", "N3", "R"))
+        if probs is None or getattr(probs, "size", 0) == 0:
+            ax.text(
+                0.5, 0.5, "Aucune matrice de transitions",
+                ha="center", va="center", color="#6C7086",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+            self._trans_canvas.draw_idle()
+            return
+
+        import numpy as np
+
+        mat = np.asarray(probs, dtype=float)
+        display_labels = [_stage_label(x) for x in labels]
+        im = ax.imshow(mat, cmap="YlGnBu", vmin=0.0, vmax=1.0, aspect="equal")
+        ax.set_xticks(range(len(display_labels)))
+        ax.set_yticks(range(len(display_labels)))
+        ax.set_xticklabels(display_labels, color="#CDD6F4")
+        ax.set_yticklabels(display_labels, color="#CDD6F4")
+        ax.set_xlabel("Vers", color="#CDD6F4")
+        ax.set_ylabel("Depuis", color="#CDD6F4")
+        ax.set_title(
+            "Probabilites de transition epoque → epoque",
+            color="#CDD6F4", fontsize=11, fontweight="bold",
+        )
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                val = mat[i, j]
+                if val < 0.005:
+                    continue
+                ax.text(
+                    j, i, f"{val:.2f}",
+                    ha="center", va="center",
+                    color="#1E1E2E" if val > 0.45 else "#CDD6F4",
+                    fontsize=8,
+                )
+        cbar = self._trans_fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.yaxis.set_tick_params(color="#CDD6F4")
+        cbar.outline.set_edgecolor("#45475A")
+        for t in cbar.ax.get_yticklabels():
+            t.set_color("#CDD6F4")
+        self._trans_fig.tight_layout(pad=1.2)
+        self._trans_canvas.draw_idle()
+
+    def _fill_qc(self) -> None:
+        r = self._qc_report
+        if r is None and self._ctrl is not None:
+            try:
+                from CESA.prep_qc import compute_night_qc
+
+                if getattr(self._ctrl, "derivations", None):
+                    r = compute_night_qc(
+                        self._ctrl.derivations,
+                        self._ctrl.sfreq,
+                        self._ctrl.channel_types_dict(),
+                    )
+                    self._qc_report = r
+            except Exception as exc:
+                logger.warning("QC nuit: %s", exc)
+                r = None
+
+        if r is None:
+            self._qc_summary.setText("QC non calcule (pas de donnees signal).")
+            self._qc_table.setRowCount(0)
+            return
+
+        bad = list(getattr(r, "bad_channels", []) or [])
+        top_reasons: Dict[str, int] = {}
+        for ch in getattr(r, "per_channel", []) or []:
+            for reason in getattr(ch, "reasons", []) or []:
+                key = reason.split("(")[0].strip()
+                top_reasons[key] = top_reasons.get(key, 0) + 1
+        reasons_txt = ", ".join(
+            f"{k}×{v}" for k, v in sorted(
+                top_reasons.items(), key=lambda kv: -kv[1],
+            )[:5]
+        ) or "aucune"
+        self._qc_summary.setText(
+            f"{r.n_channels} canaux EEG  ·  {len(bad)} suspect(s)  ·  "
+            f"raisons: {reasons_txt}"
+        )
+        rows = list(getattr(r, "per_channel", []) or [])
+        # Prefer showing suspects first, then a few OK
+        rows_sorted = sorted(rows, key=lambda c: (not c.is_bad, c.name))
+        show = rows_sorted[:40]
+        self._qc_table.setRowCount(len(show))
+        for i, ch in enumerate(show):
+            vals = [
+                ch.name,
+                getattr(ch, "channel_type", "eeg"),
+                f"{ch.snr_db:.1f}",
+                "oui" if ch.extreme_amp else "",
+                "; ".join(ch.reasons) or "OK",
+            ]
+            for j, val in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(val)
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                if ch.is_bad:
+                    item.setForeground(QtGui.QColor("#F38BA8"))
+                self._qc_table.setItem(i, j, item)
 
     def _fill_annotation_table(self) -> None:
         rows: List[Tuple[float, float, str, str, str, str, str]] = []

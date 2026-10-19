@@ -80,6 +80,10 @@ class SpectrogramBar(QtWidgets.QWidget):
         self._hypno_labels: List[str] = []
         self._hypno_epoch_len: float = 30.0
         self._overlay_enabled: bool = False
+        self._vmin: float = 0.0
+        self._vmax: float = 1.0
+        self._scale: str = "db"
+        self._colorbar: Optional[pg.ColorBarItem] = None
 
         self.setMinimumHeight(1)
 
@@ -122,8 +126,42 @@ class SpectrogramBar(QtWidgets.QWidget):
         self._placeholder.setZValue(20)
         self._plot.addItem(self._placeholder)
 
+        self._init_colorbar()
         self._apply_theme()
         self.set_placeholder_text("Spectrogramme desactive")
+
+    def _init_colorbar(self) -> None:
+        """Vertical colorbar (power scale) docked to the right of the plot."""
+        try:
+            cmap = pg.colormap.get(self._colormap_name)
+        except Exception:
+            cmap = None
+        self._colorbar = pg.ColorBarItem(
+            values=(self._vmin, self._vmax),
+            width=12,
+            colorMap=cmap,
+            label=self._scale_label(),
+            interactive=False,
+            orientation="vertical",
+        )
+        self._colorbar.setImageItem(self._image_item, insert_in=self._plot)
+        # Compact ticks for a short bar
+        try:
+            self._colorbar.axis.setWidth(36)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scale_unit(scale: str) -> str:
+        s = (scale or "db").lower()
+        if s in ("db", "dB"):
+            return "dB"
+        if s == "zscore":
+            return "z"
+        return "a.u."
+
+    def _scale_label(self) -> str:
+        return self._scale_unit(self._scale)
 
     # ================================================================
     # Mode
@@ -137,18 +175,13 @@ class SpectrogramBar(QtWidgets.QWidget):
         """
         self._follow_window = bool(follow)
         self._highlight.setVisible(not self._follow_window and bool(self._freqs.size))
-        # Night band: keep a 40 px left gutter (freq ticks) matching the
-        # hypnogram. Window band: hide the left axis so the plot area
-        # lines up with the EEG viewer (which also has no left axis).
+        # Always show the left frequency axis (Hz) — night band matches the
+        # hypnogram gutter; window band keeps a compact Hz scale as well.
         left = self._plot.getAxis("left")
-        if self._follow_window:
-            left.setWidth(0)
-            left.setStyle(showValues=False)
-            left.setVisible(False)
-        else:
-            left.setVisible(True)
-            left.setWidth(40)
-            left.setStyle(showValues=True)
+        left.setVisible(True)
+        left.setWidth(36 if self._follow_window else 40)
+        left.setStyle(showValues=True)
+        left.setLabel("Hz" if self._follow_window else None)
 
     def _set_night_xrange(self) -> None:
         """Exact [0, total] — same convention as HypnogramBar."""
@@ -163,6 +196,9 @@ class SpectrogramBar(QtWidgets.QWidget):
         self._freqs = np.asarray(result.freqs, dtype=float)
         self._times = np.asarray(result.times, dtype=float) + float(time_offset_s)
         power = np.asarray(result.power, dtype=float)
+        self._vmin = float(result.vmin)
+        self._vmax = float(result.vmax)
+        self._scale = str(getattr(result, "scale", None) or "db")
 
         n_freqs, n_times = power.shape
         if n_times < 1 or n_freqs < 1:
@@ -170,9 +206,10 @@ class SpectrogramBar(QtWidgets.QWidget):
             return
 
         self._image_item.setImage(power.T, autoLevels=False)
-        self._image_item.setLevels((result.vmin, result.vmax))
+        self._image_item.setLevels((self._vmin, self._vmax))
         self._apply_colormap()
         self._image_item.setOpacity(self._opacity)
+        self._update_colorbar()
 
         t0 = float(self._times[0]) if n_times else 0.0
         t1 = float(self._times[-1]) + (self._times[1] - self._times[0] if n_times > 1 else 1.0)
@@ -185,6 +222,8 @@ class SpectrogramBar(QtWidgets.QWidget):
         self._update_freq_ticks()
         self._placeholder.setVisible(False)
         self._highlight.setVisible(not self._follow_window)
+        if self._colorbar is not None:
+            self._colorbar.setVisible(True)
 
         if not self._follow_window:
             self._set_night_xrange()
@@ -196,6 +235,33 @@ class SpectrogramBar(QtWidgets.QWidget):
         self._image_item.clear()
         self._highlight.setVisible(False)
         self._overlay_curve.setVisible(False)
+        if self._colorbar is not None:
+            self._colorbar.setVisible(False)
+
+    def _update_colorbar(self) -> None:
+        if self._colorbar is None:
+            return
+        lo, hi = float(self._vmin), float(self._vmax)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = 0.0, 1.0
+        try:
+            self._colorbar.setLevels((lo, hi))
+        except Exception:
+            try:
+                self._colorbar.values = (lo, hi)
+                self._colorbar.axis.setRange(lo, hi)
+            except Exception:
+                pass
+        unit = self._scale_label()
+        try:
+            # Vertical ColorBarItem: unit label sits on its left axis
+            self._colorbar.getAxis("left").setLabel(unit)
+        except Exception:
+            try:
+                self._colorbar.axis.setLabel(unit)
+            except Exception:
+                pass
+        self._colorbar.setVisible(True)
 
     def set_placeholder_text(self, text: str) -> None:
         self._placeholder.setText(text, color=self._theme.get("text_dim", "#888888"))
@@ -212,14 +278,19 @@ class SpectrogramBar(QtWidgets.QWidget):
             return
         n_ticks = min(5, n)
         idxs = np.linspace(0, n - 1, n_ticks).astype(int)
-        ticks = [(float(i) + 0.5, f"{self._freqs[i]:.1f}") for i in idxs]
-        self._plot.getAxis("left").setTicks([ticks])
+        ticks = [(float(i) + 0.5, f"{self._freqs[i]:.0f}" if self._freqs[i] >= 10
+                  else f"{self._freqs[i]:.1f}") for i in idxs]
+        left = self._plot.getAxis("left")
+        left.setTicks([ticks])
+        left.setLabel("Hz")
         self._plot.setYRange(0, n, padding=0)
 
     def _apply_colormap(self) -> None:
         try:
             cmap = pg.colormap.get(self._colormap_name)
             self._image_item.setColorMap(cmap)
+            if self._colorbar is not None:
+                self._colorbar.setColorMap(cmap)
         except Exception:
             logger.debug("Colormap '%s' indisponible", self._colormap_name, exc_info=True)
 
@@ -290,18 +361,27 @@ class SpectrogramBar(QtWidgets.QWidget):
         t = self._theme
         bg = t.get("hypno_bg", t.get("surface", "#121826"))
         self._pw.setBackground(bg)
-        self._plot.getAxis("left").setTextPen(t.get("text_dim", "#6C7086"))
+        text_pen = t.get("text_dim", "#6C7086")
+        self._plot.getAxis("left").setTextPen(text_pen)
+        self._plot.getAxis("left").setPen(text_pen)
         win_brush = t.get("hypno_window", "#FFFFFF28")
         self._highlight.setBrush(pg.mkBrush(win_brush))
         border_col = t.get("hypno_window_border", "#FFFFFF50")
         for line in self._highlight.lines:
             line.setPen(pg.mkPen(border_col, width=1.5))
         self._placeholder.setColor(t.get("text_dim", "#888888"))
+        if self._colorbar is not None:
+            try:
+                self._colorbar.axis.setTextPen(text_pen)
+                self._colorbar.axis.setPen(text_pen)
+            except Exception:
+                pass
 
     def set_colormap(self, name: str) -> None:
         self._colormap_name = name or "viridis"
         if self._freqs.size:
             self._apply_colormap()
+            self._update_colorbar()
 
     def set_opacity(self, value: float) -> None:
         self._opacity = max(0.0, min(1.0, float(value)))

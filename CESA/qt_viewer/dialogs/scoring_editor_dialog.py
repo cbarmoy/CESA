@@ -5,6 +5,11 @@ Provides a row-by-row editable view of the active sleep scoring
 combo-box, bulk edits are supported on the current selection, and the result
 can be applied back to the recording or exported to CSV/JSON.
 
+The target store is explicit: edits applied to "Scoring manuel" feed
+``manual_scoring_data``, the reference used by the auto-vs-manual comparison.
+Editing only the active scoring would leave that reference untouched and make
+the comparison meaningless.
+
 Replaces the Tk ``_open_manual_scoring_editor`` Treeview window.
 """
 
@@ -19,6 +24,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 logger = logging.getLogger(__name__)
 
 _STAGES: List[str] = ["W", "N1", "N2", "N3", "R", "U"]
+
+#: Where ``Appliquer au scoring`` writes: label + ``AppController`` store key.
+_TARGETS = [
+    ("Scoring manuel (reference de comparaison)", "manual"),
+    ("Scoring automatique (corriger le modele)", "auto"),
+    ("Scoring actif seulement", "active"),
+]
 
 _STAGE_COLORS = {
     "W": "#f38ba8",
@@ -92,6 +104,30 @@ class ScoringEditorDialog(QtWidgets.QDialog):
         top.addStretch()
         layout.addLayout(top)
 
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.addWidget(QtWidgets.QLabel("Enregistrer les modifications dans:"))
+        self._target_combo = QtWidgets.QComboBox()
+        for label, key in _TARGETS:
+            self._target_combo.addItem(label, key)
+        self._target_combo.setToolTip(
+            "Scoring manuel : alimente la reference humaine utilisee par la "
+            "comparaison auto vs manuel.\n"
+            "Scoring automatique : corrige le resultat du modele (la comparaison "
+            "portera alors sur le resultat corrige).\n"
+            "Scoring actif seul : n'alimente aucune des deux references."
+        )
+        self._target_combo.setCurrentIndex(self._default_target_index())
+        target_row.addWidget(self._target_combo)
+        seed_btn = QtWidgets.QPushButton("Initialiser le manuel depuis l'auto...")
+        seed_btn.setToolTip(
+            "Copie le scoring automatique dans le scoring manuel comme point de "
+            "depart a corriger."
+        )
+        seed_btn.clicked.connect(self._seed_manual_from_auto)
+        target_row.addWidget(seed_btn)
+        target_row.addStretch()
+        layout.addLayout(target_row)
+
         self._table = QtWidgets.QTableWidget(0, 4, self)
         self._table.setHorizontalHeaderLabels(["Epoque", "Temps (s)", "Heure", "Stade"])
         self._table.setSelectionBehavior(
@@ -137,6 +173,48 @@ class ScoringEditorDialog(QtWidgets.QDialog):
         if df is None or df.empty:
             return None
         return df
+
+    def _default_target_index(self) -> int:
+        """Default to the store the active scoring came from, else manual."""
+        source = getattr(self._ctrl, "active_scoring_source", None)
+        keys = [key for _, key in _TARGETS]
+        if source in keys:
+            return keys.index(source)
+        return 0
+
+    def _target(self) -> str:
+        return str(self._target_combo.currentData() or "manual")
+
+    def _seed_manual_from_auto(self) -> None:
+        auto = getattr(self._ctrl, "auto_scoring_data", None)
+        if auto is None or auto.empty:
+            QtWidgets.QMessageBox.information(
+                self, "Scoring",
+                "Aucun scoring automatique en memoire : lancez d'abord "
+                "Sommeil > Scoring automatique.",
+            )
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Initialiser le scoring manuel",
+            "Le scoring automatique va etre copie dans le scoring manuel comme "
+            "point de depart.\n\n"
+            "Tant que vous n'aurez pas corrige d'epoques, la comparaison auto vs "
+            "manuel affichera 100 % de concordance : ce chiffre ne mesurera rien.\n\n"
+            "Continuer ?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        if self._ctrl.copy_auto_scoring_to_manual():
+            keys = [key for _, key in _TARGETS]
+            self._target_combo.setCurrentIndex(keys.index("manual"))
+            QtWidgets.QMessageBox.information(
+                self, "Scoring",
+                "Scoring manuel initialise depuis l'auto. Corrigez les epoques puis "
+                "cliquez 'Appliquer au scoring'.",
+            )
 
     def _reload(self) -> None:
         df = self._active_df()
@@ -272,8 +350,17 @@ class ScoringEditorDialog(QtWidgets.QDialog):
         try:
             new_df = df.reset_index(drop=True).copy()
             new_df["stage"] = stages
-            self._ctrl.sleep_scoring_data = new_df
-            self._ctrl.scoring_dirty = True
+            target = self._target()
+            if hasattr(self._ctrl, "set_active_scoring"):
+                self._ctrl.set_active_scoring(
+                    new_df,
+                    target,
+                    epoch_seconds=self._epoch_len,
+                    manual_source="editeur manuel CESA" if target == "manual" else None,
+                )
+            else:
+                self._ctrl.sleep_scoring_data = new_df
+                self._ctrl.scoring_dirty = True
             main = self._main
             if main is not None:
                 hyp = self._ctrl.build_hypnogram_tuple()
@@ -286,7 +373,9 @@ class ScoringEditorDialog(QtWidgets.QDialog):
                 if hasattr(main, "update_dashboard"):
                     main.update_dashboard()
             QtWidgets.QMessageBox.information(
-                self, "Scoring", "Modifications appliquees au scoring.",
+                self, "Scoring",
+                "Modifications appliquees : "
+                f"{self._target_combo.currentText().lower()}.",
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Erreur", f"Application echouee:\n{exc}")

@@ -39,7 +39,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple, Union
+from typing import Any, Iterable, Optional, Tuple, Union
 import pandas as pd
 import numpy as np
 import mne
@@ -156,6 +156,27 @@ def _normalize_stage_label(raw: object) -> str:
         if key in s_ascii or s_ascii in key:
             return val
     return "U"
+
+
+#: Canonical stage labels produced by :func:`normalize_stage_label`.
+CANONICAL_STAGES = ("W", "N1", "N2", "N3", "R", "U")
+
+
+def normalize_stage_label(raw: object) -> str:
+    """Map any stage representation to canonical W/N1/N2/N3/R/U.
+
+    Public wrapper over the importer's internal mapping so that consumers
+    comparing two hypnograms (e.g. ``AppController.compare_scoring``) use the
+    exact same conventions as the import path: ``REM`` -> ``R``,
+    ``WAKE``/``Eveil`` -> ``W``, numeric codes, artefact/movement -> ``U``.
+    """
+    return _normalize_stage_label(raw)
+
+
+def normalize_stage_series(values: Any) -> pd.Series:
+    """Vectorised :func:`normalize_stage_label` over a Series or sequence."""
+    series = values if isinstance(values, pd.Series) else pd.Series(list(values))
+    return series.map(_normalize_stage_label).astype(str)
 
 
 def _is_cesa_native_format(df: pd.DataFrame) -> bool:

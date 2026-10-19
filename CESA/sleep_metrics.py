@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 from CESA.sleep_pipeline.contracts import Epoch, ScoringResult, StageLabel
 from CESA.sleep_pipeline.evaluation import ClinicalMetrics, compute_clinical_metrics
+
+CLINICAL_STAGE_ORDER: Tuple[str, ...] = ("W", "N1", "N2", "N3", "R")
 
 
 @dataclass
@@ -18,6 +20,14 @@ class StageEpisode:
   end_min: float
   stage: str
   duration_min: float
+
+
+@dataclass
+class CycleSummary:
+  """Sleep-cycle boundaries (heuristic: REM → return to NREM)."""
+
+  n_cycles: int = 0
+  boundaries_s: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -32,6 +42,84 @@ class PsgSummary:
   night_end_s: Optional[float] = None
   awakenings: int = 0
   annotations: List[Dict[str, Any]] = field(default_factory=list)
+  n_cycles: int = 0
+  cycle_boundaries_s: List[float] = field(default_factory=list)
+  transition_counts: Optional[np.ndarray] = None
+  transition_probs: Optional[np.ndarray] = None
+  transition_labels: Tuple[str, ...] = CLINICAL_STAGE_ORDER
+
+  @property
+  def lights_off_s(self) -> Optional[float]:
+    """Alias of ``night_start_s`` (analysis window start / lights off)."""
+    return self.night_start_s
+
+  @property
+  def lights_on_s(self) -> Optional[float]:
+    """Alias of ``night_end_s`` (analysis window end / lights on)."""
+    return self.night_end_s
+
+
+def stage_transition_matrix(
+  stages: Sequence[str],
+  labels: Sequence[str] = CLINICAL_STAGE_ORDER,
+) -> Tuple[np.ndarray, List[str]]:
+  """Empirical epoch-to-epoch transition counts (and labels).
+
+  Only transitions between *labels* are counted (U and others ignored as
+  sources/targets). Returns ``(counts[n,n], list(labels))``.
+  """
+  labs = [str(x) for x in labels]
+  idx = {s: i for i, s in enumerate(labs)}
+  n = len(labs)
+  counts = np.zeros((n, n), dtype=float)
+  canon = []
+  for s in stages:
+    c = StageLabel.from_string(str(s)).value
+    canon.append(c if c in idx else None)
+  for a, b in zip(canon[:-1], canon[1:]):
+    if a is None or b is None:
+      continue
+    counts[idx[a], idx[b]] += 1.0
+  return counts, labs
+
+
+def transition_probabilities(counts: np.ndarray) -> np.ndarray:
+  """Row-normalize transition counts (rows that sum to 0 stay zero)."""
+  probs = np.zeros_like(counts, dtype=float)
+  for i in range(counts.shape[0]):
+    row_sum = float(counts[i].sum())
+    if row_sum > 0:
+      probs[i] = counts[i] / row_sum
+  return probs
+
+
+def count_sleep_cycles(
+  stages: Sequence[str],
+  times: Optional[Sequence[float]] = None,
+  epoch_s: float = 30.0,
+) -> CycleSummary:
+  """Detect sleep-cycle boundaries (same heuristic as hypnogram markers).
+
+  A cycle boundary is marked when the hypnogram leaves REM and returns to
+  N1/N2/N3. ``n_cycles`` equals the number of such boundaries (completed
+  REM→NREM returns).
+  """
+  if len(stages) < 2:
+    return CycleSummary()
+  labels = [StageLabel.from_string(str(s)).value for s in stages]
+  if times is None:
+    t_arr = np.arange(len(labels), dtype=float) * float(epoch_s)
+  else:
+    t_arr = np.asarray(times, dtype=float)
+  in_rem = False
+  boundaries: List[float] = []
+  for i, s in enumerate(labels):
+    if s == "R":
+      in_rem = True
+    elif in_rem and s in ("N1", "N2", "N3"):
+      in_rem = False
+      boundaries.append(float(t_arr[i]))
+  return CycleSummary(n_cycles=len(boundaries), boundaries_s=boundaries)
 
 
 def _df_to_scoring_result(df: pd.DataFrame, epoch_seconds: float) -> ScoringResult:
@@ -190,6 +278,10 @@ def compute_psg_summary(
     if stages[i] == "W" and stages[i - 1] != "W":
       awakenings += 1
 
+  cycles = count_sleep_cycles(stages, times, epoch_len)
+  counts_mat, trans_labels = stage_transition_matrix(stages)
+  probs_mat = transition_probabilities(counts_mat)
+
   return PsgSummary(
     clinical=clinical,
     stage_durations_min=stage_durations_min,
@@ -200,6 +292,11 @@ def compute_psg_summary(
     night_start_s=night_start_s,
     night_end_s=night_end_s,
     awakenings=awakenings,
+    n_cycles=cycles.n_cycles,
+    cycle_boundaries_s=list(cycles.boundaries_s),
+    transition_counts=counts_mat,
+    transition_probs=probs_mat,
+    transition_labels=tuple(trans_labels),
   )
 
 
@@ -217,6 +314,8 @@ def export_psg_summary_csv(
     writer = csv.writer(f)
     writer.writerow(["metric", "value"])
     if summary.night_start_s is not None and summary.night_end_s is not None:
+      writer.writerow(["lights_off_s", f"{summary.night_start_s:.2f}"])
+      writer.writerow(["lights_on_s", f"{summary.night_end_s:.2f}"])
       writer.writerow(["night_start_min", f"{summary.night_start_s / 60.0:.2f}"])
       writer.writerow(["night_end_min", f"{summary.night_end_s / 60.0:.2f}"])
     writer.writerow(["TIB_min", f"{cm.time_in_bed_min:.2f}"])
@@ -231,6 +330,12 @@ def export_psg_summary_csv(
     writer.writerow(["REM_pct_TST", f"{cm.rem_pct:.2f}"])
     writer.writerow(["Wake_pct", f"{cm.wake_pct:.2f}"])
     writer.writerow(["Awakenings", summary.awakenings])
+    writer.writerow(["n_cycles", summary.n_cycles])
+    if summary.cycle_boundaries_s:
+      writer.writerow([
+        "cycle_boundaries_min",
+        ";".join(f"{t / 60.0:.2f}" for t in summary.cycle_boundaries_s),
+      ])
     writer.writerow([])
     writer.writerow(["stage", "duration_min", "pct_TST", "episode_count", "mean_episode_min"])
     for s in ("W", "N1", "N2", "N3", "R"):
@@ -241,6 +346,15 @@ def export_psg_summary_csv(
         summary.episode_counts.get(s, 0),
         f"{summary.episode_mean_duration_min.get(s, 0.0):.2f}",
       ])
+    if summary.transition_counts is not None:
+      writer.writerow([])
+      writer.writerow(["transition_counts"] + list(summary.transition_labels))
+      for i, lab in enumerate(summary.transition_labels):
+        row = [lab] + [
+          f"{summary.transition_counts[i, j]:.0f}"
+          for j in range(len(summary.transition_labels))
+        ]
+        writer.writerow(row)
     writer.writerow([])
     writer.writerow(["start_min", "end_min", "stage", "duration_min"])
     for ep in summary.episodes:

@@ -36,6 +36,8 @@ scikit-learn>=1.0.0     # Machine learning (K-means clustering)
 statsmodels>=0.13.0     # Advanced statistics (ADF tests, time series)
 EntropyHub>=0.3.2       # Multiscale entropy toolkit (replaces custom MSE)
 neurokit2>=0.2.7        # HRV RR cleaning methods (NeuroKit2/Kubios)
+specparam>=2.0.0rc0     # FOOOF successor: periodic vs aperiodic (1/f) spectral fit
+pycircstat2>=0.1.15     # Circular statistics (preferred phase of SO-spindle coupling)
 
 # High-performance EEG viewer (PyQtGraph) — requis pour la vue PSG par défaut
 # Si pip échoue : vérifiez une version Python supportée par PySide6 (souvent 3.9–3.12 sur PyPI).

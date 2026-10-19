@@ -114,7 +114,8 @@ class SleepPeriodsDialog(QtWidgets.QDialog):
             f"<b>WASO</b> {cm.waso_min:.1f} min &nbsp; "
             f"<b>SE</b> {cm.sleep_efficiency_pct:.1f} % &nbsp; "
             f"<b>REM lat.</b> {cm.rem_latency_min:.1f} min &nbsp; "
-            f"<b>Reveils</b> {s.awakenings}{note}<br>"
+            f"<b>Reveils</b> {s.awakenings} &nbsp; "
+            f"<b>Cycles</b> {s.n_cycles}{note}<br>"
             + " &nbsp; ".join(
                 f"<b>{st}</b> {dur.get(st, 0.0):.1f}" for st in ["W", "N1", "N2", "N3", "R"]
             )
@@ -128,7 +129,7 @@ class SleepPeriodsDialog(QtWidgets.QDialog):
             self._table.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{ep.duration_min:.2f}"))
 
         self._fig.clear()
-        ax1 = self._fig.add_subplot(211)
+        ax1 = self._fig.add_subplot(221)
         stages = [st for st in ["W", "N1", "N2", "N3", "R"] if dur.get(st, 0.0) > 0.05]
         vals = [dur[st] for st in stages]
         colors = [_STAGE_COLORS.get(st, "#6c7086") for st in stages]
@@ -137,11 +138,27 @@ class SleepPeriodsDialog(QtWidgets.QDialog):
                     textprops={"fontsize": 8})
         ax1.set_title("Repartition des stades (TST)")
 
-        ax2 = self._fig.add_subplot(212)
+        ax2 = self._fig.add_subplot(222)
         ax2.bar(stages, vals, color=colors)
         ax2.set_ylabel("Duree (min)")
         ax2.set_title("Duree par stade")
         ax2.grid(True, alpha=0.3, axis="y")
+
+        ax3 = self._fig.add_subplot(212)
+        if s.transition_probs is not None and s.transition_probs.size:
+            labs = list(s.transition_labels)
+            im = ax3.imshow(s.transition_probs, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+            ax3.set_xticks(range(len(labs)))
+            ax3.set_yticks(range(len(labs)))
+            ax3.set_xticklabels(labs)
+            ax3.set_yticklabels(labs)
+            ax3.set_xlabel("Vers")
+            ax3.set_ylabel("Depuis")
+            ax3.set_title(f"Transitions (probs) — {s.n_cycles} cycle(s)")
+            self._fig.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
+        else:
+            ax3.set_title("Pas de matrice de transitions")
+            ax3.axis("off")
         self._fig.tight_layout()
         self._canvas.draw()
 

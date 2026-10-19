@@ -47,16 +47,25 @@ _INT_TO_STAGE = {v: k for k, v in _STAGE_TO_INT.items()}
 
 def _features_to_matrix(
     feature_list: List[Dict[str, float]],
+    names: Optional[Sequence[str]] = None,
 ) -> Tuple[np.ndarray, List[str]]:
     """Convert list-of-dicts to a (n_epochs, n_features) array.
+
+    With *names*, those columns are produced in that exact order and anything
+    else is dropped. Inference must use the names the model was trained on:
+    columns are otherwise taken from the current feature dict, so adding a
+    single descriptor would shift every column and corrupt the prediction
+    without raising anything.
 
     Returns (X, feature_names).
     """
     if not feature_list:
         return np.empty((0, 0)), []
-    names = sorted(feature_list[0].keys())
-    X = np.array([[f.get(n, 0.0) for n in names] for f in feature_list], dtype=np.float64)
-    return X, names
+    columns = list(names) if names is not None else sorted(feature_list[0].keys())
+    X = np.array(
+        [[f.get(n, 0.0) for n in columns] for f in feature_list], dtype=np.float64
+    )
+    return X, columns
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +272,9 @@ def score_ml(
     if use_temporal_context:
         feature_list = add_temporal_context(feature_list)
 
-    X, _ = _features_to_matrix(feature_list)
+    X, _ = _features_to_matrix(
+        feature_list, getattr(model, "_sleep_feature_names", None)
+    )
     if X.shape[0] == 0:
         return ScoringResult(epoch_duration_s=epoch_duration_s, backend="ml")
 

@@ -34,6 +34,7 @@ class SpectrogramResult:
     times: np.ndarray  # (n_times,) seconds from recording start
     vmin: float
     vmax: float
+    scale: str = "db"  # "db" | "linear" | "zscore"
 
 
 def _filter_band(x: np.ndarray, fs: float, low: float, high: float) -> np.ndarray:
@@ -191,7 +192,10 @@ def compute_tfr(
         power = power * freqs[:, np.newaxis]
 
     scaled, vmin, vmax = _scale_power(power, scale)
-    return SpectrogramResult(power=scaled, freqs=freqs, times=times, vmin=vmin, vmax=vmax)
+    return SpectrogramResult(
+        power=scaled, freqs=freqs, times=times,
+        vmin=vmin, vmax=vmax, scale=str(scale or "db"),
+    )
 
 
 # -- Frequency-band presets (Hz) -----------------------------------------

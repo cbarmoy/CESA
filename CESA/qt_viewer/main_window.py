@@ -216,7 +216,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
 
     When used as the sole application window (no Tk), call
     :meth:`set_app_controller` after construction to wire the full
-    menu bar (File / Analysis / Sleep / Tools / Help).
+    menu bar (Fichier / Affichage / Filtres / Sommeil / Analyse / Aide).
     """
 
     def __init__(
@@ -659,6 +659,24 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._dashboard.set_event_counts(
             annotations=len(self._annotation_store),
         )
+        # Night QC heuristics
+        if ctrl is not None and ctrl.derivations:
+            try:
+                from CESA.prep_qc import compute_night_qc
+                report = compute_night_qc(
+                    ctrl.derivations,
+                    ctrl.sfreq,
+                    ctrl.channel_types_dict(),
+                )
+                n_flat = sum(1 for c in report.per_channel if c.is_flat)
+                self._dashboard.set_night_qc(
+                    n_channels=report.n_channels,
+                    n_bad=len(report.bad_channels),
+                    n_flat=n_flat,
+                    warnings=report.warnings,
+                )
+            except Exception:
+                logger.debug("Night QC dashboard update failed", exc_info=True)
         self._update_night_window_status()
 
     # -- Report export --
@@ -2380,7 +2398,11 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             self.update_dashboard()
             self._status.showMessage(f"Scoring {method} termine.", 5000)
         else:
-            QtWidgets.QMessageBox.warning(self, "Scoring", "Le scoring automatique a echoue.")
+            reason = getattr(ctrl, "last_auto_scoring_error", None)
+            detail = f"\n\nCause :\n{reason}" if reason else ""
+            QtWidgets.QMessageBox.warning(
+                self, "Scoring",
+                f"Le scoring automatique ({method}) a echoue.{detail}")
 
     def _menu_import_scoring_excel(self) -> None:
         self._menu_import_scoring_file()
@@ -2592,21 +2614,72 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         ctrl = self._app_controller
         if ctrl is None:
             return
-        if ctrl.sleep_scoring_data is None or ctrl.manual_scoring_data is None:
+
+        def _empty(df) -> bool:
+            return df is None or df.empty
+
+        auto_missing = _empty(getattr(ctrl, "auto_scoring_data", None))
+        manual_missing = _empty(getattr(ctrl, "manual_scoring_data", None))
+        if auto_missing and manual_missing:
             QtWidgets.QMessageBox.warning(
-                self, "Attention",
+                self, "Comparaison impossible",
                 "Il faut un scoring automatique ET un scoring manuel pour comparer.\n"
-                "Lancez le scoring auto et importez un scoring manuel d'abord.")
+                "Aucun des deux n'est en memoire.")
             return
+        if auto_missing:
+            QtWidgets.QMessageBox.warning(
+                self, "Comparaison impossible",
+                "Aucun scoring automatique en memoire.\n\n"
+                "Lancez Sommeil > Scoring automatique. L'import d'un scoring manuel "
+                "n'ecrase plus le resultat automatique : les deux peuvent coexister, "
+                "dans l'ordre que vous voulez.")
+            return
+        if manual_missing:
+            QtWidgets.QMessageBox.warning(
+                self, "Comparaison impossible",
+                "Aucun scoring manuel de reference.\n\n"
+                "Importez un scoring (Sommeil > Importer scoring) ou scorez a la main "
+                "dans l'editeur en choisissant la cible 'Scoring manuel'.")
+            return
+
         merged = ctrl.compare_scoring()
         if merged is None or merged.empty:
             QtWidgets.QMessageBox.information(
-                self, "Comparaison", "Aucune epoque commune trouvee.")
+                self, "Comparaison",
+                "Aucune epoque comparable : les deux scorings ne se recouvrent pas "
+                "dans le temps, ou toutes les epoques communes sont non scorees (U).")
             return
         from .dialogs.scoring_comparison_dialog import ScoringComparisonDialog
         ScoringComparisonDialog(
-            self, merged, epoch_len=ctrl.scoring_epoch_duration,
+            self, merged, epoch_len=ctrl.scoring_epoch_duration, controller=ctrl,
         ).exec()
+
+    def _menu_sweep_scoring(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None or ctrl.raw is None:
+            QtWidgets.QMessageBox.warning(self, "Attention", "Chargez d'abord un enregistrement.")
+            return
+        manual = getattr(ctrl, "manual_scoring_data", None)
+        if manual is None or manual.empty:
+            QtWidgets.QMessageBox.warning(
+                self, "Comparaison impossible",
+                "Cet outil mesure chaque configuration face a un scoring manuel "
+                "de reference, qui n'est pas en memoire.\n\n"
+                "Importez un scoring (Sommeil > Importer scoring) ou scorez a la "
+                "main dans l'editeur en choisissant la cible 'Scoring manuel'.")
+            return
+
+        from .dialogs.scoring_sweep_dialog import ScoringSweepDialog
+        dlg = ScoringSweepDialog(self, ctrl)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        config = dlg.applied_config
+        if config is None:
+            return
+        self._status.showMessage(
+            f"Configuration appliquee : {config.label}. Relancez le scoring "
+            "automatique pour l'utiliser.", 8000,
+        )
 
     def _menu_scoring_info(self) -> None:
         from CESA.qt_viewer.dialogs.psg_report_dialog import PsgReportDialog
@@ -2680,6 +2753,72 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._status.showMessage(
             f"{len(events)} {labels.get(event_type, event_type)} detecte(s)", 5000)
 
+    def _menu_micro_events(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None or ctrl.raw is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Attention", "Chargez d'abord un enregistrement.",
+            )
+            return
+        types = ctrl.channel_types_dict()
+        all_chs = list(ctrl.derivations.keys()) if ctrl.derivations else list(types.keys())
+        eeg_chs = [ch for ch, t in types.items() if t == "eeg"]
+        eog_chs = [ch for ch, t in types.items() if t == "eog"]
+        # Prefer derivations order if types missed some names
+        if not eeg_chs and ctrl.derivations:
+            eeg_chs = [
+                ch for ch in ctrl.derivations
+                if cesa_detect_signal_type(ch) == "eeg"
+            ]
+        if not eog_chs and ctrl.derivations:
+            eog_chs = [
+                ch for ch in ctrl.derivations
+                if cesa_detect_signal_type(ch) == "eog"
+            ]
+        has_scoring = ctrl.get_active_scoring_df() is not None
+        from .dialogs.micro_events_dialog import MicroEventsDialog
+        dlg = MicroEventsDialog(
+            self,
+            ctrl,
+            eeg_chs,
+            eog_chs,
+            all_channels=all_chs,
+            channel_types=types,
+            has_scoring=has_scoring,
+        )
+        dlg.applied.connect(self._apply_micro_event_annotations)
+        dlg.exec()
+
+    def _apply_micro_event_annotations(self, payload: list) -> None:
+        """Push auto-detected micro-events into the annotation store."""
+        if not payload:
+            return
+        # Remove previous auto micro-events of the same types to avoid duplicates
+        micro_types = {"spindle", "slow_wave", "rem_burst", "k_complex"}
+        to_remove = [
+            a.id for a in self._annotation_store.all()
+            if a.source == "auto" and a.ann_type in micro_types
+        ]
+        for aid in to_remove:
+            self._annotation_store.remove(aid)
+        for item in payload:
+            try:
+                self._annotation_store.add(Annotation(
+                    onset_s=float(item.get("onset_s", 0.0)),
+                    duration_s=float(item.get("duration_s", 0.0)),
+                    ann_type=str(item.get("ann_type", "custom")),
+                    channel=str(item.get("channel", "") or ""),
+                    text=str(item.get("text", "") or ""),
+                    confidence=float(item.get("confidence", 1.0)),
+                    source="auto",
+                ))
+            except Exception as exc:
+                logger.warning("Skip micro annotation: %s", exc)
+        self._refresh_annotation_ui()
+        self._status.showMessage(
+            f"{len(payload)} micro-evenement(s) ajoutes aux annotations", 5000,
+        )
+
     def _menu_spectral_analysis(self) -> None:
         ctrl = self._app_controller
         if ctrl is None or ctrl.raw is None:
@@ -2750,6 +2889,31 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
                 logger.debug("open_stage_psd_before_after failed", exc_info=True)
             return
         self._open_stage_psd_native(method="welch", before_after=True)
+
+    def _menu_specparam(self) -> None:
+        data = self._native_stage_signals()
+        if data is None:
+            return
+        signals, channels, scoring_df, epoch = data
+        from .dialogs.specparam_dialog import SpecParamDialog
+        SpecParamDialog(
+            self,
+            signals=signals,
+            channels=channels[:16],
+            scoring_df=scoring_df,
+            epoch_seconds=epoch,
+        ).exec()
+
+    def _menu_night_qc(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None or not ctrl.derivations:
+            QtWidgets.QMessageBox.warning(
+                self, "Attention", "Chargez d'abord un enregistrement.",
+            )
+            return
+        from .dialogs.night_qc_dialog import NightQcDialog
+        NightQcDialog(self, ctrl).exec()
+        self.update_dashboard()
 
     def _menu_wavelet_spectrogram(self) -> None:
         cb = self._on_open_wavelet_spectrogram
@@ -2895,6 +3059,82 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             on_restore=_restore,
         ).exec()
 
+    def _menu_ica_cleaning(self) -> None:
+        ctrl = self._app_controller
+        if ctrl is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Attention", "Chargez d'abord un enregistrement.",
+            )
+            return
+        signals = dict(self._signals_data) if self._signals_data else ctrl.build_viewer_signals()
+        if not signals:
+            QtWidgets.QMessageBox.warning(self, "Attention", "Aucun signal charge.")
+            return
+        channels = list(signals.keys())
+        try:
+            t0 = float(getattr(self._viewer, "start_s", 0.0) or 0.0)
+            dur = float(getattr(self._viewer, "duration_s", 30.0) or 30.0)
+        except Exception:
+            t0, dur = 0.0, 30.0
+
+        def _apply(cleaned: Dict[str, np.ndarray]) -> None:
+            originals = {
+                name: np.asarray(self._signals_data[name][0], dtype=float)
+                for name in cleaned
+                if name in self._signals_data
+            }
+            n = ctrl.apply_ica_cleaning(cleaned, originals=originals)
+            for name, arr in cleaned.items():
+                if name not in self._signals_data:
+                    continue
+                fs = self._signals_data[name][1]
+                self._signals_data[name] = (np.asarray(arr, dtype=float), fs)
+            self._viewer.set_signals(dict(self._signals_data))
+            if hasattr(self, "_sync_cursor") and self._sync_cursor is not None:
+                self._sync_cursor.set_signals(dict(self._signals_data))
+            self._status.showMessage(
+                f"Nettoyage ICA applique ({n} canaux, memoire) — fichier non modifie.",
+                8000,
+            )
+
+        def _restore() -> None:
+            restored = ctrl.restore_ica_backup()
+            for name, arr in restored.items():
+                if name in self._signals_data:
+                    fs = self._signals_data[name][1]
+                    self._signals_data[name] = (arr, fs)
+            for ch, sig in ctrl.build_viewer_signals().items():
+                if ch in self._signals_data and ch not in restored:
+                    self._signals_data[ch] = sig
+            self._viewer.set_signals(dict(self._signals_data))
+            if hasattr(self, "_sync_cursor") and self._sync_cursor is not None:
+                self._sync_cursor.set_signals(dict(self._signals_data))
+            self._status.showMessage(
+                f"Signaux restaures apres ICA ({len(restored)} canaux).",
+                5000,
+            )
+
+        from .dialogs.ica_cleaning_dialog import IcaCleaningDialog
+        filters_on = True
+        try:
+            filters_on = bool(getattr(self._viewer, "global_filter_enabled", True))
+        except Exception:
+            filters_on = bool(getattr(ctrl, "filter_enabled", True))
+        IcaCleaningDialog(
+            self,
+            signals,
+            channels,
+            channel_types=dict(self._channel_types),
+            sfreq=float(ctrl.sfreq),
+            preview_t0=t0,
+            preview_duration=dur,
+            has_active_cleaning=ctrl.has_ica_cleaning(),
+            filters_on=filters_on,
+            ocular_cleaning_active=ctrl.has_ocular_cleaning(),
+            on_apply=_apply,
+            on_restore=_restore,
+        ).exec()
+
     def _refresh_signals_from_controller(self) -> None:
         """Rebuild viewer signal cache from controller derivations."""
         ctrl = self._app_controller
@@ -2950,6 +3190,11 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
     def _open_docs(self) -> None:
         import webbrowser
         webbrowser.open("https://github.com/cbarmoy")
+
+    def _show_feature_search(self) -> None:
+        from .dialogs.feature_search_dialog import FeatureSearchDialog
+
+        FeatureSearchDialog(self).exec()
 
     # ------------------------------------------------------------------
     # Navigation : Aller au temps
@@ -3040,6 +3285,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         <tr><td><b>Ctrl+Shift+N</b></td><td>Nouvelle annotation</td></tr>
         <tr><th align='left'>Panneaux</th><th></th></tr>
         <tr><td><b>F1</b></td><td>Cette aide</td></tr>
+        <tr><td><b>Ctrl+K</b></td><td>Rechercher une fonctionnalite</td></tr>
         <tr><td><b>F8 / F9</b></td><td>Inspection / Dashboard</td></tr>
         <tr><td><b>Ctrl+Shift+P</b></td><td>Rapport PSG (graphiques)</td></tr>
         <tr><td><b>Ctrl+O / Ctrl+Q</b></td><td>Ouvrir / Quitter</td></tr>
@@ -3060,242 +3306,212 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         mb = self.menuBar()
         has_ctrl = self._app_controller is not None
 
+        def _add(
+            menu: QtWidgets.QMenu,
+            text: str,
+            slot,
+            *,
+            shortcut: Optional[str] = None,
+            enabled: bool = True,
+            checkable: bool = False,
+        ) -> QtGui.QAction:
+            action = menu.addAction(text)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.setEnabled(enabled)
+            if checkable:
+                action.setCheckable(True)
+                action.toggled.connect(slot)
+            else:
+                action.triggered.connect(slot)
+            return action
+
         # ---- Fichier ----
         file_m = mb.addMenu("&Fichier")
-        act_open = file_m.addAction("Ouvrir un enregistrement...")
-        act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(self._menu_open_recording)
-        act_open.setEnabled(has_ctrl)
+        _add(file_m, "Ouvrir un enregistrement...", self._menu_open_recording,
+             shortcut="Ctrl+O", enabled=has_ctrl)
         file_m.addSeparator()
-
         exp_sub = file_m.addMenu("Exporter")
-        exp_html = exp_sub.addAction("Rapport HTML...")
-        exp_html.triggered.connect(self._export_html_report)
-        exp_pdf = exp_sub.addAction("Rapport PDF...")
-        exp_pdf.triggered.connect(self._export_pdf_report)
-        exp_ann = exp_sub.addAction("Annotations JSON...")
-        exp_ann.triggered.connect(self._save_annotations)
+        _add(exp_sub, "Rapport HTML...", self._export_html_report)
+        _add(exp_sub, "Rapport PDF...", self._export_pdf_report)
+        _add(exp_sub, "Annotations JSON...", self._save_annotations)
         exp_sub.addSeparator()
-        exp_edf = exp_sub.addAction("Segment EDF (plage temporelle)...")
-        exp_edf.triggered.connect(self._menu_export_edf_segment)
-        exp_edf.setEnabled(has_ctrl)
-
+        _add(exp_sub, "Segment EDF (plage temporelle)...",
+             self._menu_export_edf_segment, enabled=has_ctrl)
         file_m.addSeparator()
-        act_quit = file_m.addAction("Quitter")
-        act_quit.setShortcut("Ctrl+Q")
-        act_quit.triggered.connect(self.close)
+        _add(file_m, "Quitter", self.close, shortcut="Ctrl+Q")
 
-        # ---- Affichage ----
+        # ---- Affichage (theme, trace, panneaux) ----
         view = mb.addMenu("&Affichage")
-        theme_dark = view.addAction("Theme sombre")
-        theme_dark.triggered.connect(lambda: self.set_theme("dark"))
-        theme_light = view.addAction("Theme clair")
-        theme_light.triggered.connect(lambda: self.set_theme("light"))
+        _add(view, "Theme sombre", lambda: self.set_theme("dark"))
+        _add(view, "Theme clair", lambda: self.set_theme("light"))
         view.addSeparator()
-        raw_toggle = view.addAction("Afficher signal brut")
-        raw_toggle.setCheckable(True)
-        raw_toggle.toggled.connect(self._viewer.set_show_raw_underlay)
+        _add(view, "Afficher signal brut",
+             self._viewer.set_show_raw_underlay, checkable=True)
+        self._normalize_action = _add(
+            view, "Normaliser les amplitudes (Ctrl+N)",
+            self._on_normalize_menu, checkable=True,
+        )
         view.addSeparator()
-        self._normalize_action = view.addAction("Normaliser les amplitudes (Ctrl+N)")
-        self._normalize_action.setCheckable(True)
-        self._normalize_action.toggled.connect(self._on_normalize_menu)
+        _add(view, "Aller au temps...", self._menu_goto_time, shortcut="Ctrl+G")
         view.addSeparator()
-        act_goto = view.addAction("Aller au temps...")
-        act_goto.setShortcut("Ctrl+G")
-        act_goto.triggered.connect(self._menu_goto_time)
-
-        # ---- Panneaux ----
-        panels = mb.addMenu("&Panneaux")
-        insp_action = panels.addAction("Inspection (F8)")
-        insp_action.setCheckable(True)
-        insp_action.setShortcut("F8")
-        insp_action.toggled.connect(self._inspection.setVisible)
-        dash_action = panels.addAction("Dashboard (F9)")
+        panels = view.addMenu("Panneaux")
+        _add(panels, "Inspection", self._inspection.setVisible,
+             shortcut="F8", checkable=True)
+        dash_action = panels.addAction("Dashboard")
         dash_action.setCheckable(True)
         dash_action.setShortcut("F9")
         dash_action.toggled.connect(lambda v: (
             self._dashboard.setVisible(v),
             self.update_dashboard() if v else None,
         ))
+        panels.addSeparator()
+        _add(panels, "Scaling", self._scaling_panel.setVisible, checkable=True)
+        _add(panels, "Layout", self._layout_panel.setVisible, checkable=True)
+        _add(panels, "Spectrogramme", self._spectro_panel.setVisible, checkable=True)
 
         # ---- Filtres ----
         filt_m = mb.addMenu("Filt&res")
-        act_fc = filt_m.addAction("Configuration des filtres...")
-        act_fc.setShortcut("Ctrl+Alt+F")
-        act_fc.triggered.connect(self._invoke_filter_config_menu)
-        act_fc.setEnabled(self._on_open_filter_config is not None or has_ctrl)
+        _add(filt_m, "Configuration des filtres...", self._invoke_filter_config_menu,
+             shortcut="Ctrl+Alt+F",
+             enabled=self._on_open_filter_config is not None or has_ctrl)
         filt_m.addSeparator()
-        act_ocular = filt_m.addAction("Nettoyage oculaire...")
-        act_ocular.triggered.connect(self._menu_ocular_cleaning)
-        act_ocular.setEnabled(has_ctrl)
+        _add(filt_m, "Nettoyage oculaire...", self._menu_ocular_cleaning,
+             enabled=has_ctrl)
+        _add(filt_m, "Nettoyage ICA...", self._menu_ica_cleaning, enabled=has_ctrl)
 
-        # ---- Sommeil ----
+        # ---- Sommeil : scoring, fenetre, rapports, evenements, annotations ----
         sleep_m = mb.addMenu("&Sommeil")
-        act_auto = sleep_m.addAction("Scoring automatique...")
-        act_auto.triggered.connect(self._menu_auto_scoring)
-        act_auto.setEnabled(has_ctrl or self._on_request_auto_scoring is not None)
-
-        act_editor = sleep_m.addAction("Editeur de scoring manuel...")
-        act_editor.triggered.connect(self._invoke_manual_editor_menu)
-        act_editor.setEnabled(has_ctrl or self._on_open_manual_scoring_editor is not None)
-
+        _add(sleep_m, "Scoring automatique...", self._menu_auto_scoring,
+             enabled=has_ctrl or self._on_request_auto_scoring is not None)
+        _add(sleep_m, "Editeur de scoring manuel...", self._invoke_manual_editor_menu,
+             enabled=has_ctrl or self._on_open_manual_scoring_editor is not None)
         import_sub = sleep_m.addMenu("Importer scoring")
-        act_imp_file = import_sub.addAction("Depuis fichier (CSV/Excel/JSON)...")
-        act_imp_file.triggered.connect(self._menu_import_scoring_file)
-        act_imp_file.setEnabled(has_ctrl)
-        act_imp_edf = import_sub.addAction("Depuis annotations EDF+...")
-        act_imp_edf.triggered.connect(self._menu_import_scoring_edf)
-        act_imp_edf.setEnabled(has_ctrl)
-
+        _add(import_sub, "Depuis fichier (CSV/Excel/JSON)...",
+             self._menu_import_scoring_file, enabled=has_ctrl)
+        _add(import_sub, "Depuis annotations EDF+...",
+             self._menu_import_scoring_edf, enabled=has_ctrl)
+        _add(sleep_m, "Sauvegarder scoring (CSV/JSON)...",
+             self._menu_save_scoring, enabled=has_ctrl)
         sleep_m.addSeparator()
-        act_night = sleep_m.addAction("Definir fenetre d'analyse...")
-        act_night.triggered.connect(self._menu_set_night_window)
-        act_night.setEnabled(has_ctrl)
-        act_clear_night = sleep_m.addAction("Effacer fenetre d'analyse")
-        act_clear_night.triggered.connect(self._menu_clear_night_window)
-        act_clear_night.setEnabled(has_ctrl)
-
-        sleep_m.addSeparator()
-        act_save = sleep_m.addAction("Sauvegarder scoring (CSV/JSON)...")
-        act_save.triggered.connect(self._menu_save_scoring)
-        act_save.setEnabled(has_ctrl)
-        act_psg = sleep_m.addAction("Exporter rapport PSG (CSV)...")
-        act_psg.triggered.connect(self._menu_export_psg_csv)
-        act_psg.setEnabled(has_ctrl)
-
-        sleep_m.addSeparator()
-        act_psg_view = sleep_m.addAction("Rapport PSG (graphiques)...")
-        act_psg_view.setShortcut("Ctrl+Shift+P")
-        act_psg_view.triggered.connect(self._menu_show_psg_report)
-        act_psg_view.setEnabled(has_ctrl)
-
-        act_compare = sleep_m.addAction("Comparer auto vs manuel...")
-        act_compare.triggered.connect(self._menu_compare_scoring)
-        act_compare.setEnabled(has_ctrl)
-
-        sleep_m.addSeparator()
-        act_info = sleep_m.addAction("Informations scoring")
-        act_info.triggered.connect(self._menu_scoring_info)
-        act_info.setEnabled(has_ctrl)
-
-        self._act_auto_advance_manual = sleep_m.addAction("Auto-avancer après scoring manuel")
+        self._act_auto_advance_manual = sleep_m.addAction(
+            "Auto-avancer après scoring manuel"
+        )
         self._act_auto_advance_manual.setCheckable(True)
-        enabled_toggle = self._on_set_manual_auto_advance is not None
-        self._act_auto_advance_manual.setEnabled(enabled_toggle)
+        self._act_auto_advance_manual.setEnabled(
+            self._on_set_manual_auto_advance is not None
+        )
         if self._on_get_manual_auto_advance is not None:
             try:
-                self._act_auto_advance_manual.setChecked(bool(self._on_get_manual_auto_advance()))
+                self._act_auto_advance_manual.setChecked(
+                    bool(self._on_get_manual_auto_advance())
+                )
             except Exception:
                 self._act_auto_advance_manual.setChecked(False)
         self._act_auto_advance_manual.toggled.connect(
-            lambda checked: self._on_set_manual_auto_advance(checked) if self._on_set_manual_auto_advance else None
+            lambda checked: (
+                self._on_set_manual_auto_advance(checked)
+                if self._on_set_manual_auto_advance else None
+            )
         )
-        act_fft_scoring = sleep_m.addAction("FFT scoring (époque ciblée)")
-        self._act_fft_scoring = act_fft_scoring
-        act_fft_scoring.setShortcut("F")
+        self._act_fft_scoring = _add(
+            sleep_m, "FFT scoring (époque ciblée)",
+            self._toggle_fft_scoring_view, shortcut="F",
+        )
+        self._act_fft_scoring.triggered.connect(
+            lambda: logger.info("[FFT-SHORTCUT] Qt menu action FFT scoring triggered")
+        )
         self._update_fft_scoring_menu_enabled()
-        act_fft_scoring.triggered.connect(self._toggle_fft_scoring_view)
-        act_fft_scoring.triggered.connect(lambda: logger.info("[FFT-SHORTCUT] Qt menu action FFT scoring triggered"))
-
         sleep_m.addSeparator()
-        tip = sleep_m.addAction("Clic droit sur l'hypnogramme : scorer une epoque")
-        tip.setEnabled(False)
-
-        # ---- Detection d'evenements ----
-        events_m = mb.addMenu("&Evenements")
-        act_arousals = events_m.addAction("Detecter les arousals...")
-        act_arousals.triggered.connect(lambda: self._menu_detect_events("arousals"))
-        act_arousals.setEnabled(has_ctrl)
-        act_apneas = events_m.addAction("Detecter apnees / hypopnees...")
-        act_apneas.triggered.connect(lambda: self._menu_detect_events("apneas"))
-        act_apneas.setEnabled(has_ctrl)
-        act_desats = events_m.addAction("Detecter desaturations SpO2...")
-        act_desats.triggered.connect(lambda: self._menu_detect_events("desaturations"))
-        act_desats.setEnabled(has_ctrl)
-
-        # ---- Annotations ----
-        ann = mb.addMenu("&Annotations")
-        add_ann = ann.addAction("Nouvelle annotation (Ctrl+Shift+N)")
-        add_ann.setShortcut("Ctrl+Shift+N")
-        add_ann.triggered.connect(self._create_annotation_at_cursor)
+        night_m = sleep_m.addMenu("Fenetre d'analyse")
+        _add(night_m, "Definir...", self._menu_set_night_window, enabled=has_ctrl)
+        _add(night_m, "Effacer", self._menu_clear_night_window, enabled=has_ctrl)
+        reports_m = sleep_m.addMenu("Rapports PSG")
+        _add(reports_m, "Exporter CSV...", self._menu_export_psg_csv, enabled=has_ctrl)
+        _add(reports_m, "Graphiques...", self._menu_show_psg_report,
+             shortcut="Ctrl+Shift+P", enabled=has_ctrl)
+        _add(sleep_m, "Comparer auto vs manuel...",
+             self._menu_compare_scoring, enabled=has_ctrl)
+        _add(sleep_m, "Comparer des configurations de scoring...",
+             self._menu_sweep_scoring, enabled=has_ctrl)
+        _add(sleep_m, "Informations scoring", self._menu_scoring_info, enabled=has_ctrl)
+        sleep_m.addSeparator()
+        events_m = sleep_m.addMenu("Evenements")
+        _add(events_m, "Detecter micro-architecture (spindles/SO/REM)...",
+             self._menu_micro_events, enabled=has_ctrl)
+        events_m.addSeparator()
+        _add(events_m, "Detecter les arousals...",
+             lambda: self._menu_detect_events("arousals"), enabled=has_ctrl)
+        _add(events_m, "Detecter apnees / hypopnees...",
+             lambda: self._menu_detect_events("apneas"), enabled=has_ctrl)
+        _add(events_m, "Detecter desaturations SpO2...",
+             lambda: self._menu_detect_events("desaturations"), enabled=has_ctrl)
+        ann = sleep_m.addMenu("Annotations")
+        _add(ann, "Nouvelle annotation...", self._create_annotation_at_cursor,
+             shortcut="Ctrl+Shift+N")
         ann.addSeparator()
-        save_ann = ann.addAction("Sauvegarder annotations...")
-        save_ann.triggered.connect(self._save_annotations)
-        load_ann = ann.addAction("Charger annotations...")
-        load_ann.triggered.connect(self._load_annotations)
+        _add(ann, "Sauvegarder annotations...", self._save_annotations)
+        _add(ann, "Charger annotations...", self._load_annotations)
         ann.addSeparator()
-        clear_ann = ann.addAction("Effacer toutes les annotations")
-        clear_ann.triggered.connect(self._clear_annotations)
+        _add(ann, "Effacer toutes les annotations", self._clear_annotations)
         ann.addSeparator()
-        markers_act = ann.addAction("Marqueurs temporels...")
-        markers_act.triggered.connect(self._menu_markers)
-        markers_act.setEnabled(has_ctrl)
+        _add(ann, "Marqueurs temporels...", self._menu_markers, enabled=has_ctrl)
 
         # ---- Analyse ----
         analyse = mb.addMenu("Anal&yse")
-        act_spectral = analyse.addAction("Analyse spectrale (PSD Welch)...")
-        act_spectral.triggered.connect(self._menu_spectral_analysis)
-        act_spectral.setEnabled(has_ctrl)
-        act_stage_fft = analyse.addAction("PSD par stade (FFT - Analyse_spectrale)...")
-        act_stage_fft.triggered.connect(self._menu_stage_psd_fft)
-        act_stage_fft.setEnabled(has_ctrl or self._on_open_stage_psd_fft is not None)
-
-        act_stage_ba = analyse.addAction("PSD par stade (Welch) avant/apres...")
-        act_stage_ba.triggered.connect(self._menu_stage_psd_before_after)
-        act_stage_ba.setEnabled(has_ctrl or self._on_open_stage_psd_before_after is not None)
-
-        act_wavelet = analyse.addAction("Spectrogramme ondelettes (avant/apres)...")
-        act_wavelet.triggered.connect(self._menu_wavelet_spectrogram)
-        act_wavelet.setEnabled(has_ctrl or self._on_open_wavelet_spectrogram is not None)
-
-        analyse.addSeparator()
-        act_entropy = analyse.addAction("Entropie (MSE / Renormalisee)...")
-        act_entropy.triggered.connect(self._menu_entropy_analysis)
-        act_entropy.setEnabled(has_ctrl)
-        act_temporal = analyse.addAction("Analyse temporelle (RMS, kurtosis...)...")
-        act_temporal.triggered.connect(self._menu_temporal_analysis)
-        act_temporal.setEnabled(has_ctrl)
-        act_conn = analyse.addAction("Connectivite (coherence, correlation, PLV)...")
-        act_conn.triggered.connect(self._menu_connectivity_analysis)
-        act_conn.setEnabled(has_ctrl)
-        act_artifacts = analyse.addAction("Detection d'artefacts...")
-        act_artifacts.triggered.connect(self._menu_artifact_detection)
-        act_artifacts.setEnabled(has_ctrl)
-        act_micro = analyse.addAction("Micro-etats (K-means)...")
-        act_micro.triggered.connect(self._menu_microstates_analysis)
-        act_micro.setEnabled(has_ctrl)
-        act_sleepper = analyse.addAction("Periodes de sommeil (SleepEEGpy)...")
-        act_sleepper.triggered.connect(self._menu_sleep_periods)
-        act_sleepper.setEnabled(has_ctrl)
-
+        spectral_m = analyse.addMenu("Spectrale")
+        _add(spectral_m, "Analyse spectrale (PSD Welch)...",
+             self._menu_spectral_analysis, enabled=has_ctrl)
+        _add(spectral_m, "PSD par stade (FFT - Analyse_spectrale)...",
+             self._menu_stage_psd_fft,
+             enabled=has_ctrl or self._on_open_stage_psd_fft is not None)
+        _add(spectral_m, "PSD par stade (Welch) avant/apres...",
+             self._menu_stage_psd_before_after,
+             enabled=has_ctrl or self._on_open_stage_psd_before_after is not None)
+        _add(spectral_m, "SpecParam (FOOOF / 1/f)...",
+             self._menu_specparam, enabled=has_ctrl)
+        _add(spectral_m, "Spectrogramme ondelettes (avant/apres)...",
+             self._menu_wavelet_spectrogram,
+             enabled=has_ctrl or self._on_open_wavelet_spectrogram is not None)
+        quality_m = analyse.addMenu("Qualite")
+        _add(quality_m, "QC nuit...", self._menu_night_qc, enabled=has_ctrl)
+        _add(quality_m, "Detection d'artefacts...",
+             self._menu_artifact_detection, enabled=has_ctrl)
+        signals_m = analyse.addMenu("Signaux")
+        _add(signals_m, "Entropie (MSE / Renormalisee)...",
+             self._menu_entropy_analysis, enabled=has_ctrl)
+        _add(signals_m, "Analyse temporelle (RMS, kurtosis...)...",
+             self._menu_temporal_analysis, enabled=has_ctrl)
+        _add(signals_m, "Connectivite (coherence, correlation, PLV)...",
+             self._menu_connectivity_analysis, enabled=has_ctrl)
+        _add(signals_m, "Micro-etats (K-means)...",
+             self._menu_microstates_analysis, enabled=has_ctrl)
+        _add(signals_m, "Periodes de sommeil (SleepEEGpy)...",
+             self._menu_sleep_periods, enabled=has_ctrl)
         analyse.addSeparator()
         batch_menu = analyse.addMenu("Batch / Multi-sujets")
-        act_batch_fft = batch_menu.addAction("Automatisation en lot (FFT / Spaghetti / PSG)...")
-        act_batch_fft.triggered.connect(self._menu_batch_fft_automation)
-        act_batch_fft.setShortcut("Ctrl+B")
-        act_batch_fft.setEnabled(True)
-
-        act_group = batch_menu.addAction("Analyse Groupe (MSE/REN/HRV)...")
-        act_group.triggered.connect(self._menu_group_analysis)
-        act_group.setEnabled(True)
-
-        # ---- ML/DL ----
-        ml = mb.addMenu("&ML/DL")
+        _add(batch_menu, "Automatisation en lot (FFT / Spaghetti / PSG)...",
+             self._menu_batch_fft_automation, shortcut="Ctrl+B")
+        _add(batch_menu, "Analyse Groupe (MSE/REN/HRV)...",
+             self._menu_group_analysis)
+        ml = analyse.addMenu("ML/DL")
         ml_info = ml.addAction("Aucun backend charge")
         ml_info.setEnabled(False)
         self._ml_menu = ml
 
         # ---- Aide ----
         aide = mb.addMenu("A&ide")
-        sc_act = aide.addAction("Raccourcis clavier")
-        sc_act.setShortcut("F1")
-        sc_act.triggered.connect(self._show_shortcuts)
+        act_search = _add(
+            aide, "Rechercher une fonctionnalite...",
+            self._show_feature_search, shortcut="Ctrl+K",
+        )
+        act_search.setObjectName("featureSearch")
         aide.addSeparator()
-        about_act = aide.addAction("A propos de CESA...")
-        about_act.triggered.connect(self._show_about)
+        _add(aide, "Raccourcis clavier", self._show_shortcuts, shortcut="F1")
         aide.addSeparator()
-        docs_act = aide.addAction("Documentation en ligne...")
-        docs_act.triggered.connect(self._open_docs)
+        _add(aide, "Documentation en ligne...", self._open_docs)
+        aide.addSeparator()
+        _add(aide, "A propos de CESA...", self._show_about)
 
     # ------------------------------------------------------------------
     # Annotation actions
@@ -3439,6 +3655,9 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
 
         if key == QtCore.Qt.Key.Key_F1:
             self._show_shortcuts()
+            return True
+        if ctrl and not shift and not alt and not meta and key == QtCore.Qt.Key.Key_K:
+            self._show_feature_search()
             return True
         if ctrl and not shift and not alt and not meta and key == QtCore.Qt.Key.Key_G:
             self._menu_goto_time()

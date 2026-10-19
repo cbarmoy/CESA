@@ -61,13 +61,19 @@ Accessible via `Sommeil → Informations scoring`. Les calculs respectent les st
 
 | Indicateur              | Description                                                   | Formule                                    |
 |-------------------------|---------------------------------------------------------------|--------------------------------------------|
-| TIB (Time In Bed)       | Durée totale de l'enregistrement                              | `nb_epochs_total × durée_epoch`            |
+| TIB (Time In Bed)       | Duree fenetre d'analyse (lights off → on) ou span scoring     | `(lights_on − lights_off)` ou span epoques |
 | TST (Total Sleep Time)  | Temps total de sommeil (N1+N2+N3+REM)                         | `nb_epochs_sommeil × durée_epoch`          |
 | Efficacité du sommeil   | Pourcentage de TIB passé à dormir                             | `(TST / TIB) × 100`                        |
-| SOL (Sleep Onset Latency) | Temps avant la première époque de sommeil                   | `index_first_sleep × durée_epoch`          |
-| Latence REM             | Temps avant la première époque REM                           | `index_first_REM × durée_epoch`            |
+| SOL (Sleep Onset Latency) | Temps avant la première époque de sommeil                   | avec fenetre: `first_sleep − lights_off` ; sinon `index × durée_epoch` |
+| Latence REM             | Temps avant la première époque REM                           | depuis l'onset de sommeil                  |
 | WASO                    | Temps d'éveil après l'endormissement                          | `nb_epochs_W_post_onset × durée_epoch`     |
 | Temps d'éveil total     | Somme des périodes d'éveil                                    | `nb_epochs_W × durée_epoch`                |
+| Cycles                  | Retours REM → NREM (heuristique)                              | `count_sleep_cycles`                       |
+| Transitions             | Matrice empirique W/N1/N2/N3/R (counts + probs)               | `stage_transition_matrix`                  |
+
+### Fenetre nuit / lights off–on
+
+Dans CESA, **lights off** = `night_start_s` et **lights on** = `night_end_s` (marqueurs hypnogramme, alias `PsgSummary.lights_off_s` / `lights_on_s`). Quand la fenetre est definie, TIB et SOL utilisent l'horloge murale de cette fenetre (voir `_apply_night_window_tib` dans `CESA/sleep_metrics.py`).
 
 ### Option « Inclure les périodes U »
 
@@ -159,6 +165,46 @@ Le script détecte `os.cpu_count()` et répartit les tests sur plusieurs workers
 ### 7.5 Références complémentaires
 
 - Costa, M., Goldberger, A. L., & Peng, C.-K. (2002). **Multiscale entropy analysis of complex physiologic time series**. *Physical Review Letters*, 89(6).
+
+## 8. Couplage ondes lentes – fuseaux (phase préférée)
+
+Second chemin de détection, indépendant de YASA, implémenté dans `CESA/sleep_pipeline/so_spindle_coupling.py` et accessible depuis `Événements → Détecter micro-architecture…`, case **Couplage classique (filtres + Hilbert + phase préférée)**. Toutes les étapes sont explicites et reproductibles sur un EEG clinique standardisé.
+
+### 8.1 Détection des événements
+
+| Étape | Méthode | Paramètres par défaut |
+|-------|---------|-----------------------|
+| Onde lente (SO) | Butterworth d'ordre 4, phase nulle (`sosfiltfilt`) | 0,5 – 1,25 Hz |
+| Cycle SO | Entre deux passages à zéro descendants | durée 0,8 – 2,0 s |
+| Critère d'amplitude SO | Pic négatif sous `moyenne − 1,5 × écart-type` du signal filtré | 1,5 SD |
+| Fuseau | Même filtre + enveloppe de Hilbert `|hilbert(x)|` | 12 – 16 Hz (AASM) |
+| Critère fuseau | Enveloppe au-dessus de `moyenne + 1,5 × écart-type` | durée 0,5 – 2,0 s |
+
+Les seuils sont estimés uniquement sur les échantillons retenus par l'hypnogramme : N2 pour les fuseaux, N2+N3 pour les ondes lentes. Sans scoring chargé, l'analyse porte sur l'enregistrement entier et un avertissement est émis.
+
+### 8.2 Phase instantanée et phase préférée
+
+La phase instantanée de l'onde lente est `φ(t) = angle(hilbert(x_SO))`. **Convention : φ = 0 rad au pic positif (up-state), φ = ±π au creux négatif (down-state).**
+
+Un fuseau est dit *couplé* quand le maximum de son enveloppe tombe à l'intérieur d'un cycle SO ; on relève alors `φ` à cet instant. Les phases ainsi collectées sont agrégées par canal avec `pycircstat2` :
+
+- **phase préférée** = moyenne circulaire `arg(Σ e^{iφ_k})`, ramenée dans `[−π, π)` ;
+- **force du couplage** = longueur du vecteur résultant `R = |Σ e^{iφ_k}| / n`, entre 0 (phases uniformes) et 1 (verrouillage parfait) ;
+- **test de Rayleigh** = uniformité de la distribution (`z`, `p`).
+
+La moyenne arithmétique d'angles est invalide (discontinuité en ±π) : c'est pourquoi la statistique circulaire est obligatoire ici. Si `pycircstat2` est absent, CESA calcule les mêmes estimateurs avec NumPy (approximation de Zar, 1999, éq. 27.4 pour le `p` de Rayleigh) et indique `backend = numpy` dans la colonne correspondante.
+
+### 8.3 Sieste courte de 20 minutes
+
+Une sieste courte produit peu de N2/N3, donc peu de couples SO–fuseau. En dessous de **8 fuseaux couplés** (`MIN_COUPLED_EVENTS`), les effectifs sont exportés mais la phase préférée, `R` et le test de Rayleigh sont laissés vides, avec un avertissement explicite. Un `R` calculé sur quelques événements n'est pas interprétable.
+
+Colonnes exportées (`*_coupling.csv`) : `channel`, `n_so`, `n_spindle`, `n_coupled`, `preferred_phase_rad`, `preferred_phase_deg`, `resultant_length`, `rayleigh_z`, `rayleigh_p`, `backend`.
+
+### 8.4 Références
+
+- Staresina, B. P. (2024). **Coupled sleep rhythms for memory consolidation**. *Trends in Cognitive Sciences*.
+- Sejnowski, T. J., & Destexhe, A. (2000). **Why do we sleep?** *Brain Research*, 886(1-2).
+- Zar, J. H. (1999). **Biostatistical Analysis** (4e éd.), chapitre 27 : statistiques circulaires.
 
 ---
 

@@ -404,47 +404,41 @@ class HypnogramBar(QtWidgets.QWidget):
     def _draw_cycle_markers(self) -> None:
         """Detect and mark approximate sleep cycle boundaries.
 
-        A new cycle starts when the hypnogram transitions from REM (or W
-        after a REM block) back down into NREM.
+        Uses :func:`CESA.sleep_metrics.count_sleep_cycles` (REM → return to NREM).
         """
         if len(self._labels) < 10:
             return
 
+        from CESA.sleep_metrics import count_sleep_cycles
+
         ep = self._epoch_len
         theme = self._theme
-        in_rem = False
-        cycle_num = 0
+        times = [i * ep for i in range(len(self._labels))]
+        cycles = count_sleep_cycles(self._labels, times, ep)
 
-        for i, lbl in enumerate(self._labels):
-            s = normalize_stage(lbl)
-            if s == "R":
-                in_rem = True
-            elif in_rem and s in ("N1", "N2", "N3"):
-                in_rem = False
-                cycle_num += 1
-                x_c = i * ep
-                line = pg.InfiniteLine(
-                    pos=x_c, angle=90,
-                    pen=pg.mkPen(
-                        theme.get("hypno_cycle_line", "#FFFFFF30"),
-                        width=1.5,
-                        style=QtCore.Qt.PenStyle.DashLine,
-                    ),
-                )
-                line.setZValue(3)
-                self._plot.addItem(line)
-                self._cycle_lines.append(line)
+        for cycle_num, x_c in enumerate(cycles.boundaries_s, start=1):
+            line = pg.InfiniteLine(
+                pos=x_c, angle=90,
+                pen=pg.mkPen(
+                    theme.get("hypno_cycle_line", "#FFFFFF30"),
+                    width=1.5,
+                    style=QtCore.Qt.PenStyle.DashLine,
+                ),
+            )
+            line.setZValue(3)
+            self._plot.addItem(line)
+            self._cycle_lines.append(line)
 
-                lbl_item = pg.TextItem(
-                    text=f"C{cycle_num + 1}",
-                    color=theme.get("text_dim", "#6C7086"),
-                    anchor=(0.5, 0.0),
-                )
-                lbl_item.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Weight.Bold))
-                lbl_item.setPos(x_c, 6.0)
-                lbl_item.setZValue(5)
-                self._plot.addItem(lbl_item)
-                self._cycle_lines.append(lbl_item)
+            lbl_item = pg.TextItem(
+                text=f"C{cycle_num + 1}",
+                color=theme.get("text_dim", "#6C7086"),
+                anchor=(0.5, 0.0),
+            )
+            lbl_item.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Weight.Bold))
+            lbl_item.setPos(x_c, 6.0)
+            lbl_item.setZValue(5)
+            self._plot.addItem(lbl_item)
+            self._cycle_lines.append(lbl_item)
 
     def _clear_night_markers(self) -> None:
         for item in self._night_marker_items:

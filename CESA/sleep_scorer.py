@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 import os
 import inspect
 import logging
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional, Sequence
 
@@ -32,12 +36,17 @@ class SleepScorer:
     yasa_male: Optional[bool] = None
     yasa_confidence_threshold: float = 0.80
 
+    # Original recording on disk, uploaded when U-Sleep runs through the web API
+    edf_path: Optional[str] = None
+
     # U-Sleep specific runtime options
     usleep_checkpoint_path: Optional[str] = None
     usleep_sfreq: float = 128.0
     usleep_device: Optional[str] = None
     usleep_use_eog: bool = True
     usleep_zscore: bool = True
+    usleep_api_token: Optional[str] = None
+    usleep_model_name: str = "U-Sleep v1.0"
 
     # PFTSleep-specific options
     pft_models_dir: Optional[str] = None
@@ -208,8 +217,209 @@ class SleepScorer:
         return self._validate_output_df(df)
 
     def _score_usleep(self, raw: mne.io.BaseRaw) -> pd.DataFrame:
-        """Run U-Sleep inference via official Python implementation."""
+        """Score with U-Sleep, through the official web service when possible.
+
+        The published U-Sleep weights are not distributed, so the web service is
+        the only way to reach the performance reported in the paper. A local
+        checkpoint stays supported for anyone who trained or obtained one.
+        """
         self._emit("start", {"backend": "usleep"})
+        if self._usleep_prefers_api():
+            return self._score_usleep_api(raw)
+        return self._score_usleep_checkpoint(raw)
+
+    def _usleep_prefers_api(self) -> bool:
+        """The web service wins over a checkpoint, and owns the no-weights case."""
+        if self._resolve_usleep_token():
+            return True
+        ckpt = (self.usleep_checkpoint_path or "").strip()
+        return not (ckpt and os.path.isfile(ckpt))
+
+    def _resolve_usleep_token(self) -> Optional[str]:
+        """API token from the caller, else from ``USLEEP_API_TOKEN``."""
+        token = str(self.usleep_api_token or "").strip()
+        if token:
+            return token
+        return str(os.environ.get("USLEEP_API_TOKEN", "") or "").strip() or None
+
+    def _score_usleep_api(self, raw: mne.io.BaseRaw) -> pd.DataFrame:
+        """Score through the official U-Sleep web service (sleep.ai.ku.dk)."""
+        token = self._resolve_usleep_token()
+        if not token:
+            raise RuntimeError(
+                "U-Sleep exige un token API : generez-en un sur "
+                "https://sleep.ai.ku.dk (Account -> Generate API Token), puis "
+                "renseignez-le dans la fenetre de scoring ou dans la variable "
+                "d'environnement USLEEP_API_TOKEN. Un token reste valable 12 h."
+            )
+        try:
+            from usleep_api import USleepAPI  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Le package 'usleep-api' n'est pas installe "
+                "(pip install usleep-api)."
+            ) from exc
+
+        channels = self._select_input_channels(raw)
+        self._emit("eeg_selected", {"eeg": channels[0]})
+        if len(channels) > 1:
+            self._emit("eog_selected", {"eog": channels[1:]})
+
+        upload_path, cleanup = self._prepare_usleep_upload(raw, channels)
+        self._emit(
+            "staging_initialized",
+            {
+                "mode": "usleep",
+                "source": "api",
+                "device": f"api:{self.usleep_model_name}",
+                "eeg": channels[0],
+                "eog": channels[1] if len(channels) > 1 else None,
+            },
+        )
+        try:
+            api = USleepAPI(api_token=token)
+            session = api.new_session(session_name=f"cesa_{uuid.uuid4().hex[:8]}")
+            try:
+                session.set_model(self.usleep_model_name)
+                session.upload_file(upload_path, anonymize_before_upload=True)
+                self._emit("predict_begin", {"backend": "usleep", "source": "api"})
+                session.predict(
+                    data_per_prediction=int(
+                        round(float(self.usleep_sfreq) * float(self.epoch_length))
+                    ),
+                    channel_groups=[list(channels)],
+                )
+                if not session.wait_for_completion():
+                    raise RuntimeError(
+                        "Le service U-Sleep a rejete la prediction : consultez le "
+                        "journal du service pour la cause exacte."
+                    )
+                try:
+                    hypnogram = session.get_hypnogram(with_confidence_scores=True)
+                except TypeError:
+                    hypnogram = session.get_hypnogram()
+            finally:
+                # Leaving the upload on the server would keep the recording online.
+                try:
+                    session.delete_session()
+                except Exception as exc:
+                    logging.debug("U-Sleep session cleanup failed: %s", exc)
+        finally:
+            cleanup()
+        self._emit("predict_end", {"backend": "usleep", "source": "api"})
+
+        df = self._usleep_api_dataframe(hypnogram)
+        if df.empty:
+            raise RuntimeError("Le service U-Sleep n'a renvoye aucun stade.")
+        self._emit("done", {"epochs": int(len(df))})
+        return self._validate_output_df(df)
+
+    def _prepare_usleep_upload(
+        self, raw: mne.io.BaseRaw, channels: Sequence[str],
+    ) -> tuple[str, Callable[[], None]]:
+        """Path of the file to upload, plus its cleanup callback.
+
+        Exporting only the scoring channels keeps the other ~90 leads of a full
+        PSG off the network; without an EDF writer the original file is used
+        instead, the service being told which channels to read.
+        """
+        if importlib.util.find_spec("edfio") is not None:
+            from mne.export import export_raw
+
+            tmpdir = tempfile.mkdtemp(prefix="cesa_usleep_")
+            out_path = os.path.join(tmpdir, "psg.edf")
+            work = raw.copy().pick(list(channels)).load_data()
+            work.anonymize()
+            export_raw(out_path, work, fmt="edf", overwrite=True, verbose="ERROR")
+            return out_path, lambda: shutil.rmtree(tmpdir, ignore_errors=True)
+
+        path = str(self.edf_path or "").strip()
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(
+                "Le scoring U-Sleep passe par un envoi de fichier : installez "
+                "'edfio' (pip install edfio) pour n'envoyer que les canaux de "
+                "scoring, ou chargez un EDF depuis le disque."
+            )
+        return path, lambda: None
+
+    def _usleep_api_dataframe(self, hypnogram: Any) -> pd.DataFrame:
+        """Normalize what the service returns into ``time`` / ``stage`` rows."""
+        confidence = None
+        proba = None
+        if isinstance(hypnogram, dict):
+            for key in ("confidence", "confidences", "scores"):
+                if key in hypnogram:
+                    confidence = hypnogram[key]
+                    break
+            for key in ("probabilities", "proba", "probability"):
+                if key in hypnogram:
+                    proba = hypnogram[key]
+                    break
+            for key in ("hypnogram", "stages", "labels"):
+                if key in hypnogram:
+                    hypnogram = hypnogram[key]
+                    break
+        if isinstance(hypnogram, (str, bytes)):
+            hypnogram = str(hypnogram).split()
+        if hypnogram is None:
+            return pd.DataFrame(columns=["time", "stage"])
+
+        epoch = float(self.epoch_length)
+        stages: list[str] = []
+        for item in list(hypnogram):
+            # Interval form (start, duration, stage) is expanded to one row per epoch.
+            if isinstance(item, (list, tuple)) and len(item) == 3:
+                repeat = max(1, int(round(float(item[1]) / epoch)))
+                stages.extend([self._normalize_api_stage(item[2])] * repeat)
+            else:
+                stages.append(self._normalize_api_stage(item))
+
+        times = np.arange(len(stages), dtype=float) * epoch
+        df = pd.DataFrame({"time": times, "stage": stages})
+        return self._attach_usleep_confidence(df, confidence, proba)
+
+    @staticmethod
+    def _attach_usleep_confidence(
+        df: pd.DataFrame, confidence: Any, proba: Any,
+    ) -> pd.DataFrame:
+        """Copy optional per-epoch scores onto the hypnogram, when shapes match."""
+        if df.empty:
+            return df
+        n = len(df)
+        if proba is not None:
+            arr = np.asarray(proba, dtype=float)
+            if arr.ndim == 2 and arr.shape[0] == 5 and arr.shape[1] == n:
+                arr = arr.T
+            if arr.ndim == 2 and arr.shape[0] == n and arr.shape[1] == 5:
+                for i, stage in enumerate(("W", "N1", "N2", "N3", "R")):
+                    df[f"proba_{stage}"] = arr[:, i]
+                if confidence is None:
+                    confidence = arr.max(axis=1)
+        if confidence is not None:
+            conf = np.asarray(confidence, dtype=float).reshape(-1)
+            if len(conf) == n:
+                df["confidence"] = conf
+        return df
+
+    @staticmethod
+    def _normalize_api_stage(value: Any) -> str:
+        by_index = {0: "W", 1: "N1", 2: "N2", 3: "N3", 4: "R"}
+        by_name = {
+            "WAKE": "W", "W": "W", "AWAKE": "W",
+            "N1": "N1", "S1": "N1",
+            "N2": "N2", "S2": "N2",
+            "N3": "N3", "S3": "N3", "S4": "N3",
+            "REM": "R", "R": "R",
+        }
+        if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+            return by_index.get(int(value), "U")
+        text = str(value).strip().upper()
+        if text.isdigit():
+            return by_index.get(int(text), "U")
+        return by_name.get(text, "U")
+
+    def _score_usleep_checkpoint(self, raw: mne.io.BaseRaw) -> pd.DataFrame:
+        """Run U-Sleep locally from a checkpoint the user provides."""
         try:
             import torch
         except ImportError as exc:
@@ -438,20 +648,19 @@ class SleepScorer:
 
     def _select_input_channels(self, raw: mne.io.BaseRaw) -> list[str]:
         """Pick channels for U-Sleep while matching current project conventions."""
-        available = list(raw.ch_names)
-        chosen: list[str] = []
-        for name in self.eeg_candidates:
-            if name in available:
-                chosen.append(name)
-                break
-        if not chosen:
+        eeg_name = self._pick_first_available_channel(
+            raw, self.eeg_candidates, kind="EEG", required=False,
+        )
+        if not eeg_name:
             raise RuntimeError("Aucun canal EEG compatible trouvé pour U-Sleep.")
+        chosen = [eeg_name]
 
         if self.usleep_use_eog:
-            for name in self.eog_candidates:
-                if name in available and name not in chosen:
-                    chosen.append(name)
-                    break
+            eog_name = self._pick_first_available_channel(
+                raw, self.eog_candidates, kind="EOG", required=False,
+            )
+            if eog_name and eog_name not in chosen:
+                chosen.append(eog_name)
 
         return chosen
 
