@@ -21,8 +21,17 @@ from typing import Callable, List, Optional
 from PySide6 import QtCore, QtWidgets
 
 from core.raw_loader import open_raw_file, recording_extensions_for_scan
+from CESA.sleep_pipeline.so_spindle_coupling import (
+    MIN_COUPLED_EVENTS as MIN_COUPLED_DEFAULT,
+)
 
 logger = logging.getLogger(__name__)
+
+# Output modes, in combo order.
+MODE_FFT = 0
+MODE_SPAGHETTI = 1
+MODE_PSG = 2
+MODE_COUPLING = 3
 
 # Roles for files in a before/after design.
 GROUP_NONE = "-"
@@ -164,6 +173,7 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
             "FFT/PSD par canal (CSV)",
             "Spaghetti avant/apres",
             "Metriques PSG (CSV multi-sujets)",
+            "Couplage SO-fuseau (CSV multi-sujets)",
         ])
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Mode de sortie:", self._mode_combo)
@@ -229,6 +239,21 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         self._scoring_chk.setChecked(True)
         form.addRow("", self._scoring_chk)
 
+        self._min_coupled_spin = QtWidgets.QSpinBox()
+        self._min_coupled_spin.setRange(1, 1000)
+        self._min_coupled_spin.setValue(MIN_COUPLED_DEFAULT)
+        self._min_coupled_spin.setToolTip(
+            "En dessous de ce nombre de fuseaux couples, la phase preferee "
+            "n'est pas publiee pour le canal (effectifs quand meme exportes)."
+        )
+        form.addRow("Fuseaux couples minimum:", self._min_coupled_spin)
+
+        self._events_chk = QtWidgets.QCheckBox(
+            "Exporter aussi un CSV d'evenements par fichier (phase de chaque fuseau)"
+        )
+        form.addRow("", self._events_chk)
+
+        self._on_mode_changed()
         return w
 
     def _build_run_tab(self) -> QtWidgets.QWidget:
@@ -344,15 +369,23 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
     # ------------------------------------------------------------------
 
     def _on_mode_changed(self) -> None:
-        is_psg = self._mode_combo.currentIndex() == 2
-        is_spaghetti = self._mode_combo.currentIndex() == 1
-        # Channels not used in PSG mode
+        mode = self._mode_combo.currentIndex()
+        is_psg = mode == MODE_PSG
+        is_spaghetti = mode == MODE_SPAGHETTI
+        is_coupling = mode == MODE_COUPLING
+        is_spectral = mode in (MODE_FFT, MODE_SPAGHETTI)
+        # Channels not used in PSG mode; coupling falls back to every EEG
+        # channel when the field is left empty.
         self._channels_widget.setEnabled(not is_psg)
-        self._method_combo.setEnabled(not is_psg)
-        self._nperseg_spin.setEnabled(not is_psg)
-        self._equalize_chk.setEnabled(not is_psg)
-        self._robust_chk.setEnabled(not is_psg)
+        self._method_combo.setEnabled(is_spectral)
+        self._nperseg_spin.setEnabled(is_spectral)
+        self._fmin_spin.setEnabled(is_spectral)
+        self._fmax_spin.setEnabled(is_spectral)
+        self._equalize_chk.setEnabled(is_spectral)
+        self._robust_chk.setEnabled(is_spectral)
         self._scoring_chk.setEnabled(not is_spaghetti)
+        self._min_coupled_spin.setEnabled(is_coupling)
+        self._events_chk.setEnabled(is_coupling)
 
     def _browse_output(self) -> None:
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Dossier de sortie")
@@ -422,10 +455,12 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
 
         mode = self._mode_combo.currentIndex()
         try:
-            if mode == 0:
+            if mode == MODE_FFT:
                 job = self._make_fft_job(out_dir)
-            elif mode == 1:
+            elif mode == MODE_SPAGHETTI:
                 job = self._make_spaghetti_job(out_dir)
+            elif mode == MODE_COUPLING:
+                job = self._make_coupling_job(out_dir)
             else:
                 job = self._make_psg_job(out_dir)
         except ValueError as exc:
@@ -468,6 +503,8 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
             )
             for err in result.errors:
                 self._append_log(f"  - {err}")
+            for warn in getattr(result, "warnings", []):
+                self._append_log(f"  ! {warn}")
             for out in result.outputs:
                 self._append_log(f"  -> {out}")
         elif isinstance(result, (list, tuple)):
@@ -528,6 +565,37 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         def job(progress_cb, should_stop):
             return run_batch_psg(
                 files, config, progress_cb=progress_cb, should_stop=should_stop,
+            )
+
+        return job
+
+    def _make_coupling_job(self, out_dir: str) -> Callable:
+        from CESA.batch_engine import (
+            BatchCouplingConfig, run_batch_so_spindle_coupling,
+        )
+
+        files = self._all_files()
+        if not files:
+            raise ValueError("Aucun fichier a traiter.")
+        config = BatchCouplingConfig(
+            output_dir=out_dir,
+            channels=self._parsed_channels(),
+            epoch_seconds=self._epoch_spin.value(),
+            include_scoring=self._scoring_chk.isChecked(),
+            min_coupled=self._min_coupled_spin.value(),
+            export_events=self._events_chk.isChecked(),
+        )
+        groups = {
+            path: group
+            for group in (GROUP_BEFORE, GROUP_AFTER)
+            for path in self._files_in_group(group)
+        }
+
+        def job(progress_cb, should_stop):
+            return run_batch_so_spindle_coupling(
+                files, config,
+                groups=groups,
+                progress_cb=progress_cb, should_stop=should_stop,
             )
 
         return job

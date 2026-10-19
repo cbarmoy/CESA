@@ -11,6 +11,7 @@ It reuses the numerical helpers from :mod:`CESA.spectral_analysis` and
 Public API:
     - :class:`BatchFFTConfig` / :func:`run_batch_fft`
     - :class:`BatchPSGConfig` / :func:`run_batch_psg`
+    - :class:`BatchCouplingConfig` / :func:`run_batch_so_spindle_coupling`
     - :func:`resolve_scoring_for_file`
     - :func:`compute_channel_psd_by_stage` / :func:`export_psd_results_to_csv`
 
@@ -78,6 +79,22 @@ class BatchPSGConfig:
 
 
 @dataclass
+class BatchCouplingConfig:
+    """Parameters for the SO-spindle coupling batch pipeline.
+
+    An empty *channels* list means "every channel detected as EEG".
+    """
+
+    output_dir: str
+    channels: List[str] = field(default_factory=list)
+    epoch_seconds: float = 30.0
+    include_scoring: bool = True
+    min_coupled: Optional[int] = None
+    export_events: bool = False
+    output_filename: str = "so_spindle_coupling_batch.csv"
+
+
+@dataclass
 class BatchResult:
     """Summary returned by the batch runners."""
 
@@ -85,6 +102,7 @@ class BatchResult:
     failed: int = 0
     outputs: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
     stopped: bool = False
 
 
@@ -388,6 +406,200 @@ def run_batch_psg(
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{file_name}: {exc}")
+
+    if rows:
+        out_path = os.path.join(config.output_dir, config.output_filename)
+        pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
+        result.outputs.append(out_path)
+
+    if progress_cb is not None:
+        progress_cb(100.0, "Termine" if not result.stopped else "Arrete")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SO-spindle coupling (classical detection + circular statistics)
+# ---------------------------------------------------------------------------
+
+COUPLING_EVENT_COLUMNS: Tuple[str, ...] = (
+    "file", "channel", "onset_s", "duration_s", "frequency_hz",
+    "peak_s", "coupled", "so_phase_rad", "so_phase_deg", "coupled_so_onset_s",
+)
+
+
+def export_coupling_events_to_csv(
+    events: Sequence[object],
+    output_path: str,
+    file_name: str = "",
+) -> int:
+    """Write the detected spindles and their SO phase to CSV.
+
+    Returns the number of data rows written.
+    """
+    from CESA.sleep_pipeline.contracts import EventType
+
+    rows = 0
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(list(COUPLING_EVENT_COLUMNS))
+        for event in events:
+            if getattr(event, "event_type", None) != EventType.SPINDLE:
+                continue
+            meta = getattr(event, "metadata", None) or {}
+            phase = meta.get("so_phase_rad")
+            writer.writerow([
+                file_name,
+                meta.get("channel", ""),
+                round(float(event.onset_s), 3),
+                round(float(event.duration_s), 3),
+                meta.get("Frequency", ""),
+                meta.get("peak_s", ""),
+                phase is not None,
+                "" if phase is None else phase,
+                "" if phase is None else meta.get("so_phase_deg", ""),
+                meta.get("coupled_so_onset_s", ""),
+            ])
+            rows += 1
+    return rows
+
+
+def _coupling_channels(raw, requested: Sequence[str]) -> List[str]:
+    """Resolve the EEG channels to analyse for one recording."""
+    from CESA.filters import detect_signal_type
+
+    available = list(raw.ch_names)
+    if requested:
+        picked = [c for c in requested if c in available]
+        if not picked:
+            raise ValueError(
+                "aucun canal demande n'est present (" + ", ".join(requested) + ")"
+            )
+        return picked
+    picked = [c for c in available if detect_signal_type(c) == "eeg"]
+    if not picked:
+        raise ValueError("aucun canal EEG detecte")
+    return picked
+
+
+def _coupling_rows_for_file(
+    recording_path: str,
+    config: BatchCouplingConfig,
+    *,
+    group: str = "",
+) -> Tuple[List[Dict[str, object]], List[str]]:
+    """Compute per-channel coupling rows for one recording.
+
+    Returns ``(rows, warnings)``; the events CSV is written as a side effect
+    when :pyattr:`BatchCouplingConfig.export_events` is set.
+    """
+    from CESA.sleep_pipeline.micro_events import scoring_df_to_hypno
+    from CESA.sleep_pipeline.so_spindle_coupling import (
+        MIN_COUPLED_EVENTS,
+        detect_so_spindle_coupling,
+    )
+
+    file_name = os.path.basename(recording_path)
+    base_name = os.path.splitext(file_name)[0]
+    raw = open_raw_file(recording_path, preload=True, verbose="ERROR")
+    sfreq = float(raw.info["sfreq"])
+    duration_s = float(raw.n_times) / sfreq
+
+    channels = _coupling_channels(raw, config.channels)
+
+    scoring_df = None
+    if config.include_scoring:
+        scoring_df = resolve_scoring_for_file(
+            recording_path,
+            epoch_seconds=config.epoch_seconds,
+            recording_duration_s=duration_s,
+        )
+
+    signals = []
+    for channel in channels:
+        extracted = _channel_signal(raw, channel)
+        if extracted is None:
+            raise ValueError(f"canal '{channel}' illisible")
+        signals.append(extracted[0])
+    data = np.vstack(signals)
+
+    hypno = None
+    if scoring_df is not None and not scoring_df.empty:
+        hypno = scoring_df_to_hypno(
+            scoring_df, data.shape[1], sfreq, config.epoch_seconds,
+        )
+
+    min_coupled = (
+        MIN_COUPLED_EVENTS if config.min_coupled is None else int(config.min_coupled)
+    )
+    coupling = detect_so_spindle_coupling(
+        data, sfreq, channels, hypno=hypno, min_coupled=min_coupled,
+    )
+
+    if config.export_events and coupling.events:
+        events_path = os.path.join(
+            config.output_dir, f"{base_name}_coupling_events.csv"
+        )
+        export_coupling_events_to_csv(coupling.events, events_path, file_name)
+
+    rows: List[Dict[str, object]] = []
+    for record in coupling.stats.to_dict(orient="records"):
+        row: Dict[str, object] = {
+            "subject": base_name,
+            "file": file_name,
+            "group": group,
+            "scoring_used": hypno is not None,
+            "duration_min": round(duration_s / 60.0, 2),
+        }
+        row.update(record)
+        rows.append(row)
+
+    warnings = [f"{file_name}: {w}" for w in coupling.warnings]
+    if scoring_df is None and config.include_scoring:
+        warnings.append(
+            f"{file_name}: aucun scoring resolu, analyse sans restriction de stade"
+        )
+    return rows, warnings
+
+
+def run_batch_so_spindle_coupling(
+    files: Sequence[str],
+    config: BatchCouplingConfig,
+    *,
+    groups: Optional[Dict[str, str]] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+    should_stop: Optional[StopCallback] = None,
+) -> BatchResult:
+    """Compute the SO-spindle preferred phase for each recording x channel.
+
+    Aggregates every channel of every file into one CSV, so the cohort can be
+    compared afterwards.  *groups* optionally maps a file path to a design
+    label (e.g. ``AVANT`` / ``APRES``) written to the ``group`` column.
+    """
+    result = BatchResult()
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    files = list(files)
+    total = max(1, len(files))
+    rows: List[Dict[str, object]] = []
+
+    for idx, file_path in enumerate(files):
+        if should_stop is not None and should_stop():
+            result.stopped = True
+            break
+        file_name = os.path.basename(file_path)
+        if progress_cb is not None:
+            progress_cb(idx / total * 100.0, f"Couplage SO-fuseau: {file_name}")
+        try:
+            file_rows, warnings = _coupling_rows_for_file(
+                file_path, config, group=(groups or {}).get(file_path, ""),
+            )
+        except Exception as exc:
+            result.failed += 1
+            result.errors.append(f"{file_name}: {exc}")
+            continue
+        rows.extend(file_rows)
+        result.warnings.extend(warnings)
+        result.processed += 1
 
     if rows:
         out_path = os.path.join(config.output_dir, config.output_filename)

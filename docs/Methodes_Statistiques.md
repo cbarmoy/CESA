@@ -200,7 +200,26 @@ Une sieste courte produit peu de N2/N3, donc peu de couples SO–fuseau. En dess
 
 Colonnes exportées (`*_coupling.csv`) : `channel`, `n_so`, `n_spindle`, `n_coupled`, `preferred_phase_rad`, `preferred_phase_deg`, `resultant_length`, `rayleigh_z`, `rayleigh_p`, `backend`.
 
-### 8.4 Références
+### 8.4 Traitement en lot multi-sujets
+
+Pour une cohorte, le calcul est disponible dans `Analyse → Batch / Multi-sujets → Automatisation en lot` (Ctrl+B), **mode de sortie « Couplage SO-fuseau (CSV multi-sujets) »**. Le moteur est `run_batch_so_spindle_coupling` dans `CESA/batch_engine.py`.
+
+Chaque enregistrement est traité comme dans l'interface mono-fichier : ouverture de l'EDF, résolution automatique du scoring en sidecar (`.csv`, `.xlsx`, `.xls`, `.json` de même nom, puis `*Hypnogram*.edf` du dossier), construction de l'hypnogramme, détection, statistiques circulaires. Laisser le champ *Canaux* vide analyse tous les canaux reconnus comme EEG.
+
+Sorties dans le dossier choisi :
+
+| Fichier | Contenu |
+|---------|---------|
+| `so_spindle_coupling_batch.csv` | Une ligne par enregistrement × canal : `subject`, `file`, `group`, `scoring_used`, `duration_min`, puis les colonnes de la section 8.3 |
+| `{sujet}_coupling_events.csv` *(optionnel)* | Un fuseau par ligne avec sa phase : `channel`, `onset_s`, `duration_s`, `frequency_hz`, `coupled`, `so_phase_rad`, `so_phase_deg` |
+
+La colonne `group` reprend le marquage AVANT/APRÈS de l'onglet *Fichiers*, déduit du nom de fichier (`_AV`/`_AP`, `pre`/`post`, `nap1`/`nap2`…) et modifiable à la main. Elle prépare la comparaison de conditions.
+
+Le fichier d'événements est utile pour refaire des statistiques circulaires au niveau du groupe : la phase préférée d'un sujet ne se moyenne pas comme un nombre, et comparer deux conditions demande un test circulaire (Watson-Williams par exemple), pas un test de Wilcoxon. Les tests appariés de `CESA/group_analysis.py` sont linéaires et ne conviennent donc pas tels quels à des angles.
+
+Un enregistrement dont le scoring est introuvable n'est pas un échec : il est analysé sans restriction de stade et signalé par un avertissement (préfixé `!` dans le journal), distinct des erreurs de lecture.
+
+### 8.5 Références
 
 - Staresina, B. P. (2024). **Coupled sleep rhythms for memory consolidation**. *Trends in Cognitive Sciences*.
 - Sejnowski, T. J., & Destexhe, A. (2000). **Why do we sleep?** *Brain Research*, 886(1-2).
