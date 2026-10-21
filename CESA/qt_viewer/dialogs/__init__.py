@@ -23,6 +23,7 @@ from .ocular_cleaning_dialog import OcularCleaningDialog
 from .connectivity_dialog import ConnectivityDialog
 from .microstates_dialog import MicrostatesDialog
 from .micro_events_dialog import MicroEventsDialog
+from .coupling_plot_dialog import CouplingPlotDialog
 from .specparam_dialog import SpecParamDialog
 from .night_qc_dialog import NightQcDialog
 from .ica_cleaning_dialog import IcaCleaningDialog
@@ -54,6 +55,7 @@ __all__ = [
     "ConnectivityDialog",
     "MicrostatesDialog",
     "MicroEventsDialog",
+    "CouplingPlotDialog",
     "SpecParamDialog",
     "NightQcDialog",
     "IcaCleaningDialog",

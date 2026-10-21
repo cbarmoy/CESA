@@ -16,6 +16,7 @@ import os
 import importlib.util
 import logging
 import io
+import faulthandler
 import traceback
 
 # PyInstaller sets sys._MEIPASS when running from a bundled .exe
@@ -80,19 +81,75 @@ def _frozen_log_path(name: str = "cesa_launch.log") -> str:
     return os.path.join(d, name)
 
 
+class _Tee(io.TextIOBase):
+    """Write each chunk to every underlying stream and flush it."""
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        text = data if isinstance(data, str) else str(data)
+        for stream in self._streams:
+            try:
+                stream.write(text)
+                stream.flush()
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self):
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        first = self._streams[0] if self._streams else None
+        return bool(first and getattr(first, "isatty", lambda: False)())
+
+
+# Kept alive for the process lifetime: faulthandler writes through this handle
+# even when Python itself is aborted (access violation, out-of-memory kill).
+_FAULT_LOG = None
+_TEXT_LOG = None
+
+
 def _setup_early_logging() -> None:
-    """File logging so windowed (console=False) builds still leave a trace."""
+    """Mirror the console into ``logs/cesa_launch.log`` for every launch."""
+    global _FAULT_LOG, _TEXT_LOG
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    if FROZEN:
-        fh = logging.FileHandler(_frozen_log_path(), encoding="utf-8", delay=False)
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
-    if not FROZEN or sys.stdout:
-        sh = logging.StreamHandler(sys.stdout if sys.stdout else sys.__stdout__)
-        sh.setFormatter(fmt)
-        root.addHandler(sh)
+    log_path = _frozen_log_path("cesa_launch.log")
+
+    console_out = sys.stdout if sys.stdout else sys.__stdout__
+    console_err = sys.stderr if sys.stderr else sys.__stderr__
+    try:
+        _TEXT_LOG = open(log_path, "a", encoding="utf-8", buffering=1)
+        _FAULT_LOG = open(log_path, "ab", buffering=0)
+        faulthandler.enable(_FAULT_LOG, all_threads=True)
+        sys.stdout = _Tee(console_out, _TEXT_LOG)
+        sys.stderr = _Tee(console_err, _TEXT_LOG)
+    except Exception as exc:
+        _TEXT_LOG = None
+        try:
+            if console_err:
+                console_err.write(f"Journal fichier indisponible ({log_path}): {exc}\n")
+        except Exception:
+            pass
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8", delay=False)
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+    if console_out:
+        stream_handler = logging.StreamHandler(console_out)
+        stream_handler.setFormatter(fmt)
+        root.addHandler(stream_handler)
+    logging.info(
+        "CESA journal: %s | python %s | %s",
+        log_path, sys.version.split()[0], sys.executable,
+    )
 
 
 def _win_message_box(title: str, text: str) -> None:
@@ -396,12 +453,12 @@ def main():
             print(tb)
         except Exception:
             pass
+        try:
+            with open(_frozen_log_path("cesa_crash.log"), "w", encoding="utf-8") as fh:
+                fh.write(tb)
+        except Exception:
+            pass
         if FROZEN:
-            try:
-                with open(_frozen_log_path("cesa_crash.log"), "w", encoding="utf-8") as fh:
-                    fh.write(tb)
-            except Exception:
-                pass
             _win_message_box(
                 "CESA — erreur au demarrage",
                 f"{e}\n\nDetails: logs/cesa_crash.log ou logs/cesa_launch.log",

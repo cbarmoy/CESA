@@ -215,11 +215,51 @@ Sorties dans le dossier choisi :
 
 La colonne `group` reprend le marquage AVANT/APRÈS de l'onglet *Fichiers*, déduit du nom de fichier (`_AV`/`_AP`, `pre`/`post`, `nap1`/`nap2`…) et modifiable à la main. Elle prépare la comparaison de conditions.
 
-Le fichier d'événements est utile pour refaire des statistiques circulaires au niveau du groupe : la phase préférée d'un sujet ne se moyenne pas comme un nombre, et comparer deux conditions demande un test circulaire (Watson-Williams par exemple), pas un test de Wilcoxon. Les tests appariés de `CESA/group_analysis.py` sont linéaires et ne conviennent donc pas tels quels à des angles.
+Le fichier d'événements est utile pour refaire des statistiques circulaires au niveau du groupe : la phase préférée d'un sujet ne se moyenne pas comme un nombre, et comparer deux conditions demande un test circulaire, pas un test de Wilcoxon. Les tests appariés de `CESA/group_analysis.py` sont linéaires et ne conviennent donc pas tels quels à des angles. La comparaison AVANT/APRÈS fournie par CESA est le test de Rayleigh sur les différences angulaires appariées (section 8.6).
 
 Un enregistrement dont le scoring est introuvable n'est pas un échec : il est analysé sans restriction de stade et signalé par un avertissement (préfixé `!` dans le journal), distinct des erreurs de lecture.
 
-### 8.5 Références
+L'onglet *Paramètres* n'affiche que les champs lus par le mode choisi (les bandes FFT restent cachées en mode couplage). Pendant le calcul, chaque canal produit une ligne dans le journal et dans `logs/batch_analysis.log` (`ouverture`, `canal 2/8 C3 — filtre`, `C3 termine`). Le statut indique depuis combien de secondes l'étape courante tourne. Si CESA se ferme pendant une nuit longue, la dernière ligne de ce fichier dit sur quel fichier et quel canal le calcul s'est arrêté. Une nuit entière, canal par canal, peut prendre plusieurs minutes : ce n'est pas un blocage tant que le compteur de secondes avance.
+
+### 8.5 Montage bandeau (frontal, sans EOG)
+
+Un bandeau ne porte que des électrodes frontales et ne fournit pas d'EOG. Le module `CESA/sleep_pipeline/headband_coupling.py` adapte les deux hypothèses du chemin PSG : réduction du montage aux dérivations frontales, et traitement des artefacts oculaires sans canal de référence. La détection, la phase instantanée et les statistiques circulaires restent celles des sections 8.1 et 8.2.
+
+**Rejet des clignements.** Un clignement dure 50 à 500 ms et son spectre recouvre la bande des ondes lentes : la régression EOG de `CESA/ocular_cleaning.py` retirerait donc aussi les ondes lentes recherchées. CESA **masque** les échantillons concernés au lieu de les soustraire, et le signal n'est jamais modifié.
+
+| Étape | Méthode | Paramètres par défaut |
+|-------|---------|-----------------------|
+| Filtrage | Butterworth d'ordre 4, phase nulle | 1,5 – 10 Hz (au-dessus de la bande SO) |
+| Critère d'amplitude | Écart à la moyenne supérieur à `3,5 × écart-type` **et** au seuil absolu | 3,5 SD et 100 µV |
+| Durée retenue | Déflexion continue au-dessus du seuil | 0,05 – 0,5 s |
+| Masque | Événement élargi de part et d'autre | 0,2 s |
+
+Le masque ainsi obtenu est combiné par ET avec les masques de stade N2 et N2+N3. Comme `detect_slow_oscillations` écarte tout cycle qui n'est pas entièrement dans le masque, une onde lente chevauchant un clignement disparaît, de même que les fausses ondes lentes créées par le clignement lui-même.
+
+**Sélection des canaux.** Sont retenus `Fp1`, `Fp2`, `Fpz`, `AF3`, `AF4`, `AF7`, `AF8`, `F3`, `F4`, `F7`, `F8`, `Fz`, y compris en dérivation (`F3-M2`). Les voies d'impédance, l'EOG, l'ECG, l'EMG, la SpO2 et les capteurs respiratoires sont écartés. Quand un site existe à la fois en dérivation et en monopolaire, seule la dérivation est analysée. Sur une PSG clinique du type MBSR-HTD, cela donne `F3-M2` et `F4-M1` ; sur un bandeau, les électrodes frontales brutes, sans exiger d'EOG.
+
+**Accès.** Case **Montage bandeau (frontal, rejet des clignements)** de `Événements → Détecter micro-architecture…`, et mode **« Couplage SO-fuseau bandeau (CSV multi-sujets) »** du lot (Ctrl+B). Le lot écrit `so_spindle_coupling_headband.csv`, pour ne pas écraser la table PSG, avec deux colonnes supplémentaires : `n_blinks` (clignements détectés) et `blink_rejected_s` (durée masquée, en secondes). Le journal indique par canal `F3-M2 termine — … , 120 clignements masques (71.4 s)`.
+
+Un `blink_rejected_s` élevé réduit mécaniquement le nombre de couples disponibles : la règle des 8 fuseaux couplés de la section 8.3 s'applique de la même manière, et une nuit très artefactée peut ne pas publier de phase préférée.
+
+### 8.6 Figures circulaires
+
+Une phase préférée est un angle : elle ne se trace pas sur un axe linéaire et ne se moyenne pas arithmétiquement. Toutes les figures de `CESA/coupling_plots.py` sont donc polaires, avec la convention de la section 8.2 rappelée sous chaque graphique (0° = up-state, ±180° = creux).
+
+| Fonction | Figure | Lecture |
+|----------|--------|---------|
+| `plot_phase_rose(phases)` | Histogramme circulaire des phases relevées au pic des fuseaux d'un enregistrement | La flèche est le vecteur résultant moyen ; sa longueur vaut `R` |
+| `plot_group_phases(stats)` | Un point par enregistrement, un cadran polaire par canal | Angle = phase préférée du sujet, rayon = `R` ; la flèche est la moyenne circulaire de second ordre du groupe |
+| `plot_phase_shift(stats)` | Histogramme circulaire des différences `APRÈS − AVANT` par sujet | 0° signifie phase inchangée ; le test de Rayleigh sur ces différences est le test apparié valide |
+| `save_coupling_figures(stats, dossier)` | Écrit `coupling_phases.png` et `coupling_decalage.png` | Entrée : le CSV du lot ou le `DataFrame` correspondant |
+
+Les garde-fous d'effectifs sont repris dans les figures : sous 8 fuseaux couplés (`MIN_COUPLED_EVENTS`), la rose est tracée mais la flèche et la phase sont remplacées par un avertissement ; sous 5 sujets (`MIN_GROUP_SUBJECTS`), la moyenne de groupe n'est pas tracée.
+
+Le décalage apparié identifie les deux nuits d'un même sujet avec `participant_key`, qui retire le marqueur de condition du nom de fichier (`S030_Ap` et `S030_Av` deviennent `S030`). Un sujet dont une des deux conditions n'a pas de phase publiée est exclu de la paire.
+
+**Accès.** Bouton **Figure phase préférée…** de `Événements → Détecter micro-architecture…` pour l'enregistrement chargé (choix du canal, nombre de secteurs, export PNG/PDF/SVG à 200 dpi). Dans le lot, la case **Tracer les figures circulaires** écrit les deux PNG à côté du CSV. Une figure impossible à construire est signalée en avertissement et n'interrompt pas le traitement.
+
+### 8.7 Références
 
 - Staresina, B. P. (2024). **Coupled sleep rhythms for memory consolidation**. *Trends in Cognitive Sciences*.
 - Sejnowski, T. J., & Destexhe, A. (2000). **Why do we sleep?** *Brain Research*, 886(1-2).

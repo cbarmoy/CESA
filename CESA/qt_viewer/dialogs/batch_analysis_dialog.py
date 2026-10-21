@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Callable, List, Optional
 
 from PySide6 import QtCore, QtWidgets
@@ -32,6 +33,7 @@ MODE_FFT = 0
 MODE_SPAGHETTI = 1
 MODE_PSG = 2
 MODE_COUPLING = 3
+MODE_COUPLING_HEADBAND = 4
 
 # Roles for files in a before/after design.
 GROUP_NONE = "-"
@@ -174,9 +176,14 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
             "Spaghetti avant/apres",
             "Metriques PSG (CSV multi-sujets)",
             "Couplage SO-fuseau (CSV multi-sujets)",
+            "Couplage SO-fuseau bandeau (CSV multi-sujets)",
         ])
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         form.addRow("Mode de sortie:", self._mode_combo)
+
+        self._mode_hint = QtWidgets.QLabel()
+        self._mode_hint.setWordWrap(True)
+        form.addRow("", self._mode_hint)
 
         # Output directory
         out_row = QtWidgets.QHBoxLayout()
@@ -253,6 +260,18 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         )
         form.addRow("", self._events_chk)
 
+        self._figures_chk = QtWidgets.QCheckBox(
+            "Tracer les figures circulaires (phase par sujet, decalage AVANT/APRES)"
+        )
+        self._figures_chk.setChecked(True)
+        self._figures_chk.setToolTip(
+            "Figures polaires PNG a cote du CSV : une phase preferee par sujet "
+            "et par canal, puis le decalage apparie si les deux conditions "
+            "sont marquees dans l'onglet Fichiers."
+        )
+        form.addRow("", self._figures_chk)
+
+        self._params_form = form
         self._on_mode_changed()
         return w
 
@@ -277,7 +296,14 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         v.addWidget(self._progress)
 
         self._status_lbl = QtWidgets.QLabel("Pret.")
+        self._status_lbl.setWordWrap(True)
         v.addWidget(self._status_lbl)
+        self._clock = QtCore.QTimer(self)
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._tick_clock)
+        self._run_t0 = 0.0
+        self._step_t0 = 0.0
+        self._step_msg = ""
 
         self._log = QtWidgets.QPlainTextEdit()
         self._log.setReadOnly(True)
@@ -368,24 +394,55 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
     # Param helpers
     # ------------------------------------------------------------------
 
+    def _show_param(self, widget: QtWidgets.QWidget, visible: bool) -> None:
+        self._params_form.setRowVisible(widget, visible)
+
     def _on_mode_changed(self) -> None:
         mode = self._mode_combo.currentIndex()
-        is_psg = mode == MODE_PSG
+        is_fft = mode == MODE_FFT
         is_spaghetti = mode == MODE_SPAGHETTI
-        is_coupling = mode == MODE_COUPLING
-        is_spectral = mode in (MODE_FFT, MODE_SPAGHETTI)
-        # Channels not used in PSG mode; coupling falls back to every EEG
-        # channel when the field is left empty.
-        self._channels_widget.setEnabled(not is_psg)
-        self._method_combo.setEnabled(is_spectral)
-        self._nperseg_spin.setEnabled(is_spectral)
-        self._fmin_spin.setEnabled(is_spectral)
-        self._fmax_spin.setEnabled(is_spectral)
-        self._equalize_chk.setEnabled(is_spectral)
-        self._robust_chk.setEnabled(is_spectral)
-        self._scoring_chk.setEnabled(not is_spaghetti)
-        self._min_coupled_spin.setEnabled(is_coupling)
-        self._events_chk.setEnabled(is_coupling)
+        is_psg = mode == MODE_PSG
+        is_headband = mode == MODE_COUPLING_HEADBAND
+        is_coupling = mode == MODE_COUPLING or is_headband
+        # Only the fields the selected analysis actually reads stay on screen.
+        self._show_param(self._channels_widget, not is_psg)
+        self._show_param(self._method_combo, is_fft)
+        self._show_param(self._fmin_spin, is_fft)
+        self._show_param(self._fmax_spin, is_fft)
+        self._show_param(self._nperseg_spin, is_fft)
+        self._show_param(self._equalize_chk, is_fft)
+        self._show_param(self._robust_chk, is_fft)
+        self._show_param(self._epoch_spin, True)
+        self._show_param(self._scoring_chk, is_fft or is_coupling)
+        self._show_param(self._min_coupled_spin, is_coupling)
+        self._show_param(self._events_chk, is_coupling)
+        self._show_param(self._figures_chk, is_coupling)
+        hints = {
+            MODE_FFT: "FFT/PSD : methode, bandes de frequence, epoques et scoring.",
+            MODE_SPAGHETTI: (
+                "Spaghetti : canaux, duree d'epoque, et au moins un fichier "
+                "marque AVANT et un fichier marque APRES."
+            ),
+            MODE_PSG: (
+                "Metriques PSG : duree d'epoque. Le scoring sidecar est "
+                "obligatoire, les canaux ne sont pas utilises."
+            ),
+            MODE_COUPLING: (
+                "Couplage SO-fuseau : seuls les canaux EEG sont analyses "
+                "(EOG, ECG et frequence cardiaque sont ignores). Champ vide "
+                "= tous les EEG. Le scoring est cherche a cote du fichier, "
+                "puis dans les annotations de l'EDF. Chaque canal d'une nuit "
+                "complete peut prendre plusieurs minutes."
+            ),
+            MODE_COUPLING_HEADBAND: (
+                "Couplage SO-fuseau bandeau : seules les derivations frontales "
+                "sont analysees (champ vide = toutes les frontales) et les "
+                "clignements sont masques, sans canal EOG. Sortie dans "
+                "so_spindle_coupling_headband.csv, avec les colonnes "
+                "n_blinks et blink_rejected_s."
+            ),
+        }
+        self._mode_hint.setText(hints.get(mode, ""))
 
     def _browse_output(self) -> None:
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Dossier de sortie")
@@ -459,8 +516,10 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
                 job = self._make_fft_job(out_dir)
             elif mode == MODE_SPAGHETTI:
                 job = self._make_spaghetti_job(out_dir)
-            elif mode == MODE_COUPLING:
-                job = self._make_coupling_job(out_dir)
+            elif mode in (MODE_COUPLING, MODE_COUPLING_HEADBAND):
+                job = self._make_coupling_job(
+                    out_dir, headband=mode == MODE_COUPLING_HEADBAND,
+                )
             else:
                 job = self._make_psg_job(out_dir)
         except ValueError as exc:
@@ -470,6 +529,10 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         self._tabs.setCurrentIndex(2)
         self._log.clear()
         self._progress.setValue(0)
+        self._step_msg = ""
+        self._run_t0 = time.time()
+        self._step_t0 = self._run_t0
+        self._clock.start()
         self._run_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
 
@@ -486,8 +549,19 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
 
     def _on_progress(self, pct: float, msg: str) -> None:
         self._progress.setValue(int(pct))
-        self._status_lbl.setText(msg)
-        self._append_log(msg)
+        if msg != self._step_msg:
+            self._step_msg = msg
+            self._step_t0 = time.time()
+            self._append_log(msg)
+        self._tick_clock()
+
+    def _tick_clock(self) -> None:
+        if not self._step_msg or self._run_t0 <= 0:
+            return
+        self._status_lbl.setText(
+            f"{self._step_msg}  —  {time.time() - self._step_t0:.0f} s "
+            f"sur cette etape, {time.time() - self._run_t0:.0f} s au total"
+        )
 
     def _on_failed(self, msg: str) -> None:
         self._append_log(f"ERREUR: {msg}")
@@ -517,6 +591,7 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
         self._finish_ui()
 
     def _finish_ui(self) -> None:
+        self._clock.stop()
         self._progress.setValue(100)
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
@@ -569,7 +644,7 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
 
         return job
 
-    def _make_coupling_job(self, out_dir: str) -> Callable:
+    def _make_coupling_job(self, out_dir: str, *, headband: bool = False) -> Callable:
         from CESA.batch_engine import (
             BatchCouplingConfig, run_batch_so_spindle_coupling,
         )
@@ -584,6 +659,8 @@ class BatchAnalysisDialog(QtWidgets.QDialog):
             include_scoring=self._scoring_chk.isChecked(),
             min_coupled=self._min_coupled_spin.value(),
             export_events=self._events_chk.isChecked(),
+            export_figures=self._figures_chk.isChecked(),
+            headband=headband,
         )
         groups = {
             path: group

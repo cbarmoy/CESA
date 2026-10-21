@@ -58,6 +58,9 @@ STATS_COLUMNS: List[str] = [
     "rayleigh_z", "rayleigh_p", "backend",
 ]
 
+# Reported in addition on a headband montage, where blinks are masked out.
+HEADBAND_STATS_COLUMNS: List[str] = STATS_COLUMNS + ["n_blinks", "blink_rejected_s"]
+
 
 # ---------------------------------------------------------------------------
 # Detected structures
@@ -398,9 +401,31 @@ def analyze_channel(
     so_band: Tuple[float, float] = SO_BAND_HZ,
     spindle_band: Tuple[float, float] = SPINDLE_BAND_HZ,
     min_coupled: int = MIN_COUPLED_EVENTS,
+    reject_blinks: bool = False,
 ) -> Tuple[List[ScoredEvent], Dict[str, Any]]:
-    """Detect SO + spindles on one channel and compute their coupling stats."""
+    """Detect SO + spindles on one channel and compute their coupling stats.
+
+    With *reject_blinks* (headband montage), the samples carrying an ocular
+    deflection are removed from both masks before detection; the signal itself
+    is left untouched.
+    """
     sig = np.asarray(signal, dtype=float).ravel()
+
+    blink_stats: Dict[str, Any] = {}
+    if reject_blinks:
+        from .headband_coupling import blink_keep_mask, detect_blinks
+
+        blinks = detect_blinks(sig, sfreq)
+        keep = blink_keep_mask(sig.size, sfreq, blinks)
+        so_mask = keep if so_mask is None else (so_mask & keep)
+        spindle_mask = keep if spindle_mask is None else (spindle_mask & keep)
+        blink_stats = {
+            "n_blinks": len(blinks),
+            "blink_rejected_s": round(
+                float(np.count_nonzero(~keep)) / float(sfreq), 2
+            ) if sfreq > 0 else 0.0,
+        }
+
     so_filtered = bandpass(sig, sfreq, *so_band)
     phase = so_phase(sig, sfreq, filtered=so_filtered)
 
@@ -471,6 +496,7 @@ def analyze_channel(
         "n_spindle": len(spindles),
         "n_coupled": n_coupled,
         **stats,
+        **blink_stats,
     }
     return events, row
 
@@ -486,6 +512,7 @@ def detect_so_spindle_coupling(
     so_stages: Sequence[int] = SO_STAGES,
     spindle_stages: Sequence[int] = SPINDLE_STAGES,
     min_coupled: int = MIN_COUPLED_EVENTS,
+    reject_blinks: bool = False,
     progress_callback: Optional[Any] = None,
 ) -> CouplingResult:
     """Run the classical SO-spindle coupling pipeline over all channels.
@@ -493,6 +520,7 @@ def detect_so_spindle_coupling(
     *data* is ``(n_channels, n_samples)`` in uV; *hypno* is the sample-level
     YASA-style hypnogram built by
     :func:`CESA.sleep_pipeline.micro_events.scoring_df_to_hypno`.
+    *reject_blinks* masks ocular deflections, for a frontal headband montage.
     """
     arr = np.asarray(data, dtype=float)
     if arr.ndim == 1:
@@ -542,6 +570,7 @@ def detect_so_spindle_coupling(
                 so_band=so_band,
                 spindle_band=spindle_band,
                 min_coupled=min_coupled,
+                reject_blinks=reject_blinks,
             )
         except Exception as exc:
             logger.error("Coupling failed on %s: %s", name, exc, exc_info=True)
@@ -556,9 +585,9 @@ def detect_so_spindle_coupling(
                 f"(minimum {int(min_coupled)}); phase preferee non publiee."
             )
 
+    columns = HEADBAND_STATS_COLUMNS if reject_blinks else STATS_COLUMNS
     result.stats = (
-        pd.DataFrame(rows)[STATS_COLUMNS] if rows
-        else pd.DataFrame(columns=STATS_COLUMNS)
+        pd.DataFrame(rows)[columns] if rows else pd.DataFrame(columns=columns)
     )
     if "pycircstat2" in backends:
         result.backend = "pycircstat2"

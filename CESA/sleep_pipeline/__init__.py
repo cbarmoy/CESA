@@ -10,6 +10,7 @@ rules_aasm     Explicit rule-based stage classification (AASM criteria)
 events         Arousal / apnea / hypopnea detection
 micro_events   Spindles / slow-waves / REM (YASA) + PAC / densites
 so_spindle_coupling  Filtres classiques + Hilbert + phase preferee SO-fuseau
+headband_coupling    Montage bandeau : canaux frontaux + rejet des clignements
 evaluation     Accuracy, Cohen's kappa, confusion matrix, per-stage metrics
 transition     Bridge between legacy CESA scoring and this pipeline
 """

@@ -1639,6 +1639,7 @@ class AppController:
         channels: Optional[Sequence[str]] = None,
         *,
         use_hypnogram: bool = True,
+        headband: bool = False,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """Classical SO-spindle coupling (filters + Hilbert + circular stats).
@@ -1646,6 +1647,9 @@ class AppController:
         Independent of YASA.  Returns a dict with keys ``events`` (UI dicts),
         ``coupling`` (per-channel preferred phase records), ``warnings``,
         ``used_hypnogram``, ``backend`` and ``eeg_channels``.
+
+        With *headband*, only frontal derivations are analysed and ocular
+        deflections are masked out, since a headband carries no EOG reference.
         """
         empty: Dict[str, Any] = {
             "events": [],
@@ -1678,6 +1682,20 @@ class AppController:
             empty["warnings"].append("Aucun canal EEG disponible pour le couplage.")
             return empty
 
+        if headband:
+            from CESA.sleep_pipeline.headband_coupling import select_headband_channels
+
+            try:
+                eeg_chs, skipped = select_headband_channels(eeg_chs)
+            except ValueError as exc:
+                empty["warnings"].append(f"Montage bandeau: {exc}.")
+                return empty
+            if skipped:
+                warnings.append(
+                    "Montage bandeau: canaux non frontaux ignores — "
+                    + ", ".join(skipped)
+                )
+
         scoring_df = self.get_active_scoring_df() if use_hypnogram else None
         n_samples = int(self.derivations[eeg_chs[0]].shape[0])
 
@@ -1696,6 +1714,7 @@ class AppController:
             result = run_coupling(
                 data, sfreq, eeg_chs,
                 hypno=hypno,
+                reject_blinks=headband,
                 progress_callback=progress_callback,
             )
         except Exception as exc:

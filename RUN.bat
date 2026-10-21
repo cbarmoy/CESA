@@ -29,21 +29,25 @@ set PYTHON_PATHS=%PYTHON_PATHS% "C:\Program Files\Python310\python.exe"
 set PYTHON_PATHS=%PYTHON_PATHS% "C:\Program Files\Python39\python.exe"
 set PYTHON_PATHS=%PYTHON_PATHS% "C:\Program Files\Python38\python.exe"
 
+if not exist "logs" mkdir "logs"
+echo [LOG] Journal : %~dp0logs\cesa_launch.log
+echo.
+
 for %%p in (%PYTHON_PATHS%) do (
     if exist %%p (
         echo [OK] Python trouve: %%p
         %%p --version
         echo [LANCEMENT] Lancement de CESA...
-        %%p run.py
-        goto :end
+        %%p -u run.py
+        goto :after_run
     )
 )
 
 python --version >nul 2>&1
 if %errorlevel% == 0 (
     echo [OK] Python trouve dans le PATH
-    python run.py
-    goto :end
+    python -u run.py
+    goto :after_run
 )
 
 echo [ERREUR] Python non trouve!
@@ -54,5 +58,17 @@ echo    2. Cochez "Add Python to PATH" pendant l'installation
 echo    3. Ou ajoutez Python manuellement au PATH systeme
 echo.
 pause
+goto :end
+
+:after_run
+set RC=%ERRORLEVEL%
+echo.
+echo [LOG] Journal : %~dp0logs\cesa_launch.log
+if not "%RC%"=="0" (
+    echo [ERREUR] CESA s'est arrete avec le code %RC%.
+    echo           Voir logs\cesa_launch.log et logs\cesa_crash.log
+    pause
+)
+exit /b %RC%
 
 :end

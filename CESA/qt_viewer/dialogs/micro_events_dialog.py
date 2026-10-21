@@ -33,6 +33,9 @@ _CLASSIC_HEADERS = [
     "Phase pref. (deg)", "Phase pref. (rad)", "R",
     "Rayleigh z", "Rayleigh p", "Backend",
 ]
+# Only filled on a headband montage, where blinks are masked out.
+_HEADBAND_KEYS = ["n_blinks", "blink_rejected_s"]
+_HEADBAND_HEADERS = ["N clignements", "Rejete (s)"]
 
 
 class MicroEventsDialog(QtWidgets.QDialog):
@@ -118,6 +121,17 @@ class MicroEventsDialog(QtWidgets.QDialog):
         )
         form.addRow("", self._chk_classic)
 
+        self._chk_headband = QtWidgets.QCheckBox(
+            "Montage bandeau (frontal, rejet des clignements)"
+        )
+        self._chk_headband.setChecked(False)
+        self._chk_headband.setToolTip(
+            "Restreint le couplage classique aux derivations frontales et "
+            "masque les clignements (1.5-10 Hz, > 100 uV, 50-500 ms) sans "
+            "toucher au signal. Aucun canal EOG n'est requis."
+        )
+        form.addRow("", self._chk_headband)
+
         self._eeg_list = QtWidgets.QListWidget()
         self._eeg_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
@@ -171,6 +185,13 @@ class MicroEventsDialog(QtWidgets.QDialog):
         self._btn_export.setEnabled(False)
         self._btn_export.clicked.connect(self._export_csv)
         btn_row.addWidget(self._btn_export)
+        self._btn_figure = QtWidgets.QPushButton("Figure phase preferee...")
+        self._btn_figure.setEnabled(False)
+        self._btn_figure.setToolTip(
+            "Histogramme circulaire des phases SO relevees au pic des fuseaux."
+        )
+        self._btn_figure.clicked.connect(self._show_coupling_figure)
+        btn_row.addWidget(self._btn_figure)
         self._btn_apply = QtWidgets.QPushButton("Appliquer au viewer")
         self._btn_apply.setEnabled(False)
         self._btn_apply.clicked.connect(self._apply_to_viewer)
@@ -209,8 +230,12 @@ class MicroEventsDialog(QtWidgets.QDialog):
         self._pac_table.setAlternatingRowColors(True)
         self._tabs.addTab(self._pac_table, "PAC / co-occurrence")
 
-        self._classic_table = QtWidgets.QTableWidget(0, len(_CLASSIC_HEADERS))
-        self._classic_table.setHorizontalHeaderLabels(_CLASSIC_HEADERS)
+        self._classic_table = QtWidgets.QTableWidget(
+            0, len(_CLASSIC_HEADERS) + len(_HEADBAND_HEADERS)
+        )
+        self._classic_table.setHorizontalHeaderLabels(
+            _CLASSIC_HEADERS + _HEADBAND_HEADERS
+        )
         self._classic_table.horizontalHeader().setStretchLastSection(True)
         self._classic_table.setAlternatingRowColors(True)
         self._tabs.addTab(self._classic_table, "Phase preferee (classique)")
@@ -277,6 +302,7 @@ class MicroEventsDialog(QtWidgets.QDialog):
                 classic = self._ctrl.detect_so_spindle_coupling(
                     channels=eeg or None,
                     use_hypnogram=use_hypno,
+                    headband=self._chk_headband.isChecked(),
                     progress_callback=_report,
                 ) or {}
         except Exception as exc:
@@ -309,6 +335,9 @@ class MicroEventsDialog(QtWidgets.QDialog):
         has_data = bool(events) or bool(self._last_result["coupling"])
         self._btn_export.setEnabled(has_data)
         self._btn_apply.setEnabled(bool(events))
+        self._btn_figure.setEnabled(any(
+            (e.get("metadata") or {}).get("so_phase_rad") is not None for e in events
+        ))
 
         msg = f"{len(events)} evenement(s) detecte(s)."
         if self._last_result["used_hypnogram"]:
@@ -383,14 +412,32 @@ class MicroEventsDialog(QtWidgets.QDialog):
     def _fill_classic_table(self, rows: List[Dict[str, Any]]) -> None:
         self._classic_table.setRowCount(0)
         self._classic_table.setRowCount(len(rows))
+        has_blinks = any("n_blinks" in row for row in rows)
+        for col in range(len(_CLASSIC_KEYS), self._classic_table.columnCount()):
+            self._classic_table.setColumnHidden(col, not has_blinks)
         for i, row in enumerate(rows):
-            for col, key in enumerate(_CLASSIC_KEYS):
+            for col, key in enumerate(_CLASSIC_KEYS + _HEADBAND_KEYS):
                 val = row.get(key, "")
                 if isinstance(val, float):
                     text = "" if val != val else f"{val:.4g}"  # NaN -> blank
                 else:
                     text = "" if val is None else str(val)
                 self._classic_table.setItem(i, col, QtWidgets.QTableWidgetItem(text))
+
+    def _show_coupling_figure(self) -> None:
+        from .coupling_plot_dialog import CouplingPlotDialog
+
+        try:
+            dialog = CouplingPlotDialog(
+                self,
+                events=self._last_result.get("events") or [],
+                coupling=self._last_result.get("coupling") or [],
+            )
+        except Exception as exc:
+            logger.error("Coupling figure dialog failed: %s", exc, exc_info=True)
+            QtWidgets.QMessageBox.critical(self, "Erreur", f"Figure impossible:\n{exc}")
+            return
+        dialog.exec()
 
     def _export_csv(self) -> None:
         if not self._last_result.get("events") and not self._last_result.get("coupling"):

@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -37,6 +38,27 @@ from CESA.spectral_analysis import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Flushed on every line so a hard crash still leaves the last checkpoint.
+_BATCH_LOG = Path("logs") / "batch_analysis.log"
+
+
+def _checkpoint(
+    progress_cb: Optional[ProgressCallback],
+    percent: float,
+    message: str,
+) -> None:
+    """Surface one batch step in the UI, the logger and ``logs/batch_analysis.log``."""
+    logger.info("[BATCH] %s", message)
+    try:
+        _BATCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _BATCH_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+            handle.flush()
+    except Exception:
+        logger.debug("Could not write %s", _BATCH_LOG, exc_info=True)
+    if progress_cb is not None:
+        progress_cb(min(100.0, max(0.0, percent)), message)
 
 # Progress callback: (percent in [0, 100], human-readable message) -> None
 ProgressCallback = Callable[[float, str], None]
@@ -82,7 +104,8 @@ class BatchPSGConfig:
 class BatchCouplingConfig:
     """Parameters for the SO-spindle coupling batch pipeline.
 
-    An empty *channels* list means "every channel detected as EEG".
+    An empty *channels* list means "every channel detected as EEG", or every
+    frontal derivation when *headband* is set.
     """
 
     output_dir: str
@@ -91,6 +114,8 @@ class BatchCouplingConfig:
     include_scoring: bool = True
     min_coupled: Optional[int] = None
     export_events: bool = False
+    export_figures: bool = False
+    headband: bool = False
     output_filename: str = "so_spindle_coupling_batch.csv"
 
 
@@ -113,47 +138,107 @@ class BatchResult:
 _SCORING_SIDE_EXTENSIONS = (".csv", ".xlsx", ".xls", ".json")
 
 
+def _scoring_stem(path: str) -> str:
+    """Lower-case recording stem used to match ``S030_AP_sleep scoring.xls``."""
+    return os.path.splitext(os.path.basename(path))[0].lower().replace(" ", "")
+
+
+def find_scoring_sidecars(recording_path: str) -> List[str]:
+    """Scoring files next to *recording_path*, best match first.
+
+    Accepts the exact stem (``S030_Ap.xls``) and the clinical export pattern
+    ``S030_AP_sleep scoring.xls``: same stem, any case, then a suffix.
+    """
+    directory = os.path.dirname(os.path.abspath(recording_path))
+    stem = _scoring_stem(recording_path)
+    if not stem or not os.path.isdir(directory):
+        return []
+    ranked: List[Tuple[int, str]] = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in _SCORING_SIDE_EXTENSIONS:
+            continue
+        if name.lower().endswith("_coupling_events.csv"):
+            continue
+        body = _scoring_stem(name)
+        if body == stem:
+            rank = 0
+        elif body.startswith(stem + "_") or body.startswith(stem + "-"):
+            rank = 1
+        else:
+            continue
+        if any(token in body for token in ("sleep", "scoring", "score", "hypno", "sommeil")):
+            rank -= 1
+        ranked.append((rank, os.path.join(directory, name)))
+    ranked.sort(key=lambda item: (item[0], item[1].lower()))
+    return [path for _rank, path in ranked]
+
+
+def _load_scoring_table(
+    candidate: str,
+    *,
+    epoch_seconds: float,
+    recording_duration_s: float,
+    absolute_start_datetime: Optional[object] = None,
+) -> pd.DataFrame:
+    from CESA import scoring_io
+
+    ext = os.path.splitext(candidate)[1].lower()
+    if ext == ".json":
+        return scoring_io.import_scoring_json(
+            candidate,
+            epoch_seconds=epoch_seconds,
+            recording_duration_s=recording_duration_s,
+        )
+    if ext in (".xlsx", ".xls"):
+        df = pd.read_excel(candidate)
+    else:
+        df = pd.read_csv(candidate)
+    return scoring_io.import_scoring_table(
+        df,
+        absolute_start_datetime=absolute_start_datetime,
+        epoch_seconds=epoch_seconds,
+        recording_duration_s=recording_duration_s,
+    )
+
+
 def resolve_scoring_for_file(
     recording_path: str,
     *,
     epoch_seconds: float = 30.0,
     recording_duration_s: float = 0.0,
+    absolute_start_datetime: Optional[object] = None,
 ) -> Optional[pd.DataFrame]:
     """Locate and load a sidecar scoring file for *recording_path*.
 
-    Searches, in order, for a file sharing the recording base name with a
-    ``.csv``/``.xlsx``/``.xls``/``.json`` extension, then for an EDF+
-    hypnogram (``*Hypnogram*.edf``) in the same directory.
+    Searches the recording directory for a table whose name starts with the
+    EDF stem (``S030_Ap.edf`` matches ``S030_AP_sleep scoring.xls``), then for
+    an EDF+ hypnogram (``*Hypnogram*.edf``), then for ``Sleep stage``
+    annotations inside the recording itself.
 
     Returns a normalized ``['time', 'stage']`` DataFrame (seconds), or ``None``
     when no scoring could be resolved.
     """
     from CESA import scoring_io
 
-    base = os.path.splitext(recording_path)[0]
-
-    for ext in _SCORING_SIDE_EXTENSIONS:
-        candidate = base + ext
-        if not os.path.exists(candidate):
-            continue
+    for candidate in find_scoring_sidecars(recording_path):
         try:
-            if ext == ".json":
-                return scoring_io.import_scoring_json(
-                    candidate,
-                    epoch_seconds=epoch_seconds,
-                    recording_duration_s=recording_duration_s,
-                )
-            if ext in (".xlsx", ".xls"):
-                df = pd.read_excel(candidate)
-            else:
-                df = pd.read_csv(candidate)
-            return scoring_io.import_scoring_table(
-                df,
+            table = _load_scoring_table(
+                candidate,
                 epoch_seconds=epoch_seconds,
                 recording_duration_s=recording_duration_s,
+                absolute_start_datetime=absolute_start_datetime,
             )
         except Exception as exc:  # pragma: no cover - defensive I/O
             logger.warning("Scoring sidecar %s unreadable: %s", candidate, exc)
+            continue
+        if table is not None and not table.empty:
+            logger.info("[SCORING] %s -> %s", os.path.basename(recording_path), candidate)
+            return table
 
     # EDF+ hypnogram in the same folder
     try:
@@ -172,7 +257,21 @@ def resolve_scoring_for_file(
     except Exception:  # pragma: no cover
         pass
 
-    return None
+    # Stages are often stored in the recording itself (EDF+ "Sleep stage" annotations).
+    try:
+        embedded = scoring_io.import_edf_hypnogram(
+            recording_path,
+            recording_duration_s=recording_duration_s,
+            epoch_seconds=epoch_seconds,
+        )
+    except Exception as exc:  # pragma: no cover - not every EDF carries annotations
+        logger.info("Pas d'hypnogramme dans %s: %s", os.path.basename(recording_path), exc)
+        return None
+    if embedded is None or embedded.empty:
+        return None
+    if not embedded["stage"].astype(str).isin(["W", "N1", "N2", "N3", "R"]).any():
+        return None
+    return embedded
 
 
 # ---------------------------------------------------------------------------
@@ -463,22 +562,44 @@ def export_coupling_events_to_csv(
     return rows
 
 
-def _coupling_channels(raw, requested: Sequence[str]) -> List[str]:
-    """Resolve the EEG channels to analyse for one recording."""
+def _coupling_channels(
+    raw, requested: Sequence[str], *, headband: bool = False,
+) -> Tuple[List[str], List[str]]:
+    """Resolve EEG channels and the non-EEG names that were left out.
+
+    EOG, ECG and heart-rate traces are never analysed, even when they appear
+    in *requested*: a slow-oscillation detector on those signals is not a
+    cortical coupling. With *headband*, the montage is further reduced to its
+    frontal derivations.
+    """
     from CESA.filters import detect_signal_type
 
     available = list(raw.ch_names)
-    if requested:
-        picked = [c for c in requested if c in available]
-        if not picked:
-            raise ValueError(
-                "aucun canal demande n'est present (" + ", ".join(requested) + ")"
-            )
-        return picked
-    picked = [c for c in available if detect_signal_type(c) == "eeg"]
+    if headband:
+        from CESA.sleep_pipeline.headband_coupling import select_headband_channels
+
+        return select_headband_channels(available, requested)
+
+    names = [c for c in requested if c in available] if requested else available
+    if requested and not names:
+        raise ValueError(
+            "aucun canal demande n'est present (" + ", ".join(requested) + ")"
+        )
+    picked = [c for c in names if detect_signal_type(c) in ("eeg", "sas_eeg")]
+    skipped = [c for c in names if c not in picked]
     if not picked:
-        raise ValueError("aucun canal EEG detecte")
-    return picked
+        raise ValueError(
+            "aucun canal EEG parmi " + ", ".join(names or requested)
+        )
+    return picked, skipped
+
+
+def _summarize_names(names: Sequence[str], limit: int = 8) -> str:
+    """Comma-separated *names*, truncated: a PSG montage has 70+ channels."""
+    listed = list(names)
+    if len(listed) <= limit:
+        return ", ".join(listed)
+    return ", ".join(listed[:limit]) + f", ... (+{len(listed) - limit})"
 
 
 def _coupling_rows_for_file(
@@ -486,63 +607,125 @@ def _coupling_rows_for_file(
     config: BatchCouplingConfig,
     *,
     group: str = "",
-) -> Tuple[List[Dict[str, object]], List[str]]:
+    on_step: Optional[Callable[[float, str], None]] = None,
+    should_stop: Optional[StopCallback] = None,
+) -> Tuple[List[Dict[str, object]], List[str], bool]:
     """Compute per-channel coupling rows for one recording.
 
-    Returns ``(rows, warnings)``; the events CSV is written as a side effect
-    when :pyattr:`BatchCouplingConfig.export_events` is set.
+    Returns ``(rows, warnings, stopped)``. Channels are filtered one at a time
+    so a long recording does not keep every filtered copy in memory, and
+    *on_step* is called before each slow step (``fraction`` in ``[0, 1]``
+    within this file).
     """
+    from CESA.sleep_pipeline.contracts import EventType
     from CESA.sleep_pipeline.micro_events import scoring_df_to_hypno
     from CESA.sleep_pipeline.so_spindle_coupling import (
+        HEADBAND_STATS_COLUMNS,
         MIN_COUPLED_EVENTS,
-        detect_so_spindle_coupling,
+        STATS_COLUMNS,
+        analyze_channel,
     )
+
+    def step(fraction: float, message: str) -> None:
+        if on_step is not None:
+            on_step(fraction, message)
 
     file_name = os.path.basename(recording_path)
     base_name = os.path.splitext(file_name)[0]
+    warnings: List[str] = []
+    step(0.02, f"{file_name} : ouverture de l'EDF (le chargement peut prendre une minute)")
     raw = open_raw_file(recording_path, preload=True, verbose="ERROR")
     sfreq = float(raw.info["sfreq"])
-    duration_s = float(raw.n_times) / sfreq
+    n_samples = int(raw.n_times)
+    duration_s = n_samples / sfreq
+    step(
+        0.08,
+        f"{file_name} : charge, {duration_s / 60.0:.1f} min a {sfreq:.0f} Hz "
+        f"({n_samples} echantillons)",
+    )
 
-    channels = _coupling_channels(raw, config.channels)
+    channels, skipped = _coupling_channels(
+        raw, config.channels, headband=config.headband,
+    )
+    kind = "frontal(aux)" if config.headband else "EEG"
+    step(0.10, f"{file_name} : {len(channels)} canal(aux) {kind} — {', '.join(channels)}")
+    if skipped:
+        reason = (
+            "pas frontaux (montage bandeau)" if config.headband
+            else "pas de l'EEG cortical"
+        )
+        skipped_msg = (
+            f"{file_name}: {len(skipped)} canaux ignores ({reason}) — "
+            f"{_summarize_names(skipped)}"
+        )
+        warnings.append(skipped_msg)
+        step(0.11, skipped_msg)
 
     scoring_df = None
     if config.include_scoring:
+        step(0.12, f"{file_name} : recherche du scoring")
+        info = getattr(raw, "info", {}) or {}
         scoring_df = resolve_scoring_for_file(
             recording_path,
             epoch_seconds=config.epoch_seconds,
             recording_duration_s=duration_s,
+            absolute_start_datetime=info.get("meas_date") if hasattr(info, "get") else None,
         )
-
-    signals = []
-    for channel in channels:
-        extracted = _channel_signal(raw, channel)
-        if extracted is None:
-            raise ValueError(f"canal '{channel}' illisible")
-        signals.append(extracted[0])
-    data = np.vstack(signals)
 
     hypno = None
     if scoring_df is not None and not scoring_df.empty:
         hypno = scoring_df_to_hypno(
-            scoring_df, data.shape[1], sfreq, config.epoch_seconds,
+            scoring_df, n_samples, sfreq, config.epoch_seconds,
         )
+        step(0.16, f"{file_name} : scoring utilise ({len(scoring_df)} epoques)")
+    elif config.include_scoring:
+        step(0.16, f"{file_name} : pas de scoring, analyse sans restriction de stade")
 
     min_coupled = (
         MIN_COUPLED_EVENTS if config.min_coupled is None else int(config.min_coupled)
     )
-    coupling = detect_so_spindle_coupling(
-        data, sfreq, channels, hypno=hypno, min_coupled=min_coupled,
-    )
-
-    if config.export_events and coupling.events:
-        events_path = os.path.join(
-            config.output_dir, f"{base_name}_coupling_events.csv"
-        )
-        export_coupling_events_to_csv(coupling.events, events_path, file_name)
+    so_mask = None
+    spindle_mask = None
+    if hypno is not None:
+        from CESA.sleep_pipeline.so_spindle_coupling import SO_STAGES, SPINDLE_STAGES, stage_mask
+        so_mask = stage_mask(hypno, SO_STAGES, n_samples)
+        spindle_mask = stage_mask(hypno, SPINDLE_STAGES, n_samples)
 
     rows: List[Dict[str, object]] = []
-    for record in coupling.stats.to_dict(orient="records"):
+    events: List[object] = []
+    n_channels = max(1, len(channels))
+    stopped = False
+    for index, channel in enumerate(channels):
+        if should_stop is not None and should_stop():
+            stopped = True
+            break
+        fraction = 0.18 + 0.75 * index / n_channels
+        step(
+            fraction,
+            f"{file_name} : canal {index + 1}/{len(channels)} {channel} "
+            f"— filtre SO, fuseaux, phase",
+        )
+        extracted = _channel_signal(raw, channel)
+        if extracted is None:
+            raise ValueError(f"canal '{channel}' illisible")
+        signal, channel_sf = extracted
+        try:
+            channel_events, record = analyze_channel(
+                signal, channel_sf, channel,
+                so_mask=so_mask,
+                spindle_mask=spindle_mask,
+                min_coupled=min_coupled,
+                reject_blinks=config.headband,
+            )
+        finally:
+            del signal
+        events.extend(channel_events)
+        if record["n_coupled"] < int(min_coupled):
+            warnings.append(
+                f"{file_name}: {channel}: seulement {record['n_coupled']} "
+                f"fuseau(x) couple(s) (minimum {int(min_coupled)}); "
+                f"phase preferee non publiee."
+            )
         row: Dict[str, object] = {
             "subject": base_name,
             "file": file_name,
@@ -552,13 +735,37 @@ def _coupling_rows_for_file(
         }
         row.update(record)
         rows.append(row)
+        blink_note = (
+            f", {record.get('n_blinks', 0)} clignements masques "
+            f"({record.get('blink_rejected_s', 0.0)} s)"
+            if config.headband else ""
+        )
+        step(
+            0.18 + 0.75 * (index + 1) / n_channels,
+            f"{file_name} : {channel} termine — "
+            f"{record['n_so']} SO, {record['n_spindle']} fuseaux, "
+            f"{record['n_coupled']} couples{blink_note}",
+        )
 
-    warnings = [f"{file_name}: {w}" for w in coupling.warnings]
     if scoring_df is None and config.include_scoring:
         warnings.append(
             f"{file_name}: aucun scoring resolu, analyse sans restriction de stade"
         )
-    return rows, warnings
+
+    if config.export_events and events and not stopped:
+        events_path = os.path.join(
+            config.output_dir, f"{base_name}_coupling_events.csv"
+        )
+        spindles = [e for e in events if getattr(e, "event_type", None) == EventType.SPINDLE]
+        step(0.96, f"{file_name} : ecriture de {len(spindles)} fuseaux")
+        export_coupling_events_to_csv(events, events_path, file_name)
+
+    # Keep the public column order even when a channel produced no stats keys.
+    columns = HEADBAND_STATS_COLUMNS if config.headband else STATS_COLUMNS
+    for row in rows:
+        for column in columns:
+            row.setdefault(column, float("nan"))
+    return rows, warnings, stopped
 
 
 def run_batch_so_spindle_coupling(
@@ -581,31 +788,81 @@ def run_batch_so_spindle_coupling(
     files = list(files)
     total = max(1, len(files))
     rows: List[Dict[str, object]] = []
+    label = "Couplage SO-fuseau bandeau" if config.headband else "Couplage SO-fuseau"
+    _checkpoint(progress_cb, 0.0, f"{label} : {len(files)} fichier(s)")
 
     for idx, file_path in enumerate(files):
         if should_stop is not None and should_stop():
             result.stopped = True
             break
         file_name = os.path.basename(file_path)
-        if progress_cb is not None:
-            progress_cb(idx / total * 100.0, f"Couplage SO-fuseau: {file_name}")
+
+        def _on_step(fraction: float, message: str, _idx: int = idx) -> None:
+            _checkpoint(progress_cb, (_idx + fraction) / total * 100.0, message)
+
         try:
-            file_rows, warnings = _coupling_rows_for_file(
-                file_path, config, group=(groups or {}).get(file_path, ""),
+            file_rows, warnings, stopped = _coupling_rows_for_file(
+                file_path,
+                config,
+                group=(groups or {}).get(file_path, ""),
+                on_step=_on_step,
+                should_stop=should_stop,
             )
+        except MemoryError:
+            result.failed += 1
+            message = (
+                f"{file_name}: memoire insuffisante. Relancez avec moins de canaux."
+            )
+            result.errors.append(message)
+            _checkpoint(progress_cb, (idx + 1) / total * 100.0, message)
+            continue
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{file_name}: {exc}")
+            _checkpoint(
+                progress_cb, (idx + 1) / total * 100.0, f"{file_name} : echec ({exc})",
+            )
+            logger.error("Coupling batch failed on %s", file_name, exc_info=True)
             continue
         rows.extend(file_rows)
         result.warnings.extend(warnings)
+        if stopped:
+            result.stopped = True
+            break
         result.processed += 1
+        _checkpoint(
+            progress_cb,
+            (idx + 1) / total * 100.0,
+            f"{file_name} : fichier termine ({len(file_rows)} canal/canaux)",
+        )
 
     if rows:
-        out_path = os.path.join(config.output_dir, config.output_filename)
-        pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
+        filename = config.output_filename
+        if config.headband and filename == BatchCouplingConfig.output_filename:
+            # Never overwrite the PSG table with a frontal, blink-masked one.
+            filename = "so_spindle_coupling_headband.csv"
+        out_path = os.path.join(config.output_dir, filename)
+        table = pd.DataFrame(rows)
+        table.to_csv(out_path, index=False, encoding="utf-8")
         result.outputs.append(out_path)
+        _checkpoint(progress_cb, 100.0, f"CSV ecrit : {out_path}")
 
-    if progress_cb is not None:
-        progress_cb(100.0, "Termine" if not result.stopped else "Arrete")
+        if config.export_figures:
+            _checkpoint(progress_cb, 100.0, "Figures de phase preferee")
+            prefix = "coupling_headband" if config.headband else "coupling"
+            try:
+                from CESA.coupling_plots import save_coupling_figures
+
+                for figure in save_coupling_figures(
+                    table, config.output_dir, prefix=prefix,
+                ):
+                    result.outputs.append(figure)
+                    _checkpoint(progress_cb, 100.0, f"Figure ecrite : {figure}")
+            except Exception as exc:
+                message = f"figures non generees: {exc}"
+                result.warnings.append(message)
+                _checkpoint(progress_cb, 100.0, message)
+                logger.error("Coupling figures failed", exc_info=True)
+
+    _checkpoint(progress_cb, 100.0, "Termine" if not result.stopped else "Arrete")
     return result

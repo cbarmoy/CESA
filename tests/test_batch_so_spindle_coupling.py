@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -46,9 +47,51 @@ def _install_raw(monkeypatch, mapping, *, scoring: Optional[pd.DataFrame] = None
     monkeypatch.setattr(be, "resolve_scoring_for_file", lambda *a, **k: scoring)
 
 
+class TestScoringSidecar:
+    def test_matches_clinical_sleep_scoring_name(self, tmp_path):
+        edf = tmp_path / "S030_Ap.edf"
+        edf.write_bytes(b"")
+        other = tmp_path / "S030_AV_sleep scoring.csv"
+        other.write_text("stage,time\nW,0\n", encoding="utf-8")
+        scoring = tmp_path / "S030_AP_sleep scoring.csv"
+        scoring.write_text(
+            "Sommeil,Heure de debut\n"
+            "N2,2020-01-01 23:00:00\n"
+            "N3,2020-01-01 23:00:30\n"
+            "éveil,2020-01-01 23:01:00\n",
+            encoding="utf-8",
+        )
+        found = be.find_scoring_sidecars(str(edf))
+        assert os.path.basename(found[0]) == "S030_AP_sleep scoring.csv"
+        assert all("S030_AV" not in os.path.basename(p) for p in found)
+
+        table = be.resolve_scoring_for_file(
+            str(edf),
+            absolute_start_datetime=pd.Timestamp("2020-01-01 23:00:00"),
+        )
+        assert table is not None
+        assert list(table["stage"].head(3)) == ["N2", "N3", "W"]
+        assert float(table["time"].iloc[0]) == 0.0
+
+
 class TestChannelResolution:
     def test_requested_channels_are_kept(self, coupled_raw):
-        assert be._coupling_channels(coupled_raw, ["C3"]) == ["C3"]
+        picked, skipped = be._coupling_channels(coupled_raw, ["C3"])
+        assert picked == ["C3"]
+        assert skipped == []
+
+    def test_non_eeg_channels_are_skipped_even_when_requested(self):
+        raw = DummyRaw({
+            "C4-M1": np.zeros(1000),
+            "F3-M2": np.zeros(1000),
+            "O1-M2": np.zeros(1000),
+            "E1-M2": np.zeros(1000),
+            "ECG": np.zeros(1000),
+            "Heart Rate": np.zeros(1000),
+        })
+        picked, skipped = be._coupling_channels(raw, list(raw.ch_names))
+        assert picked == ["C4-M1", "F3-M2", "O1-M2"]
+        assert skipped == ["E1-M2", "ECG", "Heart Rate"]
 
     def test_missing_requested_channels_raise(self, coupled_raw):
         with pytest.raises(ValueError, match="aucun canal demande"):
@@ -56,7 +99,9 @@ class TestChannelResolution:
 
     def test_empty_request_falls_back_to_eeg(self, coupled_raw):
         # EMG1 is typed as EMG by detect_signal_type and must be dropped.
-        assert be._coupling_channels(coupled_raw, []) == ["C3"]
+        picked, skipped = be._coupling_channels(coupled_raw, [])
+        assert picked == ["C3"]
+        assert skipped == ["EMG1"]
 
     def test_no_eeg_channel_raises(self):
         raw = DummyRaw({"EMG1": np.zeros(1000), "ECG": np.zeros(1000)})
@@ -65,6 +110,18 @@ class TestChannelResolution:
 
 
 class TestBatchRunner:
+    def test_requested_non_eeg_is_reported_and_dropped(self, tmp_path, monkeypatch, coupled_raw):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path),
+            channels=["C3", "EMG1"],
+            include_scoring=False,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+        df = pd.read_csv(result.outputs[0])
+        assert list(df["channel"]) == ["C3"]
+        assert any("EMG1" in w and "ignores" in w for w in result.warnings)
+
     def test_writes_one_row_per_channel(self, tmp_path, monkeypatch, coupled_raw):
         _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
         config = be.BatchCouplingConfig(
@@ -176,17 +233,18 @@ class TestBatchRunner:
         config = be.BatchCouplingConfig(
             output_dir=str(tmp_path), channels=["C3"], include_scoring=False,
         )
-        seen: List[float] = []
-        # Stop once the first file has been announced.
+        seen: List[str] = []
+        # Stop once the first recording has been reported as finished.
         result = be.run_batch_so_spindle_coupling(
             ["a.edf", "b.edf"], config,
-            progress_cb=lambda pct, msg: seen.append(pct),
-            should_stop=lambda: len(seen) >= 1,
+            progress_cb=lambda pct, msg: seen.append(msg),
+            should_stop=lambda: any("fichier termine" in msg for msg in seen),
         )
 
         assert result.stopped is True
         assert result.processed == 1
-        assert seen[-1] == 100.0
+        assert any("a.edf : canal 1/1" in msg for msg in seen)
+        assert seen[-1] == "Arrete"
 
     def test_no_file_writes_nothing(self, tmp_path, monkeypatch):
         _install_raw(monkeypatch, {})
@@ -195,6 +253,134 @@ class TestBatchRunner:
 
         assert result.outputs == []
         assert result.processed == 0
+
+
+class TestHeadbandBatch:
+    @pytest.fixture
+    def headband_raw(self):
+        from tests.test_headband_coupling import with_blinks
+
+        signal, starts = synthetic_recording(seed=1)
+        contaminated, windows = with_blinks(signal, starts)
+        raw = DummyRaw({
+            "F3-M2": contaminated,
+            "F4-M1": contaminated,
+            "C3-M2": contaminated,
+            "E1-M2": contaminated,
+        })
+        return raw, len(windows)
+
+    def test_only_frontal_channels_are_analysed(
+        self, tmp_path, monkeypatch, headband_raw,
+    ):
+        raw, _ = headband_raw
+        _install_raw(monkeypatch, {"nap1.edf": raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), include_scoring=False, headband=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        df = pd.read_csv(result.outputs[0])
+        assert list(df["channel"]) == ["F3-M2", "F4-M1"]
+        assert any("C3-M2" in w and "frontaux" in w for w in result.warnings)
+
+    def test_csv_carries_the_blink_columns(
+        self, tmp_path, monkeypatch, headband_raw,
+    ):
+        from CESA.sleep_pipeline.so_spindle_coupling import HEADBAND_STATS_COLUMNS
+
+        raw, n_blinks = headband_raw
+        _install_raw(monkeypatch, {"nap1.edf": raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["F3-M2"],
+            include_scoring=False, headband=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        df = pd.read_csv(result.outputs[0])
+        assert list(df.columns) == [
+            "subject", "file", "group", "scoring_used", "duration_min",
+        ] + list(HEADBAND_STATS_COLUMNS)
+        assert int(df.iloc[0]["n_blinks"]) == n_blinks
+        assert df.iloc[0]["blink_rejected_s"] > 0.0
+
+    def test_output_file_does_not_overwrite_the_psg_table(
+        self, tmp_path, monkeypatch, headband_raw,
+    ):
+        raw, _ = headband_raw
+        _install_raw(monkeypatch, {"nap1.edf": raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["F3-M2"],
+            include_scoring=False, headband=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        assert os.path.basename(result.outputs[0]) == (
+            "so_spindle_coupling_headband.csv"
+        )
+
+    def test_no_frontal_channel_is_a_failure(self, tmp_path, monkeypatch):
+        signal, _ = synthetic_recording(seed=1)
+        _install_raw(monkeypatch, {"nap1.edf": DummyRaw({"C3-M2": signal})})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), include_scoring=False, headband=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        assert result.failed == 1
+        assert any("aucun canal frontal" in e for e in result.errors)
+
+
+class TestFigureExport:
+    def test_figures_are_written_next_to_the_csv(
+        self, tmp_path, monkeypatch, coupled_raw,
+    ):
+        import matplotlib
+
+        matplotlib.use("Agg", force=False)
+        _install_raw(monkeypatch, {"a.edf": coupled_raw, "b.edf": coupled_raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"],
+            include_scoring=False, export_figures=True,
+        )
+        result = be.run_batch_so_spindle_coupling(
+            ["a.edf", "b.edf"], config,
+            groups={"a.edf": "AVANT", "b.edf": "APRES"},
+        )
+
+        names = [os.path.basename(p) for p in result.outputs]
+        assert "coupling_phases.png" in names
+        assert (tmp_path / "coupling_phases.png").stat().st_size > 0
+
+    def test_figures_are_off_by_default(self, tmp_path, monkeypatch, coupled_raw):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"], include_scoring=False,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        assert all(p.endswith(".csv") for p in result.outputs)
+
+    def test_a_failing_figure_does_not_fail_the_batch(
+        self, tmp_path, monkeypatch, coupled_raw,
+    ):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("matplotlib indisponible")
+
+        monkeypatch.setattr(
+            "CESA.coupling_plots.save_coupling_figures", boom, raising=True,
+        )
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"],
+            include_scoring=False, export_figures=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+
+        assert result.processed == 1
+        assert result.failed == 0
+        assert any("figures non generees" in w for w in result.warnings)
 
 
 class TestEventsExport:
