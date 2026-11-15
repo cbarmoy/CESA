@@ -15,6 +15,12 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .channel_strip import ChannelStrip
+from .display_trace import (
+    DisplayTrace,
+    default_traces_for_sources,
+    next_clone_id,
+    next_clone_label,
+)
 from .downsampler import compute_target_points
 from .themes import CHANNEL_TYPE_COLORS, DARK, ThemePalette
 from .time_axis_item import TimeAxisItem
@@ -64,10 +70,12 @@ class EEGViewerWidget(QtWidgets.QWidget):
 
         self._theme: ThemePalette = dict(DARK)
         self._signals: Dict[str, Signal] = {}
+        # Display order is a list of trace_id (primary: id == source_name).
         self._channel_order: List[str] = []
+        self._traces: Dict[str, DisplayTrace] = {}
         self._strips: Dict[str, ChannelStrip] = {}
-        self._channel_types: Dict[str, str] = {}
-        self._pipelines: Dict[str, Any] = {}
+        self._channel_types: Dict[str, str] = {}  # keyed by source_name
+        self._pipelines: Dict[str, Any] = {}  # keyed by trace_id
         self._global_filter: bool = True
         self._active_layout: Optional[Any] = None  # LayoutConfig or None
 
@@ -159,7 +167,10 @@ class EEGViewerWidget(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def set_signals(self, signals: Dict[str, Signal]) -> None:
-        """Replace all channel data.  Rebuilds strips."""
+        """Replace all channel data.  Rebuilds strips.
+
+        Preserves display clones whose ``source_name`` is still present.
+        """
         self._signals = dict(signals)
         total_dur = 0.0
         for _name, (data, fs) in signals.items():
@@ -167,14 +178,30 @@ class EEGViewerWidget(QtWidgets.QWidget):
             total_dur = max(total_dur, dur)
         self._total_duration_s = total_dur
 
-        if not self._channel_order:
-            self._channel_order = list(signals.keys())
-
+        self._sync_traces_to_signals()
         self._rebuild_strips()
         self._refresh_view()
 
     def set_channel_order(self, names: List[str]) -> None:
-        self._channel_order = list(names)
+        """Set display order by *trace_id* (legacy callers may pass source names)."""
+        # Keep only known traces; map bare source names to primary traces.
+        resolved: List[str] = []
+        for n in names:
+            if n in self._traces:
+                resolved.append(n)
+            elif n in self._signals and n not in resolved:
+                # Primary trace id == source name
+                if n not in self._traces:
+                    self._traces[n] = DisplayTrace(trace_id=n, source_name=n, label=n)
+                resolved.append(n)
+        # Append any missing traces (e.g. clones) at the end
+        for tid in self._channel_order:
+            if tid not in resolved and tid in self._traces:
+                resolved.append(tid)
+        for tid in self._traces:
+            if tid not in resolved:
+                resolved.append(tid)
+        self._channel_order = resolved
         self._rebuild_strips()
         self._refresh_view()
 
@@ -188,10 +215,36 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._plot.blockSignals(False)
         self._refresh_view()
 
-    def set_filter_pipelines(self, pipelines: Dict[str, Any]) -> None:
-        self._pipelines = dict(pipelines)
-        for name, strip in self._strips.items():
-            strip.set_pipeline(pipelines.get(name))
+    def set_filter_pipelines(
+        self,
+        pipelines: Dict[str, Any],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Set filter pipelines keyed by *trace_id* (or source name for primaries).
+
+        By default **merges** into the existing map so display clones keep their
+        independent pipelines when a caller (Tk sync, profile reload) only
+        passes primary channel names.  Pass ``replace=True`` to drop unknown
+        keys (e.g. full apply from the filter dialog, or a new recording).
+        """
+        incoming = dict(pipelines or {})
+        if replace:
+            self._pipelines = incoming
+        else:
+            merged = dict(self._pipelines)
+            merged.update(incoming)
+            # Drop pipelines for traces that no longer exist
+            if self._traces:
+                merged = {
+                    k: v for k, v in merged.items()
+                    if k in self._traces or k in self._signals
+                }
+            self._pipelines = merged
+        for tid, strip in self._strips.items():
+            # Never fall back to source_name — that would force clones to share
+            # the primary filter and hide any comparison.
+            strip.set_pipeline(self._pipelines.get(tid))
         self._refresh_view()
 
     def set_global_filter_enabled(self, enabled: bool) -> None:
@@ -201,16 +254,25 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._refresh_view()
 
     def set_visible_channels(self, names: List[str]) -> None:
+        """Show/hide strips by *trace_id* (checkbox list uses UserRole ids)."""
         visible_set = set(names)
-        for name, strip in self._strips.items():
-            strip.set_visible(name in visible_set)
+        for tid, strip in self._strips.items():
+            visible = tid in visible_set
+            strip.set_visible(visible)
+            tr = self._traces.get(tid)
+            if tr is not None:
+                tr.visible = visible
         self._recompute_offsets()
         self._refresh_view()
 
     def set_channel_gain(self, name: str, gain: float) -> None:
+        """Set gain for a trace (``name`` is trace_id)."""
         strip = self._strips.get(name)
         if strip:
             strip.set_gain(gain)
+            tr = self._traces.get(name)
+            if tr is not None:
+                tr.gain = float(gain)
             self._refresh_view()
 
     def set_all_gains(self, gain: float) -> None:
@@ -226,10 +288,11 @@ class EEGViewerWidget(QtWidgets.QWidget):
         stable when navigating.
         """
         target_half = self._spacing * 0.4
-        for name, strip in self._strips.items():
+        for tid, strip in self._strips.items():
             if not strip.visible:
                 continue
-            data, fs = self._signals.get(name, (np.array([]), 1.0))
+            source = self.source_name_for(tid)
+            data, fs = self._signals.get(source, (np.array([]), 1.0))
             if data.size < 2:
                 continue
             # Subsample for speed on very long recordings (every Nth sample)
@@ -242,14 +305,302 @@ class EEGViewerWidget(QtWidgets.QWidget):
             gain = target_half / p98
             gain = max(0.01, min(gain, 1e6))
             strip.set_gain(gain)
+            tr = self._traces.get(tid)
+            if tr is not None:
+                tr.gain = gain
         self._refresh_view()
 
     def reset_gains(self) -> None:
         """Reset gains to type defaults (ECG stays attenuated)."""
-        for name, strip in self._strips.items():
-            ch_type = self._channel_types.get(name, "eeg")
+        for tid, strip in self._strips.items():
+            source = self.source_name_for(tid)
+            ch_type = self._channel_types.get(source, "eeg")
             strip.set_gain(self._DEFAULT_TYPE_GAINS.get(ch_type, 1.0))
+            tr = self._traces.get(tid)
+            if tr is not None:
+                tr.gain = None
         self._refresh_view()
+
+    # ------------------------------------------------------------------
+    # Display traces (clones)
+    # ------------------------------------------------------------------
+
+    def source_name_for(self, trace_id: str) -> str:
+        tr = self._traces.get(trace_id)
+        if tr is not None:
+            return tr.source_name
+        return trace_id
+
+    def get_traces(self) -> List[DisplayTrace]:
+        """Traces in current display order."""
+        out: List[DisplayTrace] = []
+        for tid in self._channel_order:
+            tr = self._traces.get(tid)
+            if tr is not None:
+                out.append(tr)
+        return out
+
+    def set_traces(self, traces: List[DisplayTrace]) -> None:
+        """Replace the full display-trace list (e.g. from a saved profile)."""
+        valid: Dict[str, DisplayTrace] = {}
+        order: List[str] = []
+        for tr in traces:
+            if tr.source_name not in self._signals and tr.source_name not in self._traces:
+                # Allow setting before signals if source will arrive; keep when
+                # signals already loaded and source missing → skip clone.
+                if self._signals and tr.source_name not in self._signals:
+                    continue
+            valid[tr.trace_id] = tr
+            order.append(tr.trace_id)
+        if not valid and self._signals:
+            self._sync_traces_to_signals(force_reset=True)
+            return
+        if valid:
+            self._traces = valid
+            self._channel_order = order
+            self._rebuild_strips()
+            self._refresh_view()
+
+    def duplicate_trace(self, trace_id: str) -> Optional[str]:
+        """Create a display clone of *trace_id*. Returns new trace_id or None."""
+        src = self._traces.get(trace_id)
+        if src is None:
+            if trace_id in self._signals:
+                src = DisplayTrace(
+                    trace_id=trace_id, source_name=trace_id, label=trace_id,
+                )
+                self._traces[trace_id] = src
+            else:
+                return None
+        existing_ids = list(self._traces.keys())
+        existing_labels = [t.label for t in self._traces.values()]
+        new_id = next_clone_id(src.source_name, existing_ids)
+        new_label = next_clone_label(src.source_name, existing_labels)
+        pipe = self._pipelines.get(trace_id)
+        new_pipe = None
+        if pipe is not None and hasattr(pipe, "deep_copy"):
+            try:
+                new_pipe = pipe.deep_copy()
+            except Exception:
+                new_pipe = pipe
+        elif pipe is not None:
+            new_pipe = pipe
+        else:
+            # Always give the clone its own pipeline entry so later primary-only
+            # syncs (merge) cannot leave it sharing the source implicitly, and
+            # the filter dialog can disable it independently.
+            try:
+                from CESA.filter_engine import FilterPipeline
+                new_pipe = FilterPipeline()
+            except Exception:
+                new_pipe = None
+        clone = DisplayTrace(
+            trace_id=new_id,
+            source_name=src.source_name,
+            label=new_label,
+            color=src.color,
+            gain=src.gain,
+            visible=True,
+        )
+        self._traces[new_id] = clone
+        # Insert clone just after the source strip
+        try:
+            idx = self._channel_order.index(trace_id)
+            self._channel_order.insert(idx + 1, new_id)
+        except ValueError:
+            self._channel_order.append(new_id)
+        if new_pipe is not None:
+            self._pipelines[new_id] = new_pipe
+        self._rebuild_strips()
+        self._refresh_view()
+        return new_id
+
+    def remove_trace(self, trace_id: str) -> bool:
+        """Remove a *clone* only. Primary traces (id == source) are kept."""
+        tr = self._traces.get(trace_id)
+        if tr is None or not tr.is_clone:
+            return False
+        self._traces.pop(trace_id, None)
+        self._pipelines.pop(trace_id, None)
+        if trace_id in self._channel_order:
+            self._channel_order.remove(trace_id)
+        self._rebuild_strips()
+        self._refresh_view()
+        return True
+
+    def remove_clones_of_source(self, source_name: str) -> int:
+        """Remove all display clones of *source_name*. Returns how many removed."""
+        to_drop = [
+            tid for tid, tr in self._traces.items()
+            if tr.is_clone and tr.source_name == source_name
+        ]
+        for tid in to_drop:
+            self._traces.pop(tid, None)
+            self._pipelines.pop(tid, None)
+            if tid in self._channel_order:
+                self._channel_order.remove(tid)
+        if to_drop:
+            self._rebuild_strips()
+            self._refresh_view()
+        return len(to_drop)
+
+    def apply_multi_view_recipe(self, source_name: str, recipe: Any) -> List[str]:
+        """Configure *source_name* as a multi-filter stack from a recipe.
+
+        Replaces existing clones of that source. The primary strip is kept
+        (``trace_id == source_name``) and renamed/coloured/filtered from the
+        recipe's primary lane; additional lanes become clones.
+
+        Returns the list of trace ids that belong to the recipe (primary first).
+        """
+        from .multi_view_recipes import make_lane_label
+
+        if source_name not in self._signals:
+            # Allow when source is only known via an existing primary trace
+            primary = self._traces.get(source_name)
+            if primary is None or primary.source_name not in self._signals:
+                return []
+            source_name = primary.source_name
+
+        # Resolve physical source if user selected a clone in the dialog
+        sel = self._traces.get(source_name)
+        if sel is not None:
+            source_name = sel.source_name
+
+        if source_name not in self._signals:
+            return []
+
+        lanes = list(getattr(recipe, "lanes", []) or [])
+        if not lanes:
+            return []
+
+        # Drop previous clones of this source
+        self.remove_clones_of_source(source_name)
+
+        if source_name not in self._traces:
+            self._traces[source_name] = DisplayTrace(
+                trace_id=source_name, source_name=source_name, label=source_name,
+            )
+        if source_name not in self._channel_order:
+            self._channel_order.append(source_name)
+
+        primary_lane = next((ln for ln in lanes if getattr(ln, "is_primary", False)), lanes[0])
+        other_lanes = [ln for ln in lanes if ln is not primary_lane]
+
+        # Configure primary
+        prim = self._traces[source_name]
+        prim.label = make_lane_label(source_name, primary_lane.short_name)
+        prim.color = primary_lane.color
+        prim.visible = True
+        pipe0 = primary_lane.pipeline
+        if hasattr(pipe0, "deep_copy"):
+            self._pipelines[source_name] = pipe0.deep_copy()
+        else:
+            self._pipelines[source_name] = pipe0
+
+        result_ids = [source_name]
+        insert_at = self._channel_order.index(source_name) + 1
+
+        for lane in other_lanes:
+            existing_ids = list(self._traces.keys())
+            new_id = next_clone_id(source_name, existing_ids)
+            label = make_lane_label(source_name, lane.short_name)
+            clone = DisplayTrace(
+                trace_id=new_id,
+                source_name=source_name,
+                label=label,
+                color=lane.color,
+                visible=True,
+            )
+            self._traces[new_id] = clone
+            pipe = lane.pipeline
+            if hasattr(pipe, "deep_copy"):
+                self._pipelines[new_id] = pipe.deep_copy()
+            else:
+                self._pipelines[new_id] = pipe
+            self._channel_order.insert(insert_at, new_id)
+            insert_at += 1
+            result_ids.append(new_id)
+
+        self._rebuild_strips()
+        # Re-apply colours / labels / pipelines after rebuild
+        for tid in result_ids:
+            tr = self._traces.get(tid)
+            strip = self._strips.get(tid)
+            if tr is None or strip is None:
+                continue
+            if tr.color:
+                strip.set_color(tr.color)
+            strip.name = tr.label
+            if hasattr(strip, "_label") and strip._label is not None:
+                strip._label.setText(tr.label)
+            pipe = self._pipelines.get(tid)
+            if pipe is not None:
+                strip.set_pipeline(pipe)
+        self._refresh_view()
+        return result_ids
+
+    def set_trace_color(self, trace_id: str, color: str) -> None:
+        tr = self._traces.get(trace_id)
+        if tr is None:
+            return
+        tr.color = color
+        strip = self._strips.get(trace_id)
+        if strip is not None:
+            strip.set_color(color)
+        self._refresh_view()
+
+    def set_trace_label(self, trace_id: str, label: str) -> None:
+        tr = self._traces.get(trace_id)
+        if tr is None:
+            return
+        label = (label or "").strip() or tr.source_name
+        tr.label = label
+        strip = self._strips.get(trace_id)
+        if strip is not None:
+            strip.name = label
+            if hasattr(strip, "_label") and strip._label is not None:
+                strip._label.setText(label)
+        self._refresh_view()
+
+    def _sync_traces_to_signals(self, force_reset: bool = False) -> None:
+        """Ensure every source has a primary trace; drop orphans after reload."""
+        sources = list(self._signals.keys())
+        if force_reset or not self._traces:
+            primaries = default_traces_for_sources(sources)
+            self._traces = {t.trace_id: t for t in primaries}
+            self._channel_order = [t.trace_id for t in primaries]
+            # Drop pipelines for removed sources; keep primary keys
+            self._pipelines = {
+                k: v for k, v in self._pipelines.items()
+                if k in self._traces or self.source_name_for(k) in self._signals
+            }
+            return
+
+        # Drop traces whose source disappeared
+        gone = [
+            tid for tid, tr in self._traces.items()
+            if tr.source_name not in self._signals
+        ]
+        for tid in gone:
+            self._traces.pop(tid, None)
+            self._pipelines.pop(tid, None)
+            if tid in self._channel_order:
+                self._channel_order.remove(tid)
+
+        # Ensure primary for each source
+        for src in sources:
+            if src not in self._traces:
+                self._traces[src] = DisplayTrace(
+                    trace_id=src, source_name=src, label=src,
+                )
+            if src not in self._channel_order:
+                self._channel_order.append(src)
+
+        # Prune order entries that vanished
+        self._channel_order = [
+            tid for tid in self._channel_order if tid in self._traces
+        ]
 
     # Clinical defaults: ECG is mV-scale, EEG is µV-scale.
     _DEFAULT_TYPE_GAINS = {
@@ -285,11 +636,18 @@ class EEGViewerWidget(QtWidgets.QWidget):
         per_ch = config.per_channel_gains or {}
         g_global = float(config.global_gain) if config.enabled else 1.0
 
-        for name, strip in self._strips.items():
-            ch_type = channel_types.get(name, "eeg")
+        for tid, strip in self._strips.items():
+            source = self.source_name_for(tid)
+            tr = self._traces.get(tid)
+            if tr is not None and tr.gain is not None:
+                strip.set_gain(max(0.001, float(tr.gain)))
+                strip.set_clip(config.clipping_enabled, config.clip_value_uv)
+                continue
+            ch_type = channel_types.get(source, self._channel_types.get(source, "eeg"))
             type_gain = float(per_type.get(ch_type, 1.0))
-            if name in per_ch and config.enabled:
-                ch_gain = float(per_ch[name])
+            gain_key = tid if tid in per_ch else source
+            if gain_key in per_ch and config.enabled:
+                ch_gain = float(per_ch[gain_key])
                 # Auto-gains for ECG are already amplitude-aware; don't also
                 # multiply by the strong type attenuation (would crush them).
                 # But if a per-channel gain looks like a forgotten default
@@ -318,8 +676,9 @@ class EEGViewerWidget(QtWidgets.QWidget):
         self._channel_types.update(channel_types)
 
         if layout and layout.enabled and layout.center_signal and signal_medians:
-            for name, strip in self._strips.items():
-                strip.set_center_offset(signal_medians.get(name, 0.0))
+            for tid, strip in self._strips.items():
+                source = self.source_name_for(tid)
+                strip.set_center_offset(signal_medians.get(source, 0.0))
         else:
             for strip in self._strips.values():
                 strip.set_center_offset(0.0)
@@ -436,10 +795,10 @@ class EEGViewerWidget(QtWidgets.QWidget):
                 t += self._epoch_len
                 continue
             has_artifact = False
-            for name, strip in self._strips.items():
+            for tid, strip in self._strips.items():
                 if not strip.visible:
                     continue
-                sig = self._signals.get(name)
+                sig = self._signals.get(self.source_name_for(tid))
                 if sig is None:
                     continue
                 data, fs = sig
@@ -497,7 +856,13 @@ class EEGViewerWidget(QtWidgets.QWidget):
 
     @property
     def channel_names(self) -> List[str]:
+        """Trace ids in display order (primary ids equal source names)."""
         return list(self._channel_order)
+
+    @property
+    def source_channel_names(self) -> List[str]:
+        """Unique physical source names (no clones)."""
+        return list(self._signals.keys())
 
     @property
     def plot_item(self) -> pg.PlotItem:
@@ -540,34 +905,46 @@ class EEGViewerWidget(QtWidgets.QWidget):
     # ------------------------------------------------------------------
 
     def _rebuild_strips(self) -> None:
-        """Destroy existing strips and create new ones."""
+        """Destroy existing strips and create new ones (one per display trace)."""
         for strip in self._strips.values():
             strip.cleanup()
         self._strips.clear()
 
-        visible = [
-            n for n in self._channel_order if n in self._signals
+        if not self._traces and self._signals:
+            self._sync_traces_to_signals(force_reset=True)
+
+        visible_ids = [
+            tid for tid in self._channel_order
+            if tid in self._traces
+            and self.source_name_for(tid) in self._signals
         ]
-        n_ch = len(visible)
+        n_ch = len(visible_ids)
         if n_ch == 0:
             return
 
-        for i, name in enumerate(visible):
-            data, fs = self._signals[name]
-            ch_type = self._channel_types.get(name) or cesa_detect_signal_type(name)
-            color_key = CHANNEL_TYPE_COLORS.get(ch_type, "eeg_color")
-            color = self._theme.get(color_key, self._theme["eeg_color"])
+        for i, tid in enumerate(visible_ids):
+            tr = self._traces[tid]
+            data, fs = self._signals[tr.source_name]
+            ch_type = (
+                self._channel_types.get(tr.source_name)
+                or cesa_detect_signal_type(tr.source_name)
+            )
+            if tr.color:
+                color = tr.color
+            else:
+                color_key = CHANNEL_TYPE_COLORS.get(ch_type, "eeg_color")
+                color = self._theme.get(color_key, self._theme["eeg_color"])
             y_off = -i * self._spacing
 
             strip = ChannelStrip(
-                name=name,
+                name=tr.label,
                 data=data,
                 sfreq=fs,
                 color=color,
                 plot_item=self._plot,
                 y_offset=y_off,
             )
-            pipeline = self._pipelines.get(name)
+            pipeline = self._pipelines.get(tid)
             if pipeline is not None:
                 strip.set_pipeline(pipeline)
             strip.set_filter_enabled(self._global_filter)
@@ -575,15 +952,20 @@ class EEGViewerWidget(QtWidgets.QWidget):
             strip.set_show_amplitude_scale(self._show_amplitude_scale)
             # Immediate type attenuation so ECG never flashes at 1:1 before
             # the scaling panel state is restored.
-            strip.set_gain(self._DEFAULT_TYPE_GAINS.get(ch_type, 1.0))
+            if tr.gain is not None:
+                strip.set_gain(tr.gain)
+            else:
+                strip.set_gain(self._DEFAULT_TYPE_GAINS.get(ch_type, 1.0))
             strip.set_lane_half_height(self._spacing * 0.48)
+            strip.set_visible(tr.visible)
 
-            self._strips[name] = strip
+            self._strips[tid] = strip
 
         # Y range to show all channels
         y_top = self._spacing
         y_bot = -(n_ch) * self._spacing
         self._plot.setYRange(y_bot, y_top, padding=0.02)
+        self._recompute_offsets()
 
     def _recompute_offsets(self) -> None:
         """Update Y offsets after visibility or order change.
@@ -595,18 +977,21 @@ class EEGViewerWidget(QtWidgets.QWidget):
         layout = self._active_layout
         cumulative = 0.0
         n_visible = 0
-        for name in self._channel_order:
-            strip = self._strips.get(name)
+        for tid in self._channel_order:
+            strip = self._strips.get(tid)
             if strip is None or not strip.visible:
                 continue
-            ch_type = self._channel_types.get(name, "eeg")
+            source = self.source_name_for(tid)
+            ch_type = self._channel_types.get(source, "eeg")
             if layout and layout.enabled:
                 mult = layout.per_type_spacing_multiplier.get(ch_type, 1.0)
                 # Legacy auto-layout shrank ECG lanes to ~0.12 — bump the
                 # floor so soft-clip has a usable half-height.
                 if ch_type in ("ecg", "emg"):
                     mult = max(mult, 0.5)
-                custom = layout.per_channel_offset.get(name, 0.0)
+                custom = layout.per_channel_offset.get(
+                    tid, layout.per_channel_offset.get(source, 0.0),
+                )
             else:
                 mult = 1.0
                 custom = 0.0

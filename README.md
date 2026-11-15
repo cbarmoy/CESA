@@ -1,19 +1,19 @@
 # CESA
 
-![Version](https://img.shields.io/badge/version-0.0beta2.0-blue)
+![Version](https://img.shields.io/badge/version-0.0beta2.1-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green)
-![Tests](https://img.shields.io/badge/tests-217%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-829%20collected-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 **CESA** (Complex EEG Studio Analysis) is a Windows workstation for clinicians and researchers working with long-form EEG or polysomnography recordings. It sits on top of MNE-Python and bundles everything needed to inspect raw EDF+, run standard sleep scorings, compute advanced metrics (coherence, microstates, renormalised entropy) and export publication-ready plots.
 
-## What's new in v0.0beta2.0
+## What's new in v0.0beta2.1
 
-- **Ocular cleaning (non-destructive)** -- EOG→EEG regression in memory with mandatory before/after preview and restore; recording files are never modified (`Filtres → Nettoyage oculaire...`).
-- **Native Qt analysis dialogs** -- artifact detection, stage PSD, wavelet spectrogram, entropy, temporal metrics, connectivity, microstates, sleep periods, scoring editor/comparison, PSG report, markers, EDF segment export, batch/multi-subject.
-- **Spectrogram bars** -- night-long and window spectrograms in the Qt viewer.
-- **Sleep metrics & batch engine** -- clinical sleep stats helpers and batch processing utilities.
-- **Import profiles** -- PSG / PSG-HD import presets under `config/import_profiles/`.
+- **SO–spindle coupling** -- classical Butterworth + Hilbert pipeline with circular statistics, optional YASA micro-events, and cohort figures (phase rose, spindle-locked average, PETH, SO-trough TFR). A channel analysed alone matches the same channel analysed next to others.
+- **Batch coupling** -- multi-subject CSV + optional figures; scoring sidecars are tagged at folder scan (`[scoring]` / `[sans scoring]`) before the long run.
+- **ICA cleaning & night QC** -- in-memory ICA, prep/night quality checks.
+- **Scoring toolbox** -- channel pick, signal check, sweep, scorer comparison, HTML report.
+- **Specparam & multi-view recipes** -- 1/f + oscillatory peaks; delta / spindle / alpha lane layouts in the Qt viewer.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -49,7 +49,7 @@ The CLI auto-detects the number of CPU cores and can run analyses in parallel (`
 
 1. Install Python ≥ 3.10, `pip install -r requirements.txt`.
 2. Launch `python run.py`, point the UI to your EDF/PSG folder, and start exploring.
-3. Check `docs/Methodes_Statistiques.md` for the exact formulas behind the sleep and MSE metrics.
+3. Check `docs/Methodes_Statistiques.md` for the exact formulas behind the sleep, MSE and SO–spindle coupling metrics.
 4. For scripted pipelines, call the functions in `CESA/entropy.py` or use the CSV analysis CLI.
 5. To generate a standalone filter report: `python -m CESA.report_generator --audit audit.json --output report.html`.
 
@@ -70,19 +70,20 @@ The frozen build is produced with `pyinstaller cesa.spec` and lands under **`dis
 ```
 CESA-main/
 ├── CESA/                    # Core package
-│   ├── __init__.py          # Version 0.0beta2.0
+│   ├── __init__.py          # Version 0.0beta2.1
 │   ├── filter_engine.py     # Composable filter engine
 │   ├── filters.py           # Legacy wrapper (backward-compat)
+│   ├── coupling_plots.py    # SO–spindle circular figures
 │   ├── report_generator.py  # HTML report generator
 │   ├── eeg_studio_fixed.py  # Main GUI
 │   ├── psg_plot.py          # PSG signal renderer
 │   ├── profile_schema.py    # User profiles + filter pipeline schema
-│   └── sleep_pipeline/      # AASM scoring pipeline (ML/DL/HMM)
+│   └── sleep_pipeline/      # AASM scoring + SO–spindle coupling
 ├── ui/
 │   └── filter_dialog.py     # Professional filter config dialog (v4)
 ├── config/
 │   └── filter_presets.json   # Built-in clinical presets
-├── tests/                   # 217+ unit tests
+├── tests/                   # 829 unit tests
 ├── scripts/                 # CLI utilities
 ├── docs/                    # Documentation
 ├── requirements.txt         # Dependencies

@@ -190,15 +190,24 @@ Un fuseau est dit *couplé* quand le maximum de son enveloppe tombe à l'intéri
 
 - **phase préférée** = moyenne circulaire `arg(Σ e^{iφ_k})`, ramenée dans `[−π, π)` ;
 - **force du couplage** = longueur du vecteur résultant `R = |Σ e^{iφ_k}| / n`, entre 0 (phases uniformes) et 1 (verrouillage parfait) ;
-- **test de Rayleigh** = uniformité de la distribution (`z`, `p`).
+- **test de Rayleigh** = uniformité de la distribution (`z`, `p`) ;
+- **test V** = clustering autour de 0 rad, l'up-state prédit par la littérature (`v_stat`, `v_p`). Plus puissant que Rayleigh quand la direction attendue est connue.
 
-La moyenne arithmétique d'angles est invalide (discontinuité en ±π) : c'est pourquoi la statistique circulaire est obligatoire ici. Si `pycircstat2` est absent, CESA calcule les mêmes estimateurs avec NumPy (approximation de Zar, 1999, éq. 27.4 pour le `p` de Rayleigh) et indique `backend = numpy` dans la colonne correspondante.
+S'y ajoutent les deux autres mesures standardisées par la méta-analyse de 2024 :
+
+- **pourcentage de couplage** : `pct_coupled_spindle = n_coupled / n_spindle` et `pct_coupled_so = n_SO_avec_fuseau / n_so` ;
+- **densité** : `coupled_per_h` ;
+- **amplitude** : moyenne des `peak_amplitude_uv` des fuseaux couplés (`amp_coupled_uv`) et de tous les fuseaux (`amp_spindle_uv`).
+
+La moyenne arithmétique d'angles est invalide (discontinuité en ±π) : c'est pourquoi la statistique circulaire est obligatoire ici. Si `pycircstat2` est absent, CESA calcule les mêmes estimateurs avec NumPy (approximation de Zar, 1999, éq. 27.4 pour le `p` de Rayleigh ; test V = `n R cos(θ̄)`) et indique `backend = numpy` dans la colonne correspondante.
+
+**Force permutée (`R_z`, optionnelle).** `R` croît mécaniquement avec le nombre d'événements. Sur demande, CESA tire 500 fois `n` phases à des instants aléatoires *à l'intérieur des cycles SO* (la forme non sinusoïdale de l'onde lente est conservée) et z-score le `R` observé. Colonnes `r_z` et `r_z_p`, absentes du CSV tant que l'option n'est pas cochée.
 
 ### 8.3 Sieste courte de 20 minutes
 
-Une sieste courte produit peu de N2/N3, donc peu de couples SO–fuseau. En dessous de **8 fuseaux couplés** (`MIN_COUPLED_EVENTS`), les effectifs sont exportés mais la phase préférée, `R` et le test de Rayleigh sont laissés vides, avec un avertissement explicite. Un `R` calculé sur quelques événements n'est pas interprétable.
+Une sieste courte produit peu de N2/N3, donc peu de couples SO–fuseau. En dessous de **8 fuseaux couplés** (`MIN_COUPLED_EVENTS`), les effectifs, pourcentages, densité et amplitudes sont exportés, mais la phase préférée, `R`, Rayleigh, le test V et `R_z` sont laissés vides, avec un avertissement explicite. Un `R` calculé sur quelques événements n'est pas interprétable.
 
-Colonnes exportées (`*_coupling.csv`) : `channel`, `n_so`, `n_spindle`, `n_coupled`, `preferred_phase_rad`, `preferred_phase_deg`, `resultant_length`, `rayleigh_z`, `rayleigh_p`, `backend`.
+Colonnes toujours exportées (`*_coupling.csv`) : `channel`, `n_so`, `n_spindle`, `n_coupled`, `pct_coupled_spindle`, `pct_coupled_so`, `coupled_per_h`, `amp_coupled_uv`, `amp_spindle_uv`, `preferred_phase_rad`, `preferred_phase_deg`, `resultant_length`, `rayleigh_z`, `rayleigh_p`, `v_stat`, `v_p`, `backend`. Colonnes optionnelles : `r_z`, `r_z_p`.
 
 ### 8.4 Traitement en lot multi-sujets
 
@@ -215,17 +224,31 @@ Sorties dans le dossier choisi :
 
 La colonne `group` reprend le marquage AVANT/APRÈS de l'onglet *Fichiers*, déduit du nom de fichier (`_AV`/`_AP`, `pre`/`post`, `nap1`/`nap2`…) et modifiable à la main. Elle prépare la comparaison de conditions.
 
-Le fichier d'événements est utile pour refaire des statistiques circulaires au niveau du groupe : la phase préférée d'un sujet ne se moyenne pas comme un nombre, et comparer deux conditions demande un test circulaire (Watson-Williams par exemple), pas un test de Wilcoxon. Les tests appariés de `CESA/group_analysis.py` sont linéaires et ne conviennent donc pas tels quels à des angles.
+Le fichier d'événements est utile pour refaire des statistiques circulaires au niveau du groupe : la phase préférée d'un sujet ne se moyenne pas comme un nombre, et comparer deux conditions demande un test circulaire, pas un test de Wilcoxon. Les tests appariés de `CESA/group_analysis.py` sont linéaires et ne conviennent donc pas tels quels à des angles. La comparaison AVANT/APRÈS fournie par CESA est le test de Rayleigh sur les différences angulaires appariées.
 
 Un enregistrement dont le scoring est introuvable n'est pas un échec : il est analysé sans restriction de stade et signalé par un avertissement (préfixé `!` dans le journal), distinct des erreurs de lecture.
 
-### 8.5 Références
+### 8.5 Figures (toutes optionnelles)
 
+Les figures coûteuses ne sont générées que si elles sont cochées dans les paramètres du lot ou de `Événements → Détecter micro-architecture…`.
+
+| Option | Figure | Lecture |
+|--------|--------|---------|
+| Figures circulaires | `plot_phase_rose` / `plot_group_phases` / `plot_phase_shift` (`CESA/coupling_plots.py`) | Rose des phases, points par sujet, décalage apparié APRÈS − AVANT |
+| Moyenne fuseau-verrouillée | `spindle_locked_average` + PETH (`CESA/coupling_event_plots.py`) | EEG z-normalisé ±2,5 s autour du pic du fuseau, overlay SO ; histogramme des pics relativement au creux |
+| TFR creux SO | `so_trough_tfr` | Spectrogramme 5–30 Hz, fenêtre 0,5 s, z-score vs baseline −2,0 à −1,5 s, SO superposée (Hahn et al. 2020) |
+
+En lot, TFR et moyennes sont un **grand average de cohorte par canal**, pas un PNG par fichier. Un échec de figure est un avertissement : le CSV n'est pas perdu.
+
+### 8.6 Références
+
+- Hahn, M. A. et al. (2020). **Slow oscillation-spindle coupling predicts enhanced memory formation from childhood to adolescence**. *eLife*.
+- Helfrich, R. F. et al. (2018). **Old brains come uncoupled in sleep**. *Neuron*.
 - Staresina, B. P. (2024). **Coupled sleep rhythms for memory consolidation**. *Trends in Cognitive Sciences*.
-- Sejnowski, T. J., & Destexhe, A. (2000). **Why do we sleep?** *Brain Research*, 886(1-2).
+- Zhang, J. et al. (2024). **Does slow oscillation-spindle coupling contribute to sleep-dependent memory consolidation? A Bayesian meta-analysis**. *bioRxiv*.
 - Zar, J. H. (1999). **Biostatistical Analysis** (4e éd.), chapitre 27 : statistiques circulaires.
 
 ---
 
-*CESA – méthodes statistiques & indicateurs (pré-release 0.0beta2.0)*
+*CESA – méthodes statistiques & indicateurs (pré-release 0.0beta2.1)*
 

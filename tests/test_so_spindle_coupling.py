@@ -70,6 +70,13 @@ class TestCircularPhaseStats:
         stats = sc.circular_phase_stats(angles)
         assert stats["resultant_length"] < 0.05
         assert stats["rayleigh_p"] > 0.5
+        assert stats["v_p"] > 0.2
+
+    def test_v_test_detects_upstate_clustering(self):
+        angles = np.full(30, 0.05)
+        stats = sc.circular_phase_stats(angles)
+        assert stats["v_p"] < 0.001
+        assert stats["v_stat"] > 0.0
 
     def test_wraps_around_pi(self):
         # Angles straddling the +/-pi discontinuity: the circular mean must be
@@ -178,6 +185,11 @@ class TestCoupling:
         assert abs(row["preferred_phase_deg"]) < 30.0
         assert row["resultant_length"] > 0.6
         assert row["rayleigh_p"] < 0.001
+        assert row["v_p"] < 0.001
+        assert row["pct_coupled_spindle"] > 50.0
+        assert row["coupled_per_h"] > 0.0
+        assert row["amp_coupled_uv"] > 0.0
+        assert "r_z" not in result.stats.columns
 
     def test_uniform_offsets_give_weak_coupling(self):
         rng = np.random.default_rng(11)
@@ -218,7 +230,18 @@ class TestCoupling:
         assert row["n_coupled"] > 0
         assert np.isnan(row["preferred_phase_rad"])
         assert np.isnan(row["resultant_length"])
+        assert np.isnan(row["v_stat"])
         assert any("phase preferee non publiee" in w for w in result.warnings)
+
+    def test_permutation_z_score_is_optional(self):
+        signal, _ = synthetic_recording(seed=1)
+        result = sc.detect_so_spindle_coupling(
+            signal[None, :], SFREQ, ["Cz"], permute=True, n_perm=80,
+        )
+        row = result.stats.iloc[0]
+        assert list(result.stats.columns) == sc.STATS_COLUMNS + sc.PERM_STATS_COLUMNS
+        assert row["r_z"] > 1.5
+        assert row["r_z_p"] < 0.05
 
     def test_hypnogram_restricts_analysis(self):
         signal, _ = synthetic_recording(seed=1)
@@ -249,6 +272,42 @@ class TestCoupling:
         data = np.zeros((2, int(60 * SFREQ)))
         with pytest.raises(ValueError):
             sc.detect_so_spindle_coupling(data, SFREQ, ["Cz"])
+
+    def test_one_channel_matches_the_same_channel_in_a_stack(self):
+        """C3 analysed alone must match C3 analysed next to other channels."""
+        c3, _ = synthetic_recording(seed=1)
+        c4, _ = synthetic_recording(seed=2)
+        noise = np.random.default_rng(0).normal(0.0, 20.0, c3.size)
+        alone = sc.detect_so_spindle_coupling(c3[None, :], SFREQ, ["C3"])
+        together = sc.detect_so_spindle_coupling(
+            np.vstack([c3, c4, noise]), SFREQ, ["C3", "C4", "Fz"],
+        )
+        reordered = sc.detect_so_spindle_coupling(
+            np.vstack([c4, noise, c3]), SFREQ, ["C4", "Fz", "C3"],
+        )
+        row_a = alone.stats.iloc[0]
+
+        def _c3(result):
+            return result.stats[result.stats["channel"] == "C3"].iloc[0]
+
+        for other in (_c3(together), _c3(reordered)):
+            for col in sc.STATS_COLUMNS:
+                if col == "channel":
+                    continue
+                va, vt = row_a[col], other[col]
+                if pd.isna(va) and pd.isna(vt):
+                    continue
+                if isinstance(va, (float, np.floating)) or isinstance(vt, (float, np.floating)):
+                    assert va == pytest.approx(vt, rel=0, abs=1e-12), col
+                else:
+                    assert va == vt, col
+        from CESA.coupling_event_plots import event_indices_from_dicts
+
+        troughs_a, peaks_a = event_indices_from_dicts(alone.events, SFREQ, "C3")
+        for stacked in (together, reordered):
+            troughs_t, peaks_t = event_indices_from_dicts(stacked.events, SFREQ, "C3")
+            assert troughs_a == troughs_t
+            assert peaks_a == peaks_t
 
 
 class TestControllerCoupling:

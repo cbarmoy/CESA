@@ -1639,6 +1639,7 @@ class AppController:
         channels: Optional[Sequence[str]] = None,
         *,
         use_hypnogram: bool = True,
+        permute: bool = False,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """Classical SO-spindle coupling (filters + Hilbert + circular stats).
@@ -1696,6 +1697,7 @@ class AppController:
             result = run_coupling(
                 data, sfreq, eeg_chs,
                 hypno=hypno,
+                permute=permute,
                 progress_callback=progress_callback,
             )
         except Exception as exc:

@@ -25,14 +25,35 @@ _TYPE_TO_ANN = {
 
 _CLASSIC_KEYS = [
     "channel", "n_so", "n_spindle", "n_coupled",
-    "preferred_phase_deg", "preferred_phase_rad", "resultant_length",
-    "rayleigh_z", "rayleigh_p", "backend",
+    "pct_coupled_spindle", "pct_coupled_so", "coupled_per_h",
+    "amp_coupled_uv", "preferred_phase_deg", "resultant_length",
+    "rayleigh_p", "v_p", "r_z", "backend",
 ]
 _CLASSIC_HEADERS = [
     "Canal", "N SO", "N fuseaux", "N couples",
-    "Phase pref. (deg)", "Phase pref. (rad)", "R",
-    "Rayleigh z", "Rayleigh p", "Backend",
+    "% fuseaux", "% SO", "Couples/h",
+    "Amp. couplee", "Phase pref. (deg)", "R",
+    "Rayleigh p", "V p", "R_z", "Backend",
 ]
+_CLASSIC_HEADER_TIPS = [
+    "Canal analyse.",
+    "Nombre d'ondes lentes detectees (N2+N3).",
+    "Nombre de fuseaux detectes (N2).",
+    "Fuseaux dont le pic d'enveloppe tombe dans un cycle d'onde lente.",
+    "Pourcentage de fuseaux couples : n_coupled / n_spindle.",
+    "Pourcentage d'ondes lentes qui portent au moins un fuseau.",
+    "Densite de couples par heure d'enregistrement.",
+    "Amplitude moyenne (uV) des fuseaux couples, au pic d'enveloppe.",
+    "Phase preferée de l'onde lente au pic des fuseaux couples. "
+    "0° = up-state (pic positif), ±180° = creux.",
+    "Longueur du vecteur resultant (0 = phases uniformes, 1 = verrouillage parfait).",
+    "Test de Rayleigh : les phases s'ecartent-elles de l'uniforme ?",
+    "Test V : les phases se regroupent-elles autour de 0° (up-state attendu) ?",
+    "Force permutée : z-score de R contre des fuseaux places au hasard "
+    "dans les cycles SO. Absent si l'option n'a pas ete cochee.",
+    "Bibliotheque utilisee pour les stats circulaires (pycircstat2 ou numpy).",
+]
+_OPTIONAL_KEYS = {"r_z"}
 
 
 class MicroEventsDialog(QtWidgets.QDialog):
@@ -118,6 +139,62 @@ class MicroEventsDialog(QtWidgets.QDialog):
         )
         form.addRow("", self._chk_classic)
 
+        extra = QtWidgets.QHBoxLayout()
+        self._chk_perm = QtWidgets.QCheckBox("R_z permute")
+        self._chk_perm.setChecked(False)
+        self._chk_perm.setToolTip(
+            "Force du couplage corrigee du nombre d'evenements.\n"
+            "Compare R observe a 500 tirages de fuseaux places au hasard "
+            "dans les cycles d'onde lente (la forme de l'onde est conservee).\n"
+            "Decoche par defaut : allonge un peu le calcul.\n"
+            "Ajoute les colonnes r_z et r_z_p au tableau."
+        )
+        self._chk_circ = QtWidgets.QCheckBox("Figure phase")
+        self._chk_circ.setChecked(True)
+        self._chk_circ.setToolTip(
+            "Rose polaire des phases de l'onde lente relevees au pic des fuseaux.\n"
+            "0° = up-state (pic positif), ±180° = creux.\n"
+            "Disponible ensuite via le bouton « Figures couplage… », un canal a la fois."
+        )
+        self._chk_avg = QtWidgets.QCheckBox("Moyenne fuseau")
+        self._chk_avg.setChecked(False)
+        self._chk_avg.setToolTip(
+            "Moyenne de l'EEG (±2,5 s) alignee sur le pic des fuseaux, "
+            "avec l'onde lente superposee.\n"
+            "Calcule a l'ouverture de la figure, pour le canal choisi, "
+            "pas pendant la detection."
+        )
+        self._chk_tfr = QtWidgets.QCheckBox("TFR creux SO")
+        self._chk_tfr.setChecked(False)
+        self._chk_tfr.setToolTip(
+            "Spectrogramme 5–30 Hz aligne sur chaque creux d'onde lente "
+            "(baseline −2,0 a −1,5 s, comme Hahn 2020).\n"
+            "C'est le calcul le plus long. Un canal a la fois, "
+            "uniquement a l'ouverture de la figure."
+        )
+        extra.addWidget(self._chk_perm)
+        extra.addWidget(self._chk_circ)
+        extra.addWidget(self._chk_avg)
+        extra.addWidget(self._chk_tfr)
+        extra.addStretch(1)
+        sorties_lbl = QtWidgets.QLabel("Sorties couplage:")
+        sorties_lbl.setToolTip(
+            "Options en plus du tableau de stats, toujours calcule. "
+            "Survolez chaque case pour savoir ce qu'elle ajoute et ce qu'elle coute."
+        )
+        form.addRow(sorties_lbl, extra)
+        coupling_hint = QtWidgets.QLabel(
+            "Le tableau (pourcentages, densite, amplitude, test V) est toujours "
+            "calcule. Cochez ici uniquement ce que vous voulez en plus : R_z "
+            "allonge un peu la detection ; moyenne et TFR se calculent a "
+            "l'ouverture de « Figures couplage… ». Survolez une case pour le detail."
+        )
+        coupling_hint.setWordWrap(True)
+        coupling_hint.setStyleSheet("color: #A6ADC8; font-size: 11px;")
+        form.addRow("", coupling_hint)
+        self._chk_classic.toggled.connect(self._sync_coupling_options)
+        self._sync_coupling_options(self._chk_classic.isChecked())
+
         self._eeg_list = QtWidgets.QListWidget()
         self._eeg_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.MultiSelection
@@ -175,6 +252,14 @@ class MicroEventsDialog(QtWidgets.QDialog):
         self._btn_apply.setEnabled(False)
         self._btn_apply.clicked.connect(self._apply_to_viewer)
         btn_row.addWidget(self._btn_apply)
+        self._btn_figure = QtWidgets.QPushButton("Figures couplage...")
+        self._btn_figure.setEnabled(False)
+        self._btn_figure.setToolTip(
+            "Ouvre les figures cochees dans Sorties couplage "
+            "(phase, moyenne fuseau, TFR), canal par canal."
+        )
+        self._btn_figure.clicked.connect(self._show_coupling_figure)
+        btn_row.addWidget(self._btn_figure)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -211,6 +296,10 @@ class MicroEventsDialog(QtWidgets.QDialog):
 
         self._classic_table = QtWidgets.QTableWidget(0, len(_CLASSIC_HEADERS))
         self._classic_table.setHorizontalHeaderLabels(_CLASSIC_HEADERS)
+        for col, tip in enumerate(_CLASSIC_HEADER_TIPS):
+            item = self._classic_table.horizontalHeaderItem(col)
+            if item is not None:
+                item.setToolTip(tip)
         self._classic_table.horizontalHeader().setStretchLastSection(True)
         self._classic_table.setAlternatingRowColors(True)
         self._tabs.addTab(self._classic_table, "Phase preferee (classique)")
@@ -277,6 +366,7 @@ class MicroEventsDialog(QtWidgets.QDialog):
                 classic = self._ctrl.detect_so_spindle_coupling(
                     channels=eeg or None,
                     use_hypnogram=use_hypno,
+                    permute=self._chk_perm.isChecked(),
                     progress_callback=_report,
                 ) or {}
         except Exception as exc:
@@ -309,6 +399,11 @@ class MicroEventsDialog(QtWidgets.QDialog):
         has_data = bool(events) or bool(self._last_result["coupling"])
         self._btn_export.setEnabled(has_data)
         self._btn_apply.setEnabled(bool(events))
+        self._btn_figure.setEnabled(any(
+            (e.get("metadata") or {}).get("so_phase_rad") is not None
+            or (e.get("metadata") or {}).get("trough_s") is not None
+            for e in events
+        ))
 
         msg = f"{len(events)} evenement(s) detecte(s)."
         if self._last_result["used_hypnogram"]:
@@ -380,9 +475,59 @@ class MicroEventsDialog(QtWidgets.QDialog):
                 text = "" if val is None else str(val)
                 self._pac_table.setItem(i, col, QtWidgets.QTableWidgetItem(text))
 
+    def _sync_coupling_options(self, checked: bool) -> None:
+        for widget in (
+            self._chk_perm, self._chk_circ, self._chk_avg, self._chk_tfr,
+        ):
+            widget.setEnabled(bool(checked))
+
+    def _enabled_figures(self) -> set:
+        from CESA.qt_viewer.dialogs.coupling_plot_dialog import (
+            TYPE_AVERAGE, TYPE_PHASE, TYPE_TFR,
+        )
+
+        enabled = set()
+        if self._chk_circ.isChecked():
+            enabled.add(TYPE_PHASE)
+        if self._chk_avg.isChecked():
+            enabled.add(TYPE_AVERAGE)
+        if self._chk_tfr.isChecked():
+            enabled.add(TYPE_TFR)
+        return enabled
+
+    def _show_coupling_figure(self) -> None:
+        enabled = self._enabled_figures()
+        if not enabled:
+            QtWidgets.QMessageBox.information(
+                self, "Figures",
+                "Cochez au moins une figure dans Sorties couplage, "
+                "puis relancez la detection.",
+            )
+            return
+        events = self._last_result.get("events") or []
+        coupling = self._last_result.get("coupling") or []
+
+        def get_signal(channel: str):
+            derivations = getattr(self._ctrl, "derivations", {}) or {}
+            if channel not in derivations:
+                raise RuntimeError(f"canal '{channel}' absent de l'enregistrement")
+            return derivations[channel], float(self._ctrl.sfreq)
+
+        from CESA.qt_viewer.dialogs.coupling_plot_dialog import CouplingPlotDialog
+
+        dlg = CouplingPlotDialog(
+            self, events=events, coupling=coupling,
+            enabled=enabled, get_signal=get_signal,
+        )
+        dlg.exec()
+
     def _fill_classic_table(self, rows: List[Dict[str, Any]]) -> None:
         self._classic_table.setRowCount(0)
         self._classic_table.setRowCount(len(rows))
+        hide_optional = {
+            key: not any(key in row and row.get(key) is not None for row in rows)
+            for key in _OPTIONAL_KEYS
+        }
         for i, row in enumerate(rows):
             for col, key in enumerate(_CLASSIC_KEYS):
                 val = row.get(key, "")
@@ -391,6 +536,8 @@ class MicroEventsDialog(QtWidgets.QDialog):
                 else:
                     text = "" if val is None else str(val)
                 self._classic_table.setItem(i, col, QtWidgets.QTableWidgetItem(text))
+        for col, key in enumerate(_CLASSIC_KEYS):
+            self._classic_table.setColumnHidden(col, bool(hide_optional.get(key)))
 
     def _export_csv(self) -> None:
         if not self._last_result.get("events") and not self._last_result.get("coupling"):

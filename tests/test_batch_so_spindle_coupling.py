@@ -188,6 +188,28 @@ class TestBatchRunner:
         assert result.processed == 1
         assert seen[-1] == 100.0
 
+    def test_emits_file_scoring_and_channel_checkpoints(
+        self, tmp_path, monkeypatch, coupled_raw,
+    ):
+        epochs = int(DURATION_S // 30.0)
+        scoring = pd.DataFrame({
+            "time": [30.0 * i for i in range(epochs)],
+            "stage": ["N2"] * epochs,
+        })
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw}, scoring=scoring)
+        config = be.BatchCouplingConfig(output_dir=str(tmp_path), channels=["C3"])
+        messages: List[str] = []
+        be.run_batch_so_spindle_coupling(
+            ["nap1.edf"], config,
+            progress_cb=lambda _pct, msg: messages.append(msg),
+        )
+        text = "\n".join(messages)
+        assert "Chargement: nap1.edf" in text
+        assert "Scoring:" in text
+        assert "Couplage SO-fuseau: C3" in text
+        assert "fuseaux" in text
+        assert "couples" in text
+
     def test_no_file_writes_nothing(self, tmp_path, monkeypatch):
         _install_raw(monkeypatch, {})
         config = be.BatchCouplingConfig(output_dir=str(tmp_path))
@@ -224,3 +246,96 @@ class TestEventsExport:
         be.run_batch_so_spindle_coupling(["nap1.edf"], config)
 
         assert not (tmp_path / "nap1_coupling_events.csv").exists()
+
+
+class TestOptionalOutputs:
+    def test_figures_off_by_default(self, tmp_path, monkeypatch, coupled_raw):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"], include_scoring=False,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+        names = [p.replace("\\", "/").split("/")[-1] for p in result.outputs]
+        assert names == ["so_spindle_coupling_batch.csv"]
+        df = pd.read_csv(result.outputs[0])
+        assert "r_z" not in df.columns
+
+    def test_permutation_adds_columns(self, tmp_path, monkeypatch, coupled_raw):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"],
+            include_scoring=False, compute_permutation=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+        df = pd.read_csv(result.outputs[0])
+        assert "r_z" in df.columns
+        assert "r_z_p" in df.columns
+        assert df.iloc[0]["r_z"] == df.iloc[0]["r_z"]  # not NaN
+
+    def test_circular_figures_when_requested(self, tmp_path, monkeypatch, coupled_raw):
+        _install_raw(
+            monkeypatch,
+            {"S001_Av.edf": coupled_raw, "S001_Ap.edf": coupled_raw},
+        )
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"],
+            include_scoring=False, export_figures=True,
+        )
+        result = be.run_batch_so_spindle_coupling(
+            ["S001_Av.edf", "S001_Ap.edf"], config,
+            groups={"S001_Av.edf": "AVANT", "S001_Ap.edf": "APRES"},
+        )
+        names = [p.replace("\\", "/").split("/")[-1] for p in result.outputs]
+        assert "coupling_phases.png" in names
+
+    def test_failing_figure_does_not_fail_the_batch(
+        self, tmp_path, monkeypatch, coupled_raw,
+    ):
+        _install_raw(monkeypatch, {"nap1.edf": coupled_raw})
+
+        def boom(*_a, **_k):
+            raise RuntimeError("nope")
+
+        monkeypatch.setattr(
+            "CESA.coupling_plots.save_coupling_figures", boom, raising=True,
+        )
+        config = be.BatchCouplingConfig(
+            output_dir=str(tmp_path), channels=["C3"],
+            include_scoring=False, export_figures=True,
+        )
+        result = be.run_batch_so_spindle_coupling(["nap1.edf"], config)
+        assert result.processed == 1
+        assert result.failed == 0
+        assert any("figures circulaires" in w for w in result.warnings)
+        assert (tmp_path / "so_spindle_coupling_batch.csv").exists()
+
+
+class TestFFTCheckpoints:
+    def test_emits_load_scoring_channel_and_export(
+        self, tmp_path, monkeypatch,
+    ):
+        raw = DummyRaw({"C3": np.ones(2000)})
+        monkeypatch.setattr(be, "open_raw_file", lambda _path, **_k: raw)
+        monkeypatch.setattr(be, "find_scoring_sidecar", lambda _p: None)
+        monkeypatch.setattr(be, "resolve_scoring_for_file", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            be,
+            "compute_channel_psd_by_stage",
+            lambda *_a, **_k: {
+                "N2": (
+                    np.array([1.0]), np.array([0.1]), np.array([0.01]), 12,
+                ),
+            },
+        )
+        messages: List[str] = []
+        config = be.BatchFFTConfig(output_dir=str(tmp_path), include_scoring=True)
+        be.run_batch_fft(
+            ["nap1.edf"], ["C3"], config,
+            progress_cb=lambda _pct, msg: messages.append(msg),
+        )
+        text = "\n".join(messages)
+        assert "Chargement: nap1.edf" in text
+        assert "Scoring: aucun sidecar" in text
+        assert "FFT: nap1.edf - C3" in text
+        assert "Stades: N2:12" in text
+        assert "Export: nap1_C3_FFT.csv" in text

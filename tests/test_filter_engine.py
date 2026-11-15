@@ -311,6 +311,32 @@ class TestPresetLibrary:
         assert len(names) >= 5
         assert "EEG Standard PSG" in names
 
+    def test_comparison_band_presets_for_multifilter(self):
+        """Band presets for duplicate-channel scoring comparisons."""
+        presets_path = Path(__file__).resolve().parent.parent / "config" / "filter_presets.json"
+        if not presets_path.exists():
+            pytest.skip("Default presets JSON not found")
+        lib = PresetLibrary(presets_path)
+        expected = {
+            "Comparaison · Spindles (11-16 Hz)": (11.0, 16.0),
+            "Comparaison · Delta / SO (0.5-4 Hz)": (0.5, 4.0),
+            "Comparaison · Alpha (8-12 Hz)": (8.0, 12.0),
+            "Comparaison · Beta / eveil (15-30 Hz)": (15.0, 30.0),
+            "Comparaison · EOG REM (0.5-5 Hz)": (0.5, 5.0),
+            "Aucun Filtre": None,
+        }
+        for name, bands in expected.items():
+            p = lib.get(name)
+            assert p is not None, name
+            assert p.builtin
+            if bands is None:
+                assert p.pipeline.enabled is False or not p.pipeline.filters
+            else:
+                lo, hi = bands
+                bp = p.pipeline.filters[0]
+                assert bp.low_hz == pytest.approx(lo)
+                assert bp.high_hz == pytest.approx(hi)
+
     def test_add_get_remove(self):
         lib = PresetLibrary()
         p = FilterPreset(name="Test", pipeline=FilterPipeline(filters=[NotchFilter(freq_hz=50)]))
@@ -1030,26 +1056,27 @@ class TestVersioning:
 
     def test_cesa_init_version(self):
         import CESA
-        assert CESA.__version__ == "0.0beta2.0"
+        assert CESA.__version__ == "0.0beta2.1"
 
     def test_sleep_pipeline_version(self):
         import CESA.sleep_pipeline
-        assert CESA.sleep_pipeline.__version__ == "0.0beta2.0"
+        assert CESA.sleep_pipeline.__version__ == "0.0beta2.1"
 
     def test_run_docstring_version(self):
         run_path = Path(__file__).resolve().parent.parent / "run.py"
         content = run_path.read_text(encoding="utf-8")
-        assert "0.0beta2.0" in content
+        assert "0.0beta2.1" in content
 
     def test_requirements_version(self):
         req_path = Path(__file__).resolve().parent.parent / "requirements.txt"
         content = req_path.read_text(encoding="utf-8")
-        assert "CESA 0.0beta2.0" in content
+        assert "CESA 0.0beta2.1" in content
 
     def test_changelog_exists(self):
         cl_path = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
         assert cl_path.exists()
         content = cl_path.read_text(encoding="utf-8")
+        assert "[0.0beta2.1]" in content
         assert "[0.0beta2.0]" in content
 
 

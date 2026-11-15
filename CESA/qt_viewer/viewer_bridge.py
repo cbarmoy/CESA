@@ -162,6 +162,8 @@ class ViewerBridge:
 
     @filter_pipelines_by_channel.setter
     def filter_pipelines_by_channel(self, value: Dict[str, Any]) -> None:
+        # Merge: Tk / studio often only knows primary channel names. Replacing
+        # would wipe independent pipelines on display clones.
         self._win.set_filter_pipelines(value)
 
     @property

@@ -264,8 +264,19 @@ class ChannelStrip:
     def _get_filtered(
         self, s0: int, s1: int, raw_slice: np.ndarray,
     ) -> np.ndarray:
-        """Return filtered data for the window, using cache when valid."""
-        if not self._filter_enabled or self._pipeline is None:
+        """Return filtered data for the window, using cache when valid.
+
+        A pipeline with ``enabled=False`` or an empty filter list is treated as
+        raw (so a display clone can be explicitly unfiltered while the global
+        filter toggle stays on).
+        """
+        pipe = self._pipeline
+        if (
+            not self._filter_enabled
+            or pipe is None
+            or not bool(getattr(pipe, "enabled", True))
+            or not getattr(pipe, "filters", None)
+        ):
             return raw_slice
 
         if self._cache is not None:
@@ -274,7 +285,9 @@ class ChannelStrip:
                 return cached
 
         try:
-            filtered = self._pipeline.apply(raw_slice, self._sfreq)
+            # Copy the window so sosfiltfilt / nan_to_num never touch the
+            # shared full-night buffer used by sibling display clones.
+            filtered = pipe.apply(np.array(raw_slice, dtype=np.float64, copy=True), self._sfreq)
         except Exception:
             logger.debug("Filter apply failed for %s, returning raw", self.name)
             filtered = raw_slice

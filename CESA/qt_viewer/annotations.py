@@ -179,20 +179,43 @@ class AnnotationStore:
 # -----------------------------------------------------------------------
 
 class AnnotationOverlay:
-    """Draws annotation regions on a PlotItem."""
+    """Draws annotation regions on a PlotItem.
+
+    Sparse windows keep per-event regions (with ``ignoreBounds`` so they
+    never expand the Y range).  Dense windows (many spindles / REM bursts)
+    switch to a single batched path of thin ticks so the EEG stays readable.
+    """
+
+    _REGION_CAP = 80
+    _LABEL_CAP = 40
 
     def __init__(self, plot_item: pg.PlotItem, store: AnnotationStore) -> None:
         self._plot = plot_item
         self._store = store
-        self._items: Dict[str, pg.LinearRegionItem] = {}
+        self._items: Dict[str, Any] = {}
         self._labels: Dict[str, pg.TextItem] = {}
+        self._batch_items: List[Any] = []
+        self._last_mode: str = ""
         store.add_listener(self._on_store_changed)
+
+    @property
+    def graphics_item_count(self) -> int:
+        """Total overlay graphics items currently on the plot (tests)."""
+        return len(self._items) + len(self._labels) + len(self._batch_items)
 
     def update_visible(self, start_s: float, end_s: float) -> None:
         visible = self._store.in_range(start_s, end_s)
-        visible_ids = {a.id for a in visible}
+        dense = len(visible) > self._REGION_CAP
 
-        # Remove items no longer visible
+        if dense:
+            self._clear_per_event()
+            self._draw_batched(visible, start_s, end_s)
+            self._last_mode = "batch"
+            return
+
+        # Sparse: per-event regions
+        self._clear_batch()
+        visible_ids = {a.id for a in visible}
         for aid in list(self._items.keys()):
             if aid not in visible_ids:
                 self._plot.removeItem(self._items.pop(aid))
@@ -200,11 +223,11 @@ class AnnotationOverlay:
                 if lbl:
                     self._plot.removeItem(lbl)
 
-        # Add / update visible
+        show_labels = len(visible) <= self._LABEL_CAP
         for ann in visible:
             if ann.id not in self._items:
                 color = ann.effective_color()
-                brush = pg.mkBrush(color + "30")
+                brush = pg.mkBrush(color + "28")
                 region = pg.LinearRegionItem(
                     values=[ann.onset_s, ann.onset_s + ann.duration_s],
                     movable=False,
@@ -212,27 +235,83 @@ class AnnotationOverlay:
                     pen=pg.mkPen(color, width=1),
                 )
                 region.setZValue(-5)
-                self._plot.addItem(region)
+                self._plot.addItem(region, ignoreBounds=True)
                 self._items[ann.id] = region
 
-                if ann.text:
+                if show_labels and ann.text:
                     lbl = pg.TextItem(text=ann.text[:20], color=color, anchor=(0, 1))
                     lbl.setFont(QtGui.QFont("Segoe UI", 7))
                     lbl.setPos(ann.onset_s, 0)
-                    self._plot.addItem(lbl)
+                    self._plot.addItem(lbl, ignoreBounds=True)
                     self._labels[ann.id] = lbl
             else:
                 self._items[ann.id].setRegion(
                     [ann.onset_s, ann.onset_s + ann.duration_s]
                 )
+                if not show_labels:
+                    lbl = self._labels.pop(ann.id, None)
+                    if lbl:
+                        self._plot.removeItem(lbl)
+        self._last_mode = "sparse"
 
-    def clear(self) -> None:
+    def _draw_batched(
+        self,
+        visible: List[Annotation],
+        start_s: float,
+        end_s: float,
+    ) -> None:
+        """One path of thin vertical ticks + optional density strip per colour."""
+        self._clear_batch()
+        if not visible:
+            return
+
+        # Group by colour; build NaN-separated vertical segments at y=0..1
+        # (data coords — ignoreBounds keeps channel Y range intact).
+        by_color: Dict[str, List[Annotation]] = {}
+        for ann in visible:
+            by_color.setdefault(ann.effective_color(), []).append(ann)
+
+        for color, anns in by_color.items():
+            xs: List[float] = []
+            ys: List[float] = []
+            for ann in anns:
+                t0 = max(ann.onset_s, start_s)
+                t1 = min(ann.onset_s + max(ann.duration_s, 0.05), end_s)
+                if t1 <= t0:
+                    continue
+                # Thin vertical tick at onset + short top bar for duration
+                xs.extend([t0, t0, np.nan, t0, t1, np.nan])
+                ys.extend([0.0, 1.0, np.nan, 1.0, 1.0, np.nan])
+            if not xs:
+                continue
+            curve = pg.PlotDataItem(
+                x=np.asarray(xs, dtype=np.float64),
+                y=np.asarray(ys, dtype=np.float64),
+                pen=pg.mkPen(color, width=1.2),
+                connect="finite",
+                skipFiniteCheck=False,
+            )
+            curve.setZValue(-5)
+            self._plot.addItem(curve, ignoreBounds=True)
+            self._batch_items.append(curve)
+
+    def _clear_per_event(self) -> None:
         for item in self._items.values():
             self._plot.removeItem(item)
         for lbl in self._labels.values():
             self._plot.removeItem(lbl)
         self._items.clear()
         self._labels.clear()
+
+    def _clear_batch(self) -> None:
+        for item in self._batch_items:
+            self._plot.removeItem(item)
+        self._batch_items.clear()
+
+    def clear(self) -> None:
+        self._clear_per_event()
+        self._clear_batch()
+        self._last_mode = ""
 
     def _on_store_changed(self) -> None:
         pass  # will be refreshed on next update_visible call

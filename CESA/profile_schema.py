@@ -277,6 +277,10 @@ class DisplayProcessingProfile:
     filter_window: str = "hamming"
     channel_filter_params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     channel_filter_pipelines: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Display-only channel clones (independent filter/colour/label). Primaries
+    # keep ``trace_id == source_name``; clone pipelines live here, not in
+    # ``channel_filter_pipelines``, so legacy profiles stay compatible.
+    display_traces: List[Dict[str, Any]] = field(default_factory=list)
     scaling: ScalingConfig = field(default_factory=ScalingConfig)
     layout: LayoutConfig = field(default_factory=LayoutConfig)
     spectrogram: SpectrogramConfig = field(default_factory=SpectrogramConfig)
@@ -308,6 +312,7 @@ class DisplayProcessingProfile:
             "channel_filter_pipelines": {
                 str(ch): dict(cfg) for ch, cfg in self.channel_filter_pipelines.items()
             },
+            "display_traces": [dict(t) for t in (self.display_traces or [])],
             "scaling": self.scaling.to_dict(),
             "layout": self.layout.to_dict(),
             "spectrogram": self.spectrogram.to_dict(),
@@ -355,6 +360,10 @@ class DisplayProcessingProfile:
             channel_filter_pipelines={
                 str(k): dict(v) for k, v in (data.get("channel_filter_pipelines", {}) or {}).items()
             },
+            display_traces=[
+                dict(t) for t in (data.get("display_traces", []) or [])
+                if isinstance(t, dict)
+            ],
             scaling=ScalingConfig.from_dict(data.get("scaling", {})),
             layout=LayoutConfig.from_dict(data.get("layout", {})),
             spectrogram=SpectrogramConfig.from_dict(data.get("spectrogram", {})),

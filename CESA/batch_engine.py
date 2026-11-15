@@ -12,7 +12,7 @@ Public API:
     - :class:`BatchFFTConfig` / :func:`run_batch_fft`
     - :class:`BatchPSGConfig` / :func:`run_batch_psg`
     - :class:`BatchCouplingConfig` / :func:`run_batch_so_spindle_coupling`
-    - :func:`resolve_scoring_for_file`
+    - :func:`find_scoring_sidecar` / :func:`resolve_scoring_for_file`
     - :func:`compute_channel_psd_by_stage` / :func:`export_psd_results_to_csv`
 
 Auteur: Come Barmoy (Unite Neuropsychologie du Stress - IRBA)
@@ -25,7 +25,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,17 @@ StopCallback = Callable[[], bool]
 
 DEFAULT_STAGES: Tuple[str, ...] = ("W", "N1", "N2", "N3", "R")
 PSDResults = Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, int]]
+
+
+def _as_count(value: Any) -> int:
+    """Best-effort integer for checkpoint lines (NaN / None -> 0)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if number != number:
+        return 0
+    return int(number)
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +102,10 @@ class BatchCouplingConfig:
     include_scoring: bool = True
     min_coupled: Optional[int] = None
     export_events: bool = False
+    compute_permutation: bool = False
+    export_figures: bool = False
+    export_event_averages: bool = False
+    export_tfr: bool = False
     output_filename: str = "so_spindle_coupling_batch.csv"
 
 
@@ -111,6 +126,30 @@ class BatchResult:
 # ---------------------------------------------------------------------------
 
 _SCORING_SIDE_EXTENSIONS = (".csv", ".xlsx", ".xls", ".json")
+
+
+def find_scoring_sidecar(recording_path: str) -> Optional[str]:
+    """Return a scoring sidecar path if one exists, without reading it.
+
+    Same lookup as :func:`resolve_scoring_for_file` (same-stem ``.csv`` /
+    ``.xlsx`` / ``.xls`` / ``.json``, then ``*Hypnogram*.edf`` in the folder)
+    so the batch file list can flag missing hypnograms before a long run.
+    """
+    base = os.path.splitext(recording_path)[0]
+    for ext in _SCORING_SIDE_EXTENSIONS:
+        candidate = base + ext
+        if os.path.isfile(candidate):
+            return candidate
+    directory = os.path.dirname(recording_path) or "."
+    try:
+        import glob
+
+        hyps = sorted(glob.glob(os.path.join(directory, "*Hypnogram*.edf")))
+        if hyps:
+            return hyps[0]
+    except Exception:  # pragma: no cover
+        pass
+    return None
 
 
 def resolve_scoring_for_file(
@@ -279,43 +318,54 @@ def run_batch_fft(
 
     files = list(files)
     channels = list(channels)
-    total_ops = max(1, len(files) * len(channels))
+    n_files = len(files)
+    n_channels = len(channels)
+    total_ops = max(1, n_files * n_channels)
     op = 0
 
     def _emit(msg: str) -> None:
         if progress_cb is not None:
             progress_cb(min(100.0, op / total_ops * 100.0), msg)
 
-    for file_path in files:
+    for file_idx, file_path in enumerate(files):
         if should_stop is not None and should_stop():
             result.stopped = True
             break
         file_name = os.path.basename(file_path)
         try:
-            _emit(f"Chargement: {file_name}")
+            _emit(f"[{file_idx + 1}/{n_files}] Chargement: {file_name}")
             raw = open_raw_file(file_path, preload=True, verbose="ERROR")
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{file_name}: chargement echoue ({exc})")
-            op += len(channels)
+            op += n_channels
             continue
 
         duration_s = float(raw.n_times) / float(raw.info["sfreq"])
         scoring_df = None
         if config.include_scoring:
+            sidecar = find_scoring_sidecar(file_path)
             scoring_df = resolve_scoring_for_file(
                 file_path,
                 epoch_seconds=config.epoch_len,
                 recording_duration_s=duration_s,
             )
+            if scoring_df is not None:
+                side = f" ({os.path.basename(sidecar)})" if sidecar else ""
+                _emit(f"  Scoring: {len(scoring_df)} epoques{side}")
+            else:
+                _emit("  Scoring: aucun sidecar")
 
         base_name = os.path.splitext(file_name)[0]
-        for channel in channels:
+        for ch_idx, channel in enumerate(channels):
             if should_stop is not None and should_stop():
                 result.stopped = True
                 break
             op += 1
-            _emit(f"FFT: {file_name} - {channel}")
+            _emit(
+                f"  FFT: {file_name} - {channel} "
+                f"({ch_idx + 1}/{n_channels})"
+            )
             extracted = _channel_signal(raw, channel)
             if extracted is None:
                 result.failed += 1
@@ -330,6 +380,13 @@ def run_batch_fft(
                     )
                     result.failed += 1
                     continue
+                counts = " ".join(
+                    f"{stg}:{int(payload[3])}"
+                    for stg, payload in psd.items()
+                    if payload
+                )
+                if counts:
+                    _emit(f"    Stades: {counts}")
                 safe_channel = channel.replace("-", "_").replace("/", "_")
                 out_path = os.path.join(
                     config.output_dir, f"{base_name}_{safe_channel}_FFT.csv"
@@ -337,6 +394,7 @@ def run_batch_fft(
                 export_psd_results_to_csv(psd, out_path)
                 result.outputs.append(out_path)
                 result.processed += 1
+                _emit(f"    Export: {os.path.basename(out_path)}")
             except Exception as exc:
                 result.failed += 1
                 result.errors.append(f"{file_name}/{channel}: {exc}")
@@ -390,7 +448,8 @@ def run_batch_psg(
     os.makedirs(config.output_dir, exist_ok=True)
 
     files = list(files)
-    total = max(1, len(files))
+    n_files = len(files)
+    total = max(1, n_files)
     rows: List[Dict[str, object]] = []
 
     for idx, file_path in enumerate(files):
@@ -399,10 +458,15 @@ def run_batch_psg(
             break
         file_name = os.path.basename(file_path)
         if progress_cb is not None:
-            progress_cb(idx / total * 100.0, f"PSG: {file_name}")
+            progress_cb(
+                idx / total * 100.0,
+                f"[{idx + 1}/{n_files}] Chargement: {file_name}",
+            )
         try:
             rows.append(_psg_row_for_file(file_path, config))
             result.processed += 1
+            if progress_cb is not None:
+                progress_cb(idx / total * 100.0, f"  PSG: {file_name} OK")
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{file_name}: {exc}")
@@ -486,11 +550,15 @@ def _coupling_rows_for_file(
     config: BatchCouplingConfig,
     *,
     group: str = "",
+    plots: Optional[Any] = None,
+    progress_cb: Optional[ProgressCallback] = None,
+    progress_pct: float = 0.0,
 ) -> Tuple[List[Dict[str, object]], List[str]]:
     """Compute per-channel coupling rows for one recording.
 
     Returns ``(rows, warnings)``; the events CSV is written as a side effect
-    when :pyattr:`BatchCouplingConfig.export_events` is set.
+    when :pyattr:`BatchCouplingConfig.export_events` is set. *plots* is an
+    optional :class:`~CESA.coupling_event_plots.CohortEventPlots` accumulator.
     """
     from CESA.sleep_pipeline.micro_events import scoring_df_to_hypno
     from CESA.sleep_pipeline.so_spindle_coupling import (
@@ -506,13 +574,23 @@ def _coupling_rows_for_file(
 
     channels = _coupling_channels(raw, config.channels)
 
+    def _emit(msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(progress_pct, msg)
+
     scoring_df = None
     if config.include_scoring:
+        sidecar = find_scoring_sidecar(recording_path)
         scoring_df = resolve_scoring_for_file(
             recording_path,
             epoch_seconds=config.epoch_seconds,
             recording_duration_s=duration_s,
         )
+        if scoring_df is not None:
+            side = f" ({os.path.basename(sidecar)})" if sidecar else ""
+            _emit(f"  Scoring: {len(scoring_df)} epoques{side}")
+        else:
+            _emit("  Scoring: aucun sidecar")
 
     signals = []
     for channel in channels:
@@ -533,6 +611,8 @@ def _coupling_rows_for_file(
     )
     coupling = detect_so_spindle_coupling(
         data, sfreq, channels, hypno=hypno, min_coupled=min_coupled,
+        permute=bool(config.compute_permutation),
+        progress_callback=lambda msg: _emit(f"  {msg}"),
     )
 
     if config.export_events and coupling.events:
@@ -540,6 +620,21 @@ def _coupling_rows_for_file(
             config.output_dir, f"{base_name}_coupling_events.csv"
         )
         export_coupling_events_to_csv(coupling.events, events_path, file_name)
+
+    if plots is not None and (
+        config.export_tfr or config.export_event_averages
+    ):
+        from CESA.coupling_event_plots import event_indices_from_dicts
+
+        for i, channel in enumerate(channels):
+            troughs, peaks = event_indices_from_dicts(
+                coupling.events, sfreq, channel,
+            )
+            plots.add_recording(
+                channel, signals[i], sfreq, troughs, peaks,
+                want_tfr=bool(config.export_tfr),
+                want_averages=bool(config.export_event_averages),
+            )
 
     rows: List[Dict[str, object]] = []
     for record in coupling.stats.to_dict(orient="records"):
@@ -552,6 +647,12 @@ def _coupling_rows_for_file(
         }
         row.update(record)
         rows.append(row)
+        _emit(
+            f"  {record.get('channel', '?')}: "
+            f"{_as_count(record.get('n_so'))} SO, "
+            f"{_as_count(record.get('n_spindle'))} fuseaux, "
+            f"{_as_count(record.get('n_coupled'))} couples"
+        )
 
     warnings = [f"{file_name}: {w}" for w in coupling.warnings]
     if scoring_df is None and config.include_scoring:
@@ -581,17 +682,30 @@ def run_batch_so_spindle_coupling(
     files = list(files)
     total = max(1, len(files))
     rows: List[Dict[str, object]] = []
+    plots = None
+    if config.export_tfr or config.export_event_averages:
+        from CESA.coupling_event_plots import CohortEventPlots
+
+        plots = CohortEventPlots()
 
     for idx, file_path in enumerate(files):
         if should_stop is not None and should_stop():
             result.stopped = True
             break
         file_name = os.path.basename(file_path)
+        pct = idx / total * 100.0
         if progress_cb is not None:
-            progress_cb(idx / total * 100.0, f"Couplage SO-fuseau: {file_name}")
+            progress_cb(
+                pct,
+                f"[{idx + 1}/{len(files)}] Chargement: {file_name}",
+            )
         try:
             file_rows, warnings = _coupling_rows_for_file(
-                file_path, config, group=(groups or {}).get(file_path, ""),
+                file_path, config,
+                group=(groups or {}).get(file_path, ""),
+                plots=plots,
+                progress_cb=progress_cb,
+                progress_pct=pct,
             )
         except Exception as exc:
             result.failed += 1
@@ -602,9 +716,36 @@ def run_batch_so_spindle_coupling(
         result.processed += 1
 
     if rows:
+        table = pd.DataFrame(rows)
         out_path = os.path.join(config.output_dir, config.output_filename)
-        pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
+        table.to_csv(out_path, index=False, encoding="utf-8")
         result.outputs.append(out_path)
+        if config.export_figures:
+            if progress_cb is not None:
+                progress_cb(100.0, "Figures circulaires")
+            try:
+                from CESA.coupling_plots import save_coupling_figures
+
+                for figure in save_coupling_figures(table, config.output_dir):
+                    result.outputs.append(figure)
+            except Exception as exc:
+                message = f"figures circulaires non generees: {exc}"
+                result.warnings.append(message)
+                logger.error(message)
+        if plots is not None:
+            if progress_cb is not None:
+                progress_cb(100.0, "Figures temporelles")
+            try:
+                for figure in plots.save(
+                    config.output_dir,
+                    tfr=bool(config.export_tfr),
+                    averages=bool(config.export_event_averages),
+                ):
+                    result.outputs.append(figure)
+            except Exception as exc:
+                message = f"figures temporelles non generees: {exc}"
+                result.warnings.append(message)
+                logger.error(message)
 
     if progress_cb is not None:
         progress_cb(100.0, "Termine" if not result.stopped else "Arrete")

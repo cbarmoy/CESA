@@ -100,22 +100,38 @@ except Exception:
 
 
 class _ChannelListWidget(QtWidgets.QWidget):
-    """Left sidebar: channel visibility checkboxes, reorder, gain slider."""
+    """Left sidebar: channel visibility checkboxes, reorder, gain slider.
+
+    Each row stores ``trace_id`` in ``Qt.UserRole`` so display clones can
+    share a source while keeping independent labels / colours.
+    """
 
     channel_visibility_changed = QtCore.Signal()
     gain_changed = QtCore.Signal(str, float)
     all_gain_changed = QtCore.Signal(float)
     order_changed = QtCore.Signal(list)
+    duplicate_requested = QtCore.Signal(str)  # trace_id
+    remove_requested = QtCore.Signal(str)  # trace_id (clones only)
+    color_requested = QtCore.Signal(str)  # trace_id
+    rename_requested = QtCore.Signal(str)  # trace_id
+
+    _ROLE_TRACE_ID = int(QtCore.Qt.ItemDataRole.UserRole)
+    _ROLE_SOURCE = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+    _ROLE_IS_CLONE = int(QtCore.Qt.ItemDataRole.UserRole) + 2
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(200)
+        self.setFixedWidth(220)
 
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(4, 4, 4, 4)
 
         lbl = QtWidgets.QLabel("Canaux")
         lbl.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Weight.Bold))
+        lbl.setToolTip(
+            "Clic droit ou boutons ci-dessous : Dupliquer un canal pour lui "
+            "appliquer un filtre / une couleur differents (comparaison)."
+        )
         main.addWidget(lbl)
 
         self._list = QtWidgets.QListWidget()
@@ -123,7 +139,36 @@ class _ChannelListWidget(QtWidgets.QWidget):
         self._list.model().rowsMoved.connect(self._on_rows_moved)
         # Pas de focus clavier par défaut : évite ↑/↓ et lettres qui changent de canal.
         self._list.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        self._list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._on_context_menu)
         main.addWidget(self._list, stretch=1)
+
+        # Explicit actions — duplication was easy to miss (context-menu only).
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(4)
+        self._btn_dup = QtWidgets.QPushButton("Dupliquer")
+        self._btn_dup.setToolTip(
+            "Cree une 2e vue du canal selectionne (meme signal, filtre/couleur independants)."
+        )
+        self._btn_dup.clicked.connect(self._on_dup_clicked)
+        actions.addWidget(self._btn_dup)
+        self._btn_color = QtWidgets.QPushButton("Couleur")
+        self._btn_color.setToolTip("Change la couleur de la trace selectionnee.")
+        self._btn_color.clicked.connect(self._on_color_clicked)
+        actions.addWidget(self._btn_color)
+        main.addLayout(actions)
+
+        actions2 = QtWidgets.QHBoxLayout()
+        actions2.setSpacing(4)
+        self._btn_rename = QtWidgets.QPushButton("Renommer")
+        self._btn_rename.setToolTip("Libelle d'affichage (ex. C3 · Spindles).")
+        self._btn_rename.clicked.connect(self._on_rename_clicked)
+        actions2.addWidget(self._btn_rename)
+        self._btn_remove_clone = QtWidgets.QPushButton("Suppr. copie")
+        self._btn_remove_clone.setToolTip("Supprime uniquement une copie (pas le canal source).")
+        self._btn_remove_clone.clicked.connect(self._on_remove_clicked)
+        actions2.addWidget(self._btn_remove_clone)
+        main.addLayout(actions2)
 
         # Global gain slider
         gain_frame = QtWidgets.QGroupBox("Gain global")
@@ -158,35 +203,97 @@ class _ChannelListWidget(QtWidgets.QWidget):
         main.addWidget(space_frame)
 
         self._channels: List[str] = []
+        self._item_changed_connected = False
 
     def set_channels(self, names: List[str], types: Dict[str, str]) -> None:
+        """Legacy: one primary row per source name."""
+        traces = [
+            {"trace_id": n, "source_name": n, "label": n, "color": None, "is_clone": False}
+            for n in names
+        ]
+        self.set_traces(traces, types)
+
+    def set_traces(
+        self,
+        traces: List[Dict[str, Any]],
+        types: Dict[str, str],
+    ) -> None:
+        """Populate from display traces (``trace_id`` / ``label`` / ``source_name``)."""
+        self._list.blockSignals(True)
         self._list.clear()
-        self._channels = list(names)
-        for name in names:
-            item = QtWidgets.QListWidgetItem(name)
+        self._channels = [str(t.get("trace_id", "")) for t in traces]
+        for t in traces:
+            tid = str(t.get("trace_id", ""))
+            source = str(t.get("source_name", tid))
+            label = str(t.get("label", tid) or tid)
+            is_clone = bool(t.get("is_clone", tid != source))
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(self._ROLE_TRACE_ID, tid)
+            item.setData(self._ROLE_SOURCE, source)
+            item.setData(self._ROLE_IS_CLONE, is_clone)
             item.setFlags(
                 item.flags()
                 | QtCore.Qt.ItemFlag.ItemIsUserCheckable
                 | QtCore.Qt.ItemFlag.ItemIsDragEnabled
             )
-            item.setCheckState(QtCore.Qt.CheckState.Checked)
-            ch_type = types.get(name, "eeg")
-            color_key = CHANNEL_TYPE_COLORS.get(ch_type, "eeg_color")
-            color = DARK.get(color_key, "#89B4FA")
+            checked = t.get("visible", True)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+            )
+            custom = t.get("color")
+            if custom:
+                color = str(custom)
+            else:
+                ch_type = types.get(source, types.get(tid, "eeg"))
+                color_key = CHANNEL_TYPE_COLORS.get(ch_type, "eeg_color")
+                color = DARK.get(color_key, "#89B4FA")
             item.setForeground(QtGui.QColor(color))
+            tip = f"Source: {source}" if is_clone else source
+            item.setToolTip(tip)
             self._list.addItem(item)
-        self._list.itemChanged.connect(self._on_item_changed)
+        self._list.blockSignals(False)
+        if not self._item_changed_connected:
+            self._list.itemChanged.connect(self._on_item_changed)
+            self._item_changed_connected = True
 
     def visible_channels(self) -> List[str]:
+        """Checked *trace_id*s."""
         out: List[str] = []
         for i in range(self._list.count()):
             item = self._list.item(i)
             if item and item.checkState() == QtCore.Qt.CheckState.Checked:
-                out.append(item.text())
+                tid = item.data(self._ROLE_TRACE_ID)
+                out.append(str(tid) if tid else item.text())
         return out
 
     def channel_order(self) -> List[str]:
-        return [self._list.item(i).text() for i in range(self._list.count())]
+        """Ordered *trace_id*s."""
+        out: List[str] = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is None:
+                continue
+            tid = item.data(self._ROLE_TRACE_ID)
+            out.append(str(tid) if tid else item.text())
+        return out
+
+    def refresh_from_viewer_traces(
+        self,
+        traces: List[Any],
+        types: Dict[str, str],
+    ) -> None:
+        """Sync sidebar from ``DisplayTrace`` objects without losing order."""
+        payload = []
+        for tr in traces:
+            payload.append({
+                "trace_id": tr.trace_id,
+                "source_name": tr.source_name,
+                "label": tr.label,
+                "color": tr.color,
+                "visible": tr.visible,
+                "is_clone": tr.is_clone,
+            })
+        self.set_traces(payload, types)
 
     @property
     def spacing_slider(self) -> QtWidgets.QSlider:
@@ -206,6 +313,67 @@ class _ChannelListWidget(QtWidgets.QWidget):
 
     def _on_rows_moved(self, *_args) -> None:
         self.order_changed.emit(self.channel_order())
+
+    def _selected_trace_id(self) -> Optional[str]:
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        tid = item.data(self._ROLE_TRACE_ID)
+        return str(tid) if tid else item.text()
+
+    def _selected_is_clone(self) -> bool:
+        item = self._list.currentItem()
+        if item is None:
+            return False
+        return bool(item.data(self._ROLE_IS_CLONE))
+
+    def _on_dup_clicked(self) -> None:
+        tid = self._selected_trace_id()
+        if tid:
+            self.duplicate_requested.emit(tid)
+
+    def _on_color_clicked(self) -> None:
+        tid = self._selected_trace_id()
+        if tid:
+            self.color_requested.emit(tid)
+
+    def _on_rename_clicked(self) -> None:
+        tid = self._selected_trace_id()
+        if tid:
+            self.rename_requested.emit(tid)
+
+    def _on_remove_clicked(self) -> None:
+        tid = self._selected_trace_id()
+        if tid and self._selected_is_clone():
+            self.remove_requested.emit(tid)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        self._list.setCurrentItem(item)
+        tid = item.data(self._ROLE_TRACE_ID) or item.text()
+        is_clone = bool(item.data(self._ROLE_IS_CLONE))
+        menu = QtWidgets.QMenu(self)
+        act_dup = menu.addAction("Dupliquer (comparaison)")
+        act_color = menu.addAction("Couleur…")
+        act_rename = menu.addAction("Renommer…")
+        act_remove = None
+        if is_clone:
+            menu.addSeparator()
+            act_remove = menu.addAction("Supprimer la copie")
+        chosen = menu.exec(self._list.mapToGlobal(pos))
+        if chosen is None:
+            return
+        tid_s = str(tid)
+        if chosen is act_dup:
+            self.duplicate_requested.emit(tid_s)
+        elif chosen is act_color:
+            self.color_requested.emit(tid_s)
+        elif chosen is act_rename:
+            self.rename_requested.emit(tid_s)
+        elif act_remove is not None and chosen is act_remove:
+            self.remove_requested.emit(tid_s)
 
 
 class EEGViewerMainWindow(QtWidgets.QMainWindow):
@@ -250,7 +418,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("CESA (Complex EEG Studio Analysis) v0.0beta2.0")
+        self.setWindowTitle("CESA (Complex EEG Studio Analysis) v0.0beta2.1")
         self.resize(1500, 900)
         self.setMinimumSize(900, 500)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
@@ -775,17 +943,23 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._viewer.set_total_duration(total)
         self._nav.set_total_duration(total)
 
-        # Channel list sidebar
-        self._channel_list.set_channels(list(signals.keys()), self._channel_types)
-
-        # Signals
+        # Signals (creates primary display traces)
         self._viewer.set_signals(signals)
+
+        # Restore display clones / overrides from active profile
+        self._restore_display_traces_from_profile(filter_pipelines)
+
+        # Channel list sidebar (includes clones)
+        self._sync_channel_list_from_viewer()
 
         # Feed signals to sync cursor for hover values
         self._sync_cursor.set_signals(signals)
 
-        # Filters
-        self._viewer.set_filter_pipelines(filter_pipelines)
+        # Filters (primaries + any clone pipelines already restored)
+        pipelines = dict(self._viewer._pipelines)
+        for k, v in (filter_pipelines or {}).items():
+            pipelines.setdefault(k, v)
+        self._viewer.set_filter_pipelines(pipelines, replace=True)
         self._viewer.set_global_filter_enabled(global_filter_enabled)
         self._nav._btn_filter.setChecked(global_filter_enabled)
         self._refresh_filter_dashboard()
@@ -897,6 +1071,10 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._channel_list.all_gain_changed.connect(self._on_global_gain)
         self._channel_list.order_changed.connect(self._on_order)
         self._channel_list.spacing_slider.valueChanged.connect(self._on_spacing)
+        self._channel_list.duplicate_requested.connect(self._on_duplicate_trace)
+        self._channel_list.remove_requested.connect(self._on_remove_trace)
+        self._channel_list.color_requested.connect(self._on_trace_color)
+        self._channel_list.rename_requested.connect(self._on_trace_rename)
 
         self._install_navigation_shortcuts()
 
@@ -1809,6 +1987,92 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
         self._channel_list.spacing_label.setText(str(value))
         self._viewer.set_spacing(float(value))
 
+    def _sync_channel_list_from_viewer(self) -> None:
+        """Refresh sidebar rows from viewer display traces."""
+        self._channel_list.refresh_from_viewer_traces(
+            self._viewer.get_traces(),
+            self._channel_types,
+        )
+
+    def _persist_display_traces(self) -> None:
+        """Write display clones into the active profile (if any)."""
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        try:
+            p = getattr(ctrl, "active_profile", None)
+            if p is None:
+                return
+            traces = self._viewer.get_traces()
+            payload = []
+            for tr in traces:
+                d = tr.to_dict()
+                pipe = self._viewer._pipelines.get(tr.trace_id)
+                if pipe is not None and hasattr(pipe, "to_dict"):
+                    try:
+                        d["filter_pipeline"] = pipe.to_dict()
+                    except Exception:
+                        pass
+                payload.append(d)
+            p.display_traces = payload
+            ctrl.save_active_profile()
+        except Exception:
+            logger.debug("persist display_traces failed", exc_info=True)
+
+    def _on_duplicate_trace(self, trace_id: str) -> None:
+        new_id = self._viewer.duplicate_trace(trace_id)
+        if new_id is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Dupliquer",
+                "Impossible de dupliquer ce canal.\n"
+                "Selectionnez un canal dans la liste de gauche, puis Dupliquer.",
+            )
+            return
+        self._sync_channel_list_from_viewer()
+        self._persist_display_traces()
+        # Select the new clone in the sidebar for immediate filter/colour edits
+        for i in range(self._channel_list._list.count()):
+            item = self._channel_list._list.item(i)
+            if item and str(item.data(self._channel_list._ROLE_TRACE_ID)) == new_id:
+                self._channel_list._list.setCurrentItem(item)
+                break
+        tr = next((t for t in self._viewer.get_traces() if t.trace_id == new_id), None)
+        label = tr.label if tr else new_id
+        self._status.showMessage(
+            f"Copie creee : {label} — changez son filtre (menu Filtres) "
+            f"et/ou sa couleur. Le canal source est inchange.",
+            8000,
+        )
+
+    def _on_remove_trace(self, trace_id: str) -> None:
+        if not self._viewer.remove_trace(trace_id):
+            return
+        self._sync_channel_list_from_viewer()
+        self._persist_display_traces()
+
+    def _on_trace_color(self, trace_id: str) -> None:
+        tr = next((t for t in self._viewer.get_traces() if t.trace_id == trace_id), None)
+        initial = QtGui.QColor(tr.color) if tr and tr.color else QtGui.QColor("#89B4FA")
+        color = QtWidgets.QColorDialog.getColor(initial, self, "Couleur du canal")
+        if not color.isValid():
+            return
+        self._viewer.set_trace_color(trace_id, color.name())
+        self._sync_channel_list_from_viewer()
+        self._persist_display_traces()
+
+    def _on_trace_rename(self, trace_id: str) -> None:
+        tr = next((t for t in self._viewer.get_traces() if t.trace_id == trace_id), None)
+        current = tr.label if tr else trace_id
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "Renommer", "Libelle d'affichage :", text=current,
+        )
+        if not ok:
+            return
+        self._viewer.set_trace_label(trace_id, text)
+        self._sync_channel_list_from_viewer()
+        self._persist_display_traces()
+
     # ------------------------------------------------------------------
     # Scoring toolbar + studio callbacks (Tk)
     # ------------------------------------------------------------------
@@ -1894,6 +2158,49 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             except Exception:
                 logger.debug("on_open_filter_config failed", exc_info=True)
 
+    def _restore_display_traces_from_profile(
+        self,
+        filter_pipelines: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Apply ``active_profile.display_traces`` after signals are loaded."""
+        ctrl = self._app_controller
+        if ctrl is None:
+            return
+        p = getattr(ctrl, "active_profile", None)
+        raw_list = getattr(p, "display_traces", None) if p is not None else None
+        if not raw_list:
+            # Still seed viewer pipelines from primaries
+            if filter_pipelines:
+                self._viewer.set_filter_pipelines(dict(filter_pipelines))
+            return
+        from .display_trace import DisplayTrace
+        try:
+            from CESA.filter_engine import FilterPipeline
+        except Exception:
+            FilterPipeline = None  # type: ignore[misc,assignment]
+
+        traces: List[DisplayTrace] = []
+        pipes: Dict[str, Any] = dict(filter_pipelines or {})
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            try:
+                tr = DisplayTrace.from_dict(item)
+            except Exception:
+                continue
+            if tr.source_name not in self._viewer._signals:
+                continue
+            traces.append(tr)
+            fp = item.get("filter_pipeline")
+            if fp and FilterPipeline is not None:
+                try:
+                    pipes[tr.trace_id] = FilterPipeline.from_dict(fp)
+                except Exception:
+                    pass
+        if traces:
+            self._viewer.set_traces(traces)
+            self._viewer.set_filter_pipelines(pipes)
+
     def _open_qt_filter_dialog(self) -> None:
         ctrl = self._app_controller
         if ctrl is None or ctrl.raw is None:
@@ -1902,36 +2209,112 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
 
         from .dialogs.filter_config_dialog import FilterConfigDialog
 
-        # Use the viewer's current signal names and types (which include
-        # wizard renames and user-assigned types) rather than raw MNE names.
+        # Include display clones so each strip can have its own pipeline.
         signals = dict(self._signals_data) if self._signals_data else ctrl.build_viewer_signals()
-        ch_names = list(signals.keys())
+        traces = self._viewer.get_traces()
+        if traces:
+            ch_names = [t.trace_id for t in traces]
+            ch_labels = {t.trace_id: t.label for t in traces}
+            ch_sources = {t.trace_id: t.source_name for t in traces}
+        else:
+            ch_names = list(signals.keys())
+            ch_labels = {n: n for n in ch_names}
+            ch_sources = {n: n for n in ch_names}
         ch_types = dict(self._channel_types) if self._channel_types else ctrl.channel_types_dict()
+        # Types keyed by source; also expose under trace_id for convenience
+        types_for_dialog = dict(ch_types)
+        for tid, src in ch_sources.items():
+            if tid not in types_for_dialog and src in ch_types:
+                types_for_dialog[tid] = ch_types[src]
+
+        current_pipes = dict(self._viewer._pipelines)
+        for ch, pipe in (ctrl.channel_filter_pipelines or {}).items():
+            current_pipes.setdefault(ch, pipe)
 
         def _on_apply(pipelines, global_enabled):
-            ctrl.channel_filter_pipelines = {
+            # Primaries (trace_id == source) stay on the controller profile key
+            primary = {
                 ch: pipe for ch, pipe in pipelines.items()
+                if ch_sources.get(ch, ch) == ch
             }
+            ctrl.channel_filter_pipelines = primary
             ctrl.filter_enabled = global_enabled
-            self._viewer.set_filter_pipelines(pipelines)
+            # replace=True: dialog lists every trace, including explicitly
+            # empty / disabled pipelines for "non filtre" clones.
+            self._viewer.set_filter_pipelines(pipelines, replace=True)
             self._viewer.set_global_filter_enabled(global_enabled)
             self._nav._btn_filter.setChecked(global_enabled)
             self._refresh_filter_dashboard()
-            ctrl.save_active_profile()
+            self._persist_display_traces()
             logger.info("[FILTERS] Applied %d pipelines, global=%s",
                         len(pipelines), global_enabled)
+
+        def _on_multi_view(source_name: str, recipe_id: str):
+            return self._apply_multi_view_recipe(source_name, recipe_id)
 
         dlg = FilterConfigDialog(
             self,
             channel_names=ch_names,
             sfreq=ctrl.sfreq,
-            channel_pipelines=ctrl.channel_filter_pipelines,
-            channel_types=ch_types,
+            channel_pipelines=current_pipes,
+            channel_types=types_for_dialog,
             signals=signals,
             global_enabled=ctrl.filter_enabled,
             on_apply=_on_apply,
+            channel_labels=ch_labels,
+            channel_sources=ch_sources,
+            on_multi_view=_on_multi_view,
         )
         dlg.exec()
+
+    def _apply_multi_view_recipe(
+        self,
+        source_name: str,
+        recipe_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply a literature multi-view recipe to one physical channel."""
+        from .multi_view_recipes import get_recipe
+
+        recipe = get_recipe(recipe_id)
+        if recipe is None:
+            return None
+        ids = self._viewer.apply_multi_view_recipe(source_name, recipe)
+        if not ids:
+            return None
+
+        # Keep controller primaries in sync
+        ctrl = self._app_controller
+        if ctrl is not None:
+            prim_pipe = self._viewer._pipelines.get(source_name)
+            if prim_pipe is not None:
+                ctrl.channel_filter_pipelines[source_name] = prim_pipe
+            ctrl.filter_enabled = True
+        self._viewer.set_global_filter_enabled(True)
+        self._nav._btn_filter.setChecked(True)
+
+        self._sync_channel_list_from_viewer()
+        self._persist_display_traces()
+        self._refresh_filter_dashboard()
+        self._status.showMessage(
+            f"Multi-vue « {recipe.title} » sur {source_name} "
+            f"({len(ids)} traces)",
+            6000,
+        )
+
+        labels = {t.trace_id: t.label for t in self._viewer.get_traces()}
+        sources = {t.trace_id: t.source_name for t in self._viewer.get_traces()}
+        types = dict(self._channel_types)
+        for tid, src in sources.items():
+            if tid not in types and src in self._channel_types:
+                types[tid] = self._channel_types[src]
+        return {
+            "channel_names": list(self._viewer.channel_names),
+            "channel_labels": labels,
+            "channel_sources": sources,
+            "channel_types": types,
+            "pipelines": dict(self._viewer._pipelines),
+            "primary_id": source_name if source_name in ids else ids[0],
+        }
 
     def _on_hypno_context_stage(self, onset_s: float, stage: str) -> None:
         fn = self._on_request_stage_at_epoch_time
@@ -2269,7 +2652,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             )
 
         file_name = _Path(session.file_path).name
-        self.setWindowTitle(f"CESA v0.0beta2.0 - {file_name}")
+        self.setWindowTitle(f"CESA v0.0beta2.1 - {file_name}")
         self._status.showMessage(f"Fichier charge : {file_name}", 5000)
 
         self._restore_scaling_state()
@@ -3181,7 +3564,7 @@ class EEGViewerMainWindow(QtWidgets.QMainWindow):
             self,
             "A propos de CESA",
             "<h3>CESA (Complex EEG Studio Analysis)</h3>"
-            "<p>Version 0.0beta2.0</p>"
+            "<p>Version 0.0beta2.1</p>"
             "<p>Auteur: Come Barmoy<br>"
             "Unite Neuropsychologie du Stress - IRBA</p>"
             "<p>Licence: MIT</p>",

@@ -52,11 +52,19 @@ MIN_COUPLED_EVENTS = 8
 # At least this much usable signal is needed to estimate detection thresholds.
 MIN_ANALYSIS_DURATION_S = 30.0
 
+# Surrogate draws used when the permutation z-score of R is requested.
+DEFAULT_N_PERM = 500
+
 STATS_COLUMNS: List[str] = [
     "channel", "n_so", "n_spindle", "n_coupled",
+    "pct_coupled_spindle", "pct_coupled_so", "coupled_per_h",
+    "amp_coupled_uv", "amp_spindle_uv",
     "preferred_phase_rad", "preferred_phase_deg", "resultant_length",
-    "rayleigh_z", "rayleigh_p", "backend",
+    "rayleigh_z", "rayleigh_p", "v_stat", "v_p", "backend",
 ]
+
+# Appended only when analyze_channel(..., permute=True).
+PERM_STATS_COLUMNS: List[str] = ["r_z", "r_z_p"]
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +147,15 @@ def wrap_to_pi(angle: float) -> float:
     return float((float(angle) + np.pi) % (2.0 * np.pi) - np.pi)
 
 
+def resultant_length(phases: Sequence[float]) -> float:
+    """Mean resultant length of *phases* in radians, or NaN if empty."""
+    angles = np.asarray(list(phases), dtype=float)
+    angles = angles[np.isfinite(angles)]
+    if angles.size == 0:
+        return float("nan")
+    return float(np.hypot(np.mean(np.cos(angles)), np.mean(np.sin(angles))))
+
+
 def _runs(flags: np.ndarray) -> List[Tuple[int, int]]:
     """Start/stop index pairs of contiguous ``True`` runs in *flags*."""
     if flags.size == 0:
@@ -162,12 +179,88 @@ def _circular_backend():
     return circ_mean_and_r, rayleigh_test
 
 
-def circular_phase_stats(phases: Sequence[float]) -> Dict[str, Any]:
-    """Preferred phase, resultant length and Rayleigh test over *phases* (rad).
+def _v_test_numpy(
+    mean_rad: float, r: float, n: int, hypothesized: float = 0.0,
+) -> Tuple[float, float]:
+    """V-test against *hypothesized* radians (Zar 1999).
 
-    Uses ``pycircstat2`` when installed and falls back to the equivalent
-    closed-form estimators otherwise; the backend used is reported so a result
-    is never silently computed by a different implementation than expected.
+    ``V = n R cos(mean - mu0)``; ``u = V * sqrt(2/n)``; ``p = 1 - Phi(u)``.
+    """
+    if n <= 0 or not np.isfinite(r) or not np.isfinite(mean_rad):
+        return float("nan"), float("nan")
+    from math import erfc
+
+    v_stat = float(n) * float(r) * float(np.cos(mean_rad - hypothesized))
+    u = v_stat * np.sqrt(2.0 / float(n))
+    p = 0.5 * float(erfc(u / np.sqrt(2.0)))
+    return float(v_stat), float(min(1.0, max(0.0, p)))
+
+
+def _v_test(angles: np.ndarray, hypothesized: float = 0.0) -> Tuple[float, float]:
+    """V-test of clustering around *hypothesized* radians (0 = SO up-state)."""
+    n = int(angles.size)
+    if n == 0:
+        return float("nan"), float("nan")
+    try:
+        from pycircstat2.hypothesis import V_test
+
+        res = V_test(angle=float(hypothesized), alpha=angles)
+        if np.isfinite(res.V) and np.isfinite(res.pval):
+            return float(res.V), float(res.pval)
+    except Exception:
+        pass
+    r = resultant_length(angles)
+    mean_rad = wrap_to_pi(float(np.arctan2(
+        np.mean(np.sin(angles)), np.mean(np.cos(angles)),
+    )))
+    return _v_test_numpy(mean_rad, r, n, hypothesized)
+
+
+def permute_resultant_length(
+    observed_r: float,
+    n: int,
+    candidate_phases: Sequence[float],
+    *,
+    n_perm: int = DEFAULT_N_PERM,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float]:
+    """Z-score of *observed_r* against random times inside SO cycles.
+
+    The null draws *n* phases from *candidate_phases* (SO-cycle samples), so
+    the surrogate keeps the non-uniform occupancy of the SO and only breaks
+    the spindle timing. Returns ``(r_z, r_z_p)``.
+    """
+    pool = np.asarray(list(candidate_phases), dtype=float)
+    pool = pool[np.isfinite(pool)]
+    if (
+        n <= 0
+        or pool.size < 2
+        or not np.isfinite(observed_r)
+        or int(n_perm) < 2
+    ):
+        return float("nan"), float("nan")
+    generator = rng if rng is not None else np.random.default_rng()
+    null = np.empty(int(n_perm), dtype=float)
+    for i in range(int(n_perm)):
+        draw = pool[generator.integers(0, pool.size, size=int(n))]
+        null[i] = resultant_length(draw)
+    mu = float(np.mean(null))
+    sd = float(np.std(null, ddof=1))
+    if sd <= 0.0:
+        return float("nan"), float("nan")
+    z = (float(observed_r) - mu) / sd
+    p = float(np.mean(null >= float(observed_r)))
+    return float(z), float(min(1.0, max(0.0, p)))
+
+
+def circular_phase_stats(phases: Sequence[float]) -> Dict[str, Any]:
+    """Preferred phase, resultant length, Rayleigh and V-test over *phases*.
+
+    The V-test asks whether the phases cluster around the SO up-state (0 rad),
+    which is the direction predicted by the coupling literature. Uses
+    ``pycircstat2`` when installed and falls back to the equivalent closed-form
+    estimators otherwise; the backend used is reported so a result is never
+    silently computed by a different implementation than expected.
     """
     angles = np.asarray(list(phases), dtype=float)
     angles = angles[np.isfinite(angles)]
@@ -179,6 +272,8 @@ def circular_phase_stats(phases: Sequence[float]) -> Dict[str, Any]:
         "resultant_length": float("nan"),
         "rayleigh_z": float("nan"),
         "rayleigh_p": float("nan"),
+        "v_stat": float("nan"),
+        "v_p": float("nan"),
         "backend": "none",
     }
     if n == 0:
@@ -190,11 +285,14 @@ def circular_phase_stats(phases: Sequence[float]) -> Dict[str, Any]:
         try:
             mean_angle, r = circ_mean_and_r(angles)
             res = rayleigh_test(r=float(r), n=n)
+            v_stat, v_p = _v_test(angles, hypothesized=0.0)
             out.update(
                 preferred_phase_rad=wrap_to_pi(mean_angle),
                 resultant_length=float(r),
                 rayleigh_z=float(res.z),
                 rayleigh_p=float(res.pval),
+                v_stat=v_stat,
+                v_p=v_p,
                 backend="pycircstat2",
             )
             out["preferred_phase_deg"] = float(
@@ -214,11 +312,15 @@ def circular_phase_stats(phases: Sequence[float]) -> Dict[str, Any]:
         np.sqrt(1.0 + 4.0 * n + 4.0 * (n * n - resultant * resultant))
         - (1.0 + 2.0 * n)
     ))
+    mean_rad = wrap_to_pi(np.arctan2(sin_m, cos_m))
+    v_stat, v_p = _v_test_numpy(mean_rad, r, n, hypothesized=0.0)
     out.update(
-        preferred_phase_rad=wrap_to_pi(np.arctan2(sin_m, cos_m)),
+        preferred_phase_rad=mean_rad,
         resultant_length=r,
         rayleigh_z=float(z),
         rayleigh_p=min(1.0, p),
+        v_stat=v_stat,
+        v_p=v_p,
         backend="numpy",
     )
     out["preferred_phase_deg"] = float(np.degrees(out["preferred_phase_rad"]))
@@ -398,9 +500,17 @@ def analyze_channel(
     so_band: Tuple[float, float] = SO_BAND_HZ,
     spindle_band: Tuple[float, float] = SPINDLE_BAND_HZ,
     min_coupled: int = MIN_COUPLED_EVENTS,
+    permute: bool = False,
+    n_perm: int = DEFAULT_N_PERM,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[List[ScoredEvent], Dict[str, Any]]:
-    """Detect SO + spindles on one channel and compute their coupling stats."""
-    sig = np.asarray(signal, dtype=float).ravel()
+    """Detect SO + spindles on one channel and compute their coupling stats.
+
+    *permute* adds ``r_z`` / ``r_z_p``, a z-score of R against random times
+    inside the detected SO cycles. Skip it when speed matters: the rest of
+    the table does not need a second pass over the signal.
+    """
+    sig = np.array(signal, dtype=float, copy=True).ravel()
     so_filtered = bandpass(sig, sfreq, *so_band)
     phase = so_phase(sig, sfreq, filtered=so_filtered)
 
@@ -422,6 +532,8 @@ def analyze_channel(
             resultant_length=float("nan"),
             rayleigh_z=float("nan"),
             rayleigh_p=float("nan"),
+            v_stat=float("nan"),
+            v_p=float("nan"),
         )
 
     coupled_so = {so_idx for so_idx, _ in coupled.values()}
@@ -465,13 +577,46 @@ def analyze_channel(
             metadata=meta,
         ))
 
-    row = {
+    n_so = len(slow_oscillations)
+    n_spindle = len(spindles)
+    hours = (float(sig.size) / float(sfreq) / 3600.0) if sfreq > 0 else 0.0
+    amps = [sp.peak_amplitude_uv for sp in spindles]
+    amp_coupled = [
+        spindles[i].peak_amplitude_uv for i in coupled
+    ]
+    row: Dict[str, Any] = {
         "channel": channel,
-        "n_so": len(slow_oscillations),
-        "n_spindle": len(spindles),
+        "n_so": n_so,
+        "n_spindle": n_spindle,
         "n_coupled": n_coupled,
+        "pct_coupled_spindle": (
+            round(100.0 * n_coupled / n_spindle, 2) if n_spindle else 0.0
+        ),
+        "pct_coupled_so": (
+            round(100.0 * len(coupled_so) / n_so, 2) if n_so else 0.0
+        ),
+        "coupled_per_h": round(n_coupled / hours, 2) if hours > 0 else 0.0,
+        "amp_coupled_uv": (
+            round(float(np.mean(amp_coupled)), 3) if amp_coupled else float("nan")
+        ),
+        "amp_spindle_uv": (
+            round(float(np.mean(amps)), 3) if amps else float("nan")
+        ),
         **stats,
     }
+    if permute:
+        if enough:
+            pool: List[float] = []
+            for so in slow_oscillations:
+                pool.extend(phase[so.start_idx:so.end_idx].tolist())
+            r_z, r_z_p = permute_resultant_length(
+                float(stats.get("resultant_length", float("nan"))),
+                n_coupled, pool, n_perm=n_perm, rng=rng,
+            )
+        else:
+            r_z = r_z_p = float("nan")
+        row["r_z"] = r_z
+        row["r_z_p"] = r_z_p
     return events, row
 
 
@@ -486,6 +631,8 @@ def detect_so_spindle_coupling(
     so_stages: Sequence[int] = SO_STAGES,
     spindle_stages: Sequence[int] = SPINDLE_STAGES,
     min_coupled: int = MIN_COUPLED_EVENTS,
+    permute: bool = False,
+    n_perm: int = DEFAULT_N_PERM,
     progress_callback: Optional[Any] = None,
 ) -> CouplingResult:
     """Run the classical SO-spindle coupling pipeline over all channels.
@@ -493,6 +640,7 @@ def detect_so_spindle_coupling(
     *data* is ``(n_channels, n_samples)`` in uV; *hypno* is the sample-level
     YASA-style hypnogram built by
     :func:`CESA.sleep_pipeline.micro_events.scoring_df_to_hypno`.
+    *permute* adds the surrogate z-score of R (see :func:`analyze_channel`).
     """
     arr = np.asarray(data, dtype=float)
     if arr.ndim == 1:
@@ -536,12 +684,14 @@ def detect_so_spindle_coupling(
             progress_callback(f"Couplage SO-fuseau: {name}...")
         try:
             events, row = analyze_channel(
-                arr[i], sfreq, name,
+                np.array(arr[i], dtype=float, copy=True), sfreq, name,
                 so_mask=so_mask,
                 spindle_mask=spindle_mask,
                 so_band=so_band,
                 spindle_band=spindle_band,
                 min_coupled=min_coupled,
+                permute=permute,
+                n_perm=n_perm,
             )
         except Exception as exc:
             logger.error("Coupling failed on %s: %s", name, exc, exc_info=True)
@@ -556,9 +706,10 @@ def detect_so_spindle_coupling(
                 f"(minimum {int(min_coupled)}); phase preferee non publiee."
             )
 
+    columns = STATS_COLUMNS + (PERM_STATS_COLUMNS if permute else [])
     result.stats = (
-        pd.DataFrame(rows)[STATS_COLUMNS] if rows
-        else pd.DataFrame(columns=STATS_COLUMNS)
+        pd.DataFrame(rows)[columns] if rows
+        else pd.DataFrame(columns=columns)
     )
     if "pycircstat2" in backends:
         result.backend = "pycircstat2"

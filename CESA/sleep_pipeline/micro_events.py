@@ -138,10 +138,41 @@ def _row_to_scored_event(
 def _summary_to_events(
     summary: Optional[pd.DataFrame],
     event_type: EventType,
+    *,
+    extra_meta: Optional[Dict[str, Any]] = None,
 ) -> List[ScoredEvent]:
     if summary is None or summary.empty:
         return []
-    return [_row_to_scored_event(row, event_type) for _, row in summary.iterrows()]
+    return [
+        _row_to_scored_event(row, event_type, extra_meta=extra_meta)
+        for _, row in summary.iterrows()
+    ]
+
+
+def _as_channel_stack(
+    data: np.ndarray, ch_names: Sequence[str],
+) -> Tuple[np.ndarray, List[str]]:
+    arr = np.asarray(data, dtype=np.float64)
+    names = list(ch_names)
+    if arr.ndim == 1:
+        arr = arr[np.newaxis, :]
+        names = names or ["EEG"]
+    if arr.shape[0] != len(names):
+        raise ValueError(
+            f"data channels ({arr.shape[0]}) != ch_names ({len(names)})"
+        )
+    return arr, names
+
+
+def _spindle_summary_for_channel(
+    spindle_summary: Optional[pd.DataFrame], channel: str,
+) -> Optional[pd.DataFrame]:
+    if spindle_summary is None or spindle_summary.empty:
+        return None
+    if "Channel" not in spindle_summary.columns:
+        return spindle_summary
+    subset = spindle_summary[spindle_summary["Channel"] == channel]
+    return subset if not subset.empty else None
 
 
 def detect_spindles(
@@ -152,31 +183,34 @@ def detect_spindles(
     include: Sequence[int] = (2,),
     **kwargs: Any,
 ) -> List[ScoredEvent]:
-    """Detect sleep spindles via YASA (data in µV, shape ``(n_ch, n_times)``)."""
+    """Detect sleep spindles via YASA (data in µV, shape ``(n_ch, n_times)``).
+
+    Each channel is run on its own so a channel analysed alone matches the
+    same channel analysed beside others.
+    """
     yasa = _require_yasa()
-    data = np.asarray(data, dtype=np.float64)
-    if data.ndim == 1:
-        data = data[np.newaxis, :]
-        ch_names = list(ch_names) or ["EEG"]
-    if data.shape[0] != len(ch_names):
-        raise ValueError(
-            f"data channels ({data.shape[0]}) != ch_names ({len(ch_names)})"
-        )
-    try:
-        res = yasa.spindles_detect(
-            data,
-            sf=float(sfreq),
-            ch_names=list(ch_names),
-            hypno=hypno,
-            include=tuple(include),
-            **kwargs,
-        )
-    except Exception as exc:
-        logger.error("spindles_detect failed: %s", exc, exc_info=True)
-        return []
-    if res is None:
-        return []
-    return _summary_to_events(res.summary(), EventType.SPINDLE)
+    data, names = _as_channel_stack(data, ch_names)
+    events: List[ScoredEvent] = []
+    for i, name in enumerate(names):
+        try:
+            res = yasa.spindles_detect(
+                np.array(data[i], dtype=np.float64, copy=True),
+                sf=float(sfreq),
+                ch_names=[name],
+                hypno=hypno,
+                include=tuple(include),
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.error("spindles_detect failed on %s: %s", name, exc, exc_info=True)
+            continue
+        if res is None:
+            continue
+        events.extend(_summary_to_events(
+            res.summary(), EventType.SPINDLE,
+            extra_meta={"detector": "yasa"},
+        ))
+    return events
 
 
 def detect_slow_waves(
@@ -190,37 +224,41 @@ def detect_slow_waves(
     spindle_summary: Optional[pd.DataFrame] = None,
     **kwargs: Any,
 ) -> List[ScoredEvent]:
-    """Detect slow waves; optionally compute SO–sigma PAC and co-occurrence."""
+    """Detect slow waves; optionally compute SO–sigma PAC and co-occurrence.
+
+    Channels are analysed one by one. Co-occurrence uses only spindles of
+    the same channel.
+    """
     yasa = _require_yasa()
-    data = np.asarray(data, dtype=np.float64)
-    if data.ndim == 1:
-        data = data[np.newaxis, :]
-        ch_names = list(ch_names) or ["EEG"]
-    if data.shape[0] != len(ch_names):
-        raise ValueError(
-            f"data channels ({data.shape[0]}) != ch_names ({len(ch_names)})"
-        )
-    try:
-        res = yasa.sw_detect(
-            data,
-            sf=float(sfreq),
-            ch_names=list(ch_names),
-            hypno=hypno,
-            include=tuple(include),
-            coupling=bool(coupling),
-            **kwargs,
-        )
-    except Exception as exc:
-        logger.error("sw_detect failed: %s", exc, exc_info=True)
-        return []
-    if res is None:
-        return []
-    if spindle_summary is not None and not spindle_summary.empty:
+    data, names = _as_channel_stack(data, ch_names)
+    events: List[ScoredEvent] = []
+    for i, name in enumerate(names):
         try:
-            res.find_cooccurring_spindles(spindle_summary)
+            res = yasa.sw_detect(
+                np.array(data[i], dtype=np.float64, copy=True),
+                sf=float(sfreq),
+                ch_names=[name],
+                hypno=hypno,
+                include=tuple(include),
+                coupling=bool(coupling),
+                **kwargs,
+            )
         except Exception as exc:
-            logger.warning("find_cooccurring_spindles failed: %s", exc)
-    return _summary_to_events(res.summary(), EventType.SLOW_WAVE)
+            logger.error("sw_detect failed on %s: %s", name, exc, exc_info=True)
+            continue
+        if res is None:
+            continue
+        local_spindles = _spindle_summary_for_channel(spindle_summary, name)
+        if local_spindles is not None:
+            try:
+                res.find_cooccurring_spindles(local_spindles)
+            except Exception as exc:
+                logger.warning("find_cooccurring_spindles failed on %s: %s", name, exc)
+        events.extend(_summary_to_events(
+            res.summary(), EventType.SLOW_WAVE,
+            extra_meta={"detector": "yasa"},
+        ))
+    return events
 
 
 def detect_rem_bursts(

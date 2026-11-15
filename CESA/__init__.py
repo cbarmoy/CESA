@@ -9,7 +9,9 @@ Ce package fournit les utilitaires modulaires utilisés par CESA :
 
 - filters / filter_engine : Filtrage composable (Bandpass, Notch, etc.)
 - scoring_io : Import scoring Excel/EDF+
-- sleep_pipeline : Scoring AASM avec ML/DL et HMM
+- sleep_pipeline : Scoring AASM, micro-architecture YASA, couplage SO-fuseau
+- coupling_plots / coupling_event_plots : Figures circulaires et event-locked
+- ica_cleaning : Nettoyage ICA en mémoire
 - theme : Thèmes UI professionnel (dark/light)
 - ui_dialogs : Dialogues d'interface spécialisés
 - entropy : Analyse d'entropie renormée (Issartel)
@@ -17,12 +19,12 @@ Ce package fournit les utilitaires modulaires utilisés par CESA :
 - user_assistant : Assistant utilisateur et aide contextuelle
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta2.0
-Date: 2026-07-20
+Version: 0.0beta2.1
+Date: 2026-11-13
 Licence: MIT
 """
 
-__version__ = "0.0beta2.0"
+__version__ = "0.0beta2.1"
 __author__ = "Côme Barmoy (IRBA)"
 __all__ = [
     "filters", "filter_engine", "scoring_io", "theme", "ui_dialogs",

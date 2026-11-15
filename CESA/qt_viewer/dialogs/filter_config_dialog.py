@@ -209,6 +209,9 @@ class FilterConfigDialog(QtWidgets.QDialog):
         signals: Optional[Dict[str, Signal]] = None,
         global_enabled: bool = True,
         on_apply: Optional[Callable[[Dict[str, FilterPipeline], bool], None]] = None,
+        channel_labels: Optional[Dict[str, str]] = None,
+        channel_sources: Optional[Dict[str, str]] = None,
+        on_multi_view: Optional[Callable[[str, str], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Configuration des Filtres - CESA")
@@ -220,7 +223,10 @@ class FilterConfigDialog(QtWidgets.QDialog):
         self._channel_types = channel_types or {}
         self._signals = signals or {}
         self._on_apply_cb = on_apply
+        self._on_multi_view_cb = on_multi_view
         self._global_enabled = global_enabled
+        self._channel_labels = channel_labels or {}
+        self._channel_sources = channel_sources or {}
 
         self._pipelines: Dict[str, FilterPipeline] = {}
         for ch in self._channel_names:
@@ -262,14 +268,37 @@ class FilterConfigDialog(QtWidgets.QDialog):
         top.addSpacing(16)
         top.addWidget(QtWidgets.QLabel("Preset:"))
         self._preset_combo = QtWidgets.QComboBox()
-        self._preset_combo.setMinimumWidth(180)
+        self._preset_combo.setMinimumWidth(260)
+        self._preset_combo.setToolTip(
+            "Presets « Comparaison · … » : bandes utiles pour un meme canal "
+            "duplique (spindles, delta, alpha…). Appliquer puis cliquer Appliquer."
+        )
         self._refresh_preset_list()
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
         top.addWidget(self._preset_combo)
         btn_apply_preset = QtWidgets.QPushButton("Appliquer preset")
+        btn_apply_preset.setToolTip(
+            "Charge le preset sur le canal selectionne (copie independante)."
+        )
         btn_apply_preset.clicked.connect(self._apply_preset)
         top.addWidget(btn_apply_preset)
+
+        self._btn_multi = QtWidgets.QPushButton("Multi-vue…")
+        self._btn_multi.setToolTip(
+            "Configure rapidement plusieurs vues du meme canal "
+            "(filtres, noms et couleurs) pour le scoring compare."
+        )
+        self._btn_multi.setEnabled(self._on_multi_view_cb is not None)
+        self._btn_multi.clicked.connect(self._open_multi_view_menu)
+        top.addWidget(self._btn_multi)
         top.addStretch()
         main_layout.addLayout(top)
+
+        self._preset_hint = QtWidgets.QLabel("")
+        self._preset_hint.setWordWrap(True)
+        self._preset_hint.setStyleSheet("color: #6C7086; font-size: 11px; padding: 0 4px;")
+        main_layout.addWidget(self._preset_hint)
+        self._on_preset_combo_changed(self._preset_combo.currentIndex())
 
         # Splitter: channel list | pipeline editor | preview
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
@@ -300,6 +329,14 @@ class FilterConfigDialog(QtWidgets.QDialog):
         btn_reset.clicked.connect(self._batch_reset)
         batch_lay.addWidget(btn_reset)
         left_lay.addWidget(batch_box)
+
+        tip = QtWidgets.QLabel(
+            "Astuce : pour une 2e vue libre du meme canal, "
+            "utilisez Multi-vue… ou Dupliquer dans la liste Canaux (a gauche du viewer)."
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #6C7086; font-size: 10px;")
+        left_lay.addWidget(tip)
 
         left.setMaximumWidth(280)
         splitter.addWidget(left)
@@ -391,13 +428,19 @@ class FilterConfigDialog(QtWidgets.QDialog):
         self._ch_list.clear()
         q = query.strip().lower()
         for ch in self._channel_names:
-            if q and q not in ch.lower():
+            label = self._channel_labels.get(ch, ch)
+            source = self._channel_sources.get(ch, ch)
+            hay = f"{label} {source} {ch}".lower()
+            if q and q not in hay:
                 continue
-            ctype = self._channel_types.get(ch, "?").upper()[:3]
+            ctype = self._channel_types.get(source, self._channel_types.get(ch, "?")).upper()[:3]
             pipe = self._pipelines.get(ch, FilterPipeline())
             n_active = sum(1 for f in pipe.filters if f.enabled) if pipe.enabled else 0
             badge = f" [{n_active}F]" if n_active else ""
-            self._ch_list.addItem(f"[{ctype}] {ch}{badge}")
+            disp = label if label == source else f"{label} ← {source}"
+            item = QtWidgets.QListWidgetItem(f"[{ctype}] {disp}{badge}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, ch)
+            self._ch_list.addItem(item)
         self._ch_list.blockSignals(False)
 
     def _filter_channel_list(self, text: str) -> None:
@@ -405,7 +448,8 @@ class FilterConfigDialog(QtWidgets.QDialog):
         self._populate_channel_list(text)
         if prev:
             for i in range(self._ch_list.count()):
-                if prev in (self._ch_list.item(i).text() or ""):
+                item = self._ch_list.item(i)
+                if item and item.data(QtCore.Qt.ItemDataRole.UserRole) == prev:
                     self._ch_list.setCurrentRow(i)
                     return
 
@@ -415,12 +459,23 @@ class FilterConfigDialog(QtWidgets.QDialog):
         item = self._ch_list.item(row)
         if item is None:
             return None
+        tid = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if tid and str(tid) in self._pipelines:
+            return str(tid)
         text = item.text()
-        # Format: "[TYP] name [nF]"  -- extract name between "] " and end/next "["
+        # Legacy format: "[TYP] name [nF]"
         try:
             after_bracket = text.split("] ", 1)[1]
             name = after_bracket.split(" [")[0].strip()
-            return name if name in self._pipelines else None
+            # Strip " ← source" suffix from display clones
+            if " ← " in name:
+                name = name.split(" ← ", 1)[0].strip()
+            if name in self._pipelines:
+                return name
+            for ch in self._channel_names:
+                if self._channel_labels.get(ch, ch) == name:
+                    return ch
+            return None
         except Exception:
             return None
 
@@ -455,7 +510,10 @@ class FilterConfigDialog(QtWidgets.QDialog):
 
         # Pipeline enabled toggle
         hdr = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel(f"Pipeline : {ch}")
+        label = self._channel_labels.get(ch, ch)
+        source = self._channel_sources.get(ch, ch)
+        title_txt = f"Pipeline : {label}" if label == source else f"Pipeline : {label} ({source})"
+        title = QtWidgets.QLabel(title_txt)
         title.setStyleSheet("font-weight: bold; font-size: 13px;")
         hdr.addWidget(title)
         hdr.addStretch()
@@ -559,7 +617,8 @@ class FilterConfigDialog(QtWidgets.QDialog):
 
         snippet: Optional[np.ndarray] = None
         fs = self._sfreq
-        sig = self._signals.get(ch)
+        source = self._channel_sources.get(ch, ch)
+        sig = self._signals.get(source) or self._signals.get(ch)
         if sig is not None:
             data_arr, fs = sig
             n = min(len(data_arr), int(fs * duration_s))
@@ -633,10 +692,35 @@ class FilterConfigDialog(QtWidgets.QDialog):
         if self._preset_lib is None:
             return
         try:
-            names = self._preset_lib.list_names()
-            self._preset_combo.addItems(names)
+            names = list(self._preset_lib.list_names())
+            # Put multi-filter comparison presets first for the duplicate-channel workflow
+            names.sort(
+                key=lambda n: (
+                    0 if str(n).startswith("Comparaison") else 1,
+                    0 if str(n).startswith("Aucun") else 1,
+                    str(n).lower(),
+                )
+            )
+            for name in names:
+                self._preset_combo.addItem(name)
+                preset = self._preset_lib.get(name)
+                if preset is not None and preset.description:
+                    idx = self._preset_combo.count() - 1
+                    self._preset_combo.setItemData(
+                        idx, preset.description, QtCore.Qt.ItemDataRole.ToolTipRole,
+                    )
         except Exception:
             pass
+
+    def _on_preset_combo_changed(self, index: int) -> None:
+        if not hasattr(self, "_preset_hint"):
+            return
+        if index < 0 or self._preset_lib is None:
+            self._preset_hint.setText("")
+            return
+        name = self._preset_combo.itemText(index)
+        preset = self._preset_lib.get(name)
+        self._preset_hint.setText(preset.description if preset and preset.description else "")
 
     def _apply_preset(self) -> None:
         if not self._preset_lib or not self._selected_channel:
@@ -649,6 +733,123 @@ class FilterConfigDialog(QtWidgets.QDialog):
         self._rebuild_pipeline_editor()
         self._schedule_preview()
         self._refresh_channel_badges()
+
+    # ------------------------------------------------------------------
+    # Multi-view (one channel, several filters)
+    # ------------------------------------------------------------------
+
+    def _open_multi_view_menu(self) -> None:
+        if self._on_multi_view_cb is None:
+            return
+        ch = self._selected_channel
+        if not ch:
+            QtWidgets.QMessageBox.information(
+                self, "Multi-vue", "Selectionnez d'abord un canal dans la liste.",
+            )
+            return
+
+        from CESA.qt_viewer.multi_view_recipes import recipes_for_channel_type
+
+        source = self._channel_sources.get(ch, ch)
+        ch_type = self._channel_types.get(
+            source, self._channel_types.get(ch, "eeg"),
+        )
+        recipes = recipes_for_channel_type(ch_type)
+        if not recipes:
+            recipes = recipes_for_channel_type("generic")
+
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #313244; color: #CDD6F4; border: 1px solid #585B70; }"
+            "QMenu::item:selected { background: #45475A; }"
+            "QMenu::separator { background: #585B70; height: 1px; }"
+        )
+        header = menu.addAction(f"Multi-vue pour {source}")
+        header.setEnabled(False)
+        menu.addSeparator()
+        for recipe in recipes:
+            act = menu.addAction(recipe.title)
+            act.setToolTip(recipe.description)
+            act.setData(recipe.recipe_id)
+
+        chosen = menu.exec(self._btn_multi.mapToGlobal(
+            self._btn_multi.rect().bottomLeft(),
+        ))
+        if chosen is None or not chosen.isEnabled():
+            return
+        recipe_id = chosen.data()
+        if not recipe_id:
+            return
+
+        # Confirm: replaces existing clones of this source
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Multi-vue",
+            f"Configurer « {source} » en multi-vue ?\n\n"
+            f"{chosen.text()}\n\n"
+            "Les copies existantes de ce canal seront remplacees. "
+            "Noms, couleurs et filtres seront appliques immediatement.",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            result = self._on_multi_view_cb(source, str(recipe_id))
+        except Exception as exc:
+            logger.exception("Multi-vue failed")
+            QtWidgets.QMessageBox.warning(
+                self, "Multi-vue", f"Echec de la configuration : {exc}",
+            )
+            return
+
+        if not result:
+            QtWidgets.QMessageBox.warning(
+                self, "Multi-vue", "Impossible d'appliquer cette multi-vue.",
+            )
+            return
+
+        self._reload_after_multi_view(result)
+        QtWidgets.QMessageBox.information(
+            self,
+            "Multi-vue",
+            f"Multi-vue appliquee sur {source} "
+            f"({len(result.get('channel_names', []))} traces).\n"
+            "Pensez a verifier l'aperçu, puis Fermer / Appliquer si besoin.",
+        )
+
+    def _reload_after_multi_view(self, state: Dict[str, Any]) -> None:
+        """Refresh dialog lists after the viewer created clones."""
+        names = list(state.get("channel_names") or [])
+        if not names:
+            return
+        self._channel_names = names
+        self._channel_labels = dict(state.get("channel_labels") or {})
+        self._channel_sources = dict(state.get("channel_sources") or {})
+        types = state.get("channel_types")
+        if isinstance(types, dict):
+            self._channel_types.update(types)
+        pipes = state.get("pipelines") or {}
+        self._pipelines = {}
+        for ch in names:
+            p = pipes.get(ch)
+            if p is not None and hasattr(p, "deep_copy"):
+                self._pipelines[ch] = p.deep_copy()
+            elif p is not None:
+                self._pipelines[ch] = p
+            else:
+                self._pipelines[ch] = FilterPipeline()
+        self._populate_channel_list()
+        # Select primary source if present
+        primary = state.get("primary_id")
+        if primary and primary in names:
+            row = names.index(primary)
+            self._ch_list.setCurrentRow(row)
+        elif names:
+            self._ch_list.setCurrentRow(0)
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Batch

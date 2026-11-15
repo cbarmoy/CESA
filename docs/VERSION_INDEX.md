@@ -1,6 +1,6 @@
 # Index des versions CESA
 
-> **Version actuelle : `0.0beta2.0`**
+> **Version actuelle : `0.0beta2.1`**
 >
 > Ce fichier recense **tous** les emplacements où le numéro de version apparaît dans le projet.
 > Lors d'un bump de version, parcourir cette checklist pour garantir la cohérence.
@@ -90,7 +90,7 @@ Toute mise à jour de version **doit commencer ici**.
 
 | Fichier | Occurrences | Détail |
 |---|---|---|
-| `tests/test_filter_engine.py` | 5 | Assertions `__version__`, contenu de `run.py` et `CHANGELOG.md` |
+| `tests/test_filter_engine.py` | 6 | Assertions `__version__`, contenu de `run.py` et `CHANGELOG.md` (`[0.0beta2.1]` + historique `[0.0beta2.0]`) |
 
 ---
 
@@ -99,6 +99,7 @@ Toute mise à jour de version **doit commencer ici**.
 | Fichier | Occurrences | Détail |
 |---|---|---|
 | `requirements.txt` | 1 | Commentaire header |
+| `cesa.spec` | 1 | Spec PyInstaller |
 
 ---
 

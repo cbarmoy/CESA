@@ -582,10 +582,14 @@ class FilterPipeline:
     enabled: bool = True
 
     def apply(self, data: np.ndarray, sfreq: float) -> np.ndarray:
-        """Apply every enabled filter in order."""
+        """Apply every enabled filter in order.
+
+        Always copies the input so shared display buffers (channel clones)
+        cannot be mutated in place by a filter stage.
+        """
         if not self.enabled or not self.filters:
             return data
-        y = np.asarray(data, dtype=np.float64)
+        y = np.array(data, dtype=np.float64, copy=True)
         for f in self.filters:
             if f.enabled:
                 y = f.apply(y, sfreq)

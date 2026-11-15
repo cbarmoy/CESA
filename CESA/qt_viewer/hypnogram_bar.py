@@ -128,6 +128,7 @@ class HypnogramBar(QtWidgets.QWidget):
         ])
         self._plot.getAxis("left").setStyle(tickLength=0)
         self._plot.disableAutoRange(axis="x")
+        self._plot.disableAutoRange(axis="y")
         self._plot.setLimits(xMin=0)
 
         self._pw.viewport().setMouseTracking(True)
@@ -353,53 +354,84 @@ class HypnogramBar(QtWidgets.QWidget):
         secs = int(t_s % 60)
         return f"{mins}:{secs:02d}"
 
+    # Cap individual markers so thousands of spindles/REM bursts cannot
+    # bury the stage blocks or stall the graphics scene.
+    _ANN_INDIVIDUAL_CAP = 400
+
     def _draw_annotations(self) -> None:
-        """Draw user annotations in a dedicated lane above the hypnogram."""
+        """Draw clinical annotations in a thin lane above the stages.
+
+        No per-event vertical lines (they used to paint over the whole
+        hypnogram).  Above ``_ANN_INDIVIDUAL_CAP`` events, markers are
+        merged into a per-colour density bar so item count stays bounded.
+        """
         for item in self._annotation_items:
             self._plot.removeItem(item)
         self._annotation_items.clear()
 
         if not self._annotations:
+            self._plot.setYRange(-0.8, 6.8, padding=0)
             return
 
         lane_y = 6.05
         lane_h = 0.55
-        for ev in self._annotations:
-            onset = float(ev.get("onset", 0.0))
-            dur = max(float(ev.get("duration", 1.0)), 0.5)
-            color = str(ev.get("color") or "#F9E2AF")
-            etype = str(ev.get("type") or ev.get("label") or "note")
-            label = str(ev.get("label") or ev.get("text") or etype)[:16]
+        events = self._annotations
 
-            rect = _RoundedRectItem(
-                onset, lane_y, dur, lane_h,
-                brush=pg.mkBrush(color),
-                pen=pg.mkPen(color, width=1.5),
-                radius=2.0, opacity=0.92,
-            )
-            rect.setZValue(8)
-            self._plot.addItem(rect)
-            self._annotation_items.append(rect)
+        if len(events) <= self._ANN_INDIVIDUAL_CAP:
+            for ev in events:
+                onset = float(ev.get("onset", 0.0))
+                dur = max(float(ev.get("duration", 1.0)), 0.25)
+                color = str(ev.get("color") or "#F9E2AF")
+                rect = QtWidgets.QGraphicsRectItem(onset, lane_y, dur, lane_h)
+                rect.setBrush(pg.mkBrush(color))
+                rect.setPen(pg.mkPen(color, width=0.5))
+                rect.setOpacity(0.85)
+                rect.setZValue(8)
+                self._plot.addItem(rect, ignoreBounds=True)
+                self._annotation_items.append(rect)
+        else:
+            total = max(float(self._total_duration_s), 1.0)
+            n_bins = min(500, max(50, int(total / max(self._epoch_len, 1.0))))
+            bin_w = total / n_bins
+            # Accumulate occupancy per colour → one BarGraphItem per colour
+            by_color: Dict[str, np.ndarray] = {}
+            for ev in events:
+                onset = float(ev.get("onset", 0.0))
+                dur = max(float(ev.get("duration", 1.0)), 0.25)
+                color = str(ev.get("color") or "#F9E2AF")
+                if color not in by_color:
+                    by_color[color] = np.zeros(n_bins, dtype=np.float64)
+                i0 = max(0, int(onset / bin_w))
+                i1 = min(n_bins - 1, int((onset + dur) / bin_w))
+                by_color[color][i0 : i1 + 1] = 1.0
 
-            tick = pg.InfiniteLine(
-                pos=onset, angle=90,
-                pen=pg.mkPen(color, width=1.5, style=QtCore.Qt.PenStyle.DashLine),
-            )
-            tick.setZValue(8)
-            self._plot.addItem(tick)
-            self._annotation_items.append(tick)
-
-            if dur >= self._epoch_len * 0.5:
-                lbl_item = pg.TextItem(
-                    text=label,
-                    color="#FFFFFF",
-                    anchor=(0.0, 0.5),
+            x_centers = (np.arange(n_bins) + 0.5) * bin_w
+            for color, hits in by_color.items():
+                mask = hits > 0
+                if not np.any(mask):
+                    continue
+                xs = x_centers[mask]
+                # Height scales lightly with density but stays inside the lane
+                heights = np.full(xs.shape, lane_h * 0.9, dtype=np.float64)
+                bg = pg.BarGraphItem(
+                    x=xs,
+                    height=heights,
+                    width=bin_w * 0.95,
+                    y0=lane_y,
+                    brush=pg.mkBrush(color),
+                    pen=pg.mkPen(None),
                 )
-                lbl_item.setFont(QtGui.QFont("Segoe UI", 7, QtGui.QFont.Weight.Bold))
-                lbl_item.setPos(onset + 2, lane_y + lane_h * 0.5)
-                lbl_item.setZValue(9)
-                self._plot.addItem(lbl_item)
-                self._annotation_items.append(lbl_item)
+                bg.setZValue(8)
+                bg.setOpacity(0.8)
+                self._plot.addItem(bg, ignoreBounds=True)
+                self._annotation_items.append(bg)
+
+        self._plot.setYRange(-0.8, 6.8, padding=0)
+
+    @property
+    def annotation_item_count(self) -> int:
+        """Number of graphics items used for clinical annotations (tests)."""
+        return len(self._annotation_items)
 
     def _draw_cycle_markers(self) -> None:
         """Detect and mark approximate sleep cycle boundaries.

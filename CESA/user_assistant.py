@@ -1,8 +1,8 @@
 """
-CESA (EEG Studio Analysis) v0.0beta2.0 - Assistant Utilisateur
+CESA (EEG Studio Analysis) v0.0beta2.1 - Assistant Utilisateur
 ======================================================
 
-Module d'assistance utilisateur pour CESA v0.0beta2.0.
+Module d'assistance utilisateur pour CESA v0.0beta2.1.
 Développé pour l'Unité Neuropsychologie du Stress (IRBA).
 
 Ce module fournit des assistants interactifs, des tooltips détaillés,
@@ -16,7 +16,7 @@ Fonctionnalités principales:
 - Suggestions d'utilisation intelligentes
 
 Auteur: Côme Barmoy (Unité Neuropsychologie du Stress - IRBA)
-Version: 0.0beta2.0
+Version: 0.0beta2.1
 Date: 2025-01-27
 Licence: MIT
 """
@@ -28,7 +28,7 @@ import webbrowser
 from pathlib import Path
 
 class UserAssistant:
-    """Assistant utilisateur pour CESA v0.0beta2.0."""
+    """Assistant utilisateur pour CESA v0.0beta2.1."""
     
     def __init__(self, parent_app):
         self.parent_app = parent_app
@@ -77,7 +77,7 @@ class UserAssistant:
             return
         
         welcome_window = tk.Toplevel(self.parent_app.root)
-        welcome_window.title("🎉 Bienvenue dans CESA v0.0beta2.0 - Assistant Personnalisé")
+        welcome_window.title("🎉 Bienvenue dans CESA v0.0beta2.1 - Assistant Personnalisé")
         welcome_window.geometry("900x700")
         welcome_window.transient(self.parent_app.root)
         welcome_window.grab_set()
@@ -111,7 +111,7 @@ class UserAssistant:
         
         # Titre de bienvenue
         title_label = ttk.Label(scrollable_frame, 
-                               text="🎉 Bienvenue dans CESA v0.0beta2.0 !",
+                               text="🎉 Bienvenue dans CESA v0.0beta2.1 !",
                                font=('Segoe UI', 20, 'bold'))
         title_label.pack(pady=(0, 10))
         
@@ -121,11 +121,11 @@ class UserAssistant:
         subtitle_label.pack(pady=(0, 20))
         
         # Informations détaillées sur CESA
-        esa_info_frame = ttk.LabelFrame(scrollable_frame, text="🧠 À Propos d'CESA v0.0beta2.0", padding=15)
+        esa_info_frame = ttk.LabelFrame(scrollable_frame, text="🧠 À Propos d'CESA v0.0beta2.1", padding=15)
         esa_info_frame.pack(fill=tk.X, pady=(0, 15))
         
         esa_info_text = """
-CESA (EEG Studio Analysis) v0.0beta2.0 est une application professionnelle développée spécifiquement pour l'Unité 
+CESA (EEG Studio Analysis) v0.0beta2.1 est une application professionnelle développée spécifiquement pour l'Unité 
 Neuropsychologie du Stress (IRBA). Cette version révolutionnaire intègre des méthodes d'analyse avancées 
 et une interface utilisateur moderne pour l'analyse complète des données EEG.
 
@@ -148,34 +148,29 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
                                   font=('Segoe UI', 10), justify='left')
         esa_info_label.pack(anchor='w')
         
-        # Nouvelles fonctionnalités v0.0beta2.0
-        features_frame = ttk.LabelFrame(scrollable_frame, text="🚀 Nouvelles Fonctionnalités v0.0beta2.0", padding=15)
+        # Nouvelles fonctionnalités v0.0beta2.1
+        features_frame = ttk.LabelFrame(scrollable_frame, text="🚀 Nouvelles Fonctionnalités v0.0beta2.1", padding=15)
         features_frame.pack(fill=tk.X, pady=(0, 15))
         
         features_text = """
-🧮 ENTROPIE RENORMÉE (ISSTARTEL) - NOUVEAUTÉ MAJEURE :
-   • Méthode révolutionnaire basée sur les travaux de Jean-Pierre Issartel (2007)
-   • Quantification de la complexité cérébrale par renormalisation spectrale
-   • 4 kernels de renormée : Identity, Powerlaw, Logarithmic, Adaptive
-   • Applications : états de conscience, pathologies neurologiques, recherche
+🌊 COUPLAGE SO–FUSEAU - NOUVEAUTÉ MAJEURE :
+   • Filtres classiques + Hilbert : phase de l'onde lente au pic du fuseau
+   • Statistiques circulaires (phase préférée, R, Rayleigh, V-test vs 0°)
+   • Figures : rose, moyenne fuseau-verrouillée, PETH, TFR creux SO
+   • Un canal analysé seul donne le même résultat qu'à côté des autres
 
-🔬 ANALYSES AVANCÉES INTÉGRÉES :
-   • Cohérence inter-canal et connectivité fonctionnelle
-   • Corrélations temporelles et spatiales
-   • Clustering des micro-états EEG
-   • Analyse de sources (MNE, sLORETA, dSPM)
+🔬 MICRO-ARCHITECTURE ET SCORING :
+   • Fuseaux / ondes lentes / bursts REM (YASA), canal par canal
+   • Comparaison de scorers, balayage, rapport HTML, contrôle de signal
+   • Lot multi-sujets : sidecar scoring visible dès le scan du dossier
 
-⚡ AUTOMATISATION INTELLIGENTE :
-   • Détection automatique d'artefacts (EMG, EOG, ECG, mouvement)
-   • Classification automatique des stades de sommeil (YASA)
-   • Filtrage adaptatif et amplification automatique
-   • Synchronisation avec scoring manuel
+🧹 NETTOYAGE ET QC :
+   • ICA en mémoire et régression EOG (fichiers d'enregistrement intacts)
+   • Contrôle qualité de nuit avant les analyses longues
 
-🎨 INTERFACE MODERNE ET INTUITIVE :
-   • Thème sombre/clair adaptatif
-   • Tooltips contextuels détaillés
-   • Assistant de première utilisation
-   • Export multi-format (CSV, PNG, PDF)
+🎨 VIEWER QT :
+   • Multi-vues (delta / fuseaux / alpha), specparam, infobulles courtes
+   • Export CSV / PNG des événements et des figures de couplage
         """
         
         features_label = ttk.Label(features_frame, text=features_text.strip(), 
@@ -335,7 +330,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
     def show_guided_tour(self):
         """Affiche une visite guidée interactive d'CESA."""
         tour_window = tk.Toplevel(self.parent_app.root)
-        tour_window.title("🎯 Visite Guidée CESA v0.0beta2.0")
+        tour_window.title("🎯 Visite Guidée CESA v0.0beta2.1")
         tour_window.geometry("700x600")
         tour_window.transient(self.parent_app.root)
         tour_window.grab_set()
@@ -351,7 +346,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Titre
-        title_label = ttk.Label(main_frame, text="🎯 Visite Guidée CESA v0.0beta2.0", 
+        title_label = ttk.Label(main_frame, text="🎯 Visite Guidée CESA v0.0beta2.1", 
                                font=('Segoe UI', 16, 'bold'))
         title_label.pack(pady=(0, 20))
         
@@ -449,7 +444,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
                 tour_window.destroy()
                 messagebox.showinfo("Visite terminée", 
                                   "🎉 Félicitations ! Vous avez terminé la visite guidée.\n\n"
-                                  "Vous êtes maintenant prêt à utiliser CESA v0.0beta2.0 !")
+                                  "Vous êtes maintenant prêt à utiliser CESA v0.0beta2.1 !")
         
         def skip_tour():
             tour_window.destroy()
@@ -481,7 +476,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
     def show_feature_explorer(self):
         """Affiche un explorateur interactif approfondi des fonctionnalités."""
         explorer_window = tk.Toplevel(self.parent_app.root)
-        explorer_window.title("🔍 Explorateur de Fonctionnalités CESA v0.0beta2.0 - Guide Complet")
+        explorer_window.title("🔍 Explorateur de Fonctionnalités CESA v0.0beta2.1 - Guide Complet")
         explorer_window.geometry("1200x900")
         explorer_window.transient(self.parent_app.root)
         explorer_window.grab_set()
@@ -516,7 +511,7 @@ et une interface utilisateur moderne pour l'analyse complète des données EEG.
         title_frame = ttk.Frame(scrollable_frame)
         title_frame.pack(fill=tk.X, pady=(0, 20))
         
-        title_label = ttk.Label(title_frame, text="🔍 Explorateur de Fonctionnalités CESA v0.0beta2.0", 
+        title_label = ttk.Label(title_frame, text="🔍 Explorateur de Fonctionnalités CESA v0.0beta2.1", 
                                font=('Segoe UI', 20, 'bold'))
         title_label.pack()
         
@@ -1596,7 +1591,7 @@ Cliquez sur "Aide" → "Documentation complète" ou F1
 Tutoriel interactif personnalisé pour guider les nouveaux utilisateurs dans la découverte d'CESA.
 
 📋 CONTENU DU TUTORIEL
-• Introduction à CESA v0.0beta2.0
+• Introduction à CESA v0.0beta2.1
 • Guide de première utilisation
 • Démonstration des fonctionnalités principales
 • Conseils d'utilisation personnalisés
@@ -2035,7 +2030,7 @@ Cliquez sur "Aide" → "Documentation complète" ou F1
 Tutoriel interactif personnalisé pour guider les nouveaux utilisateurs dans la découverte d'CESA.
 
 📋 CONTENU DU TUTORIEL
-• Introduction à CESA v0.0beta2.0
+• Introduction à CESA v0.0beta2.1
 • Guide de première utilisation
 • Démonstration des fonctionnalités principales
 • Conseils d'utilisation personnalisés
@@ -2099,7 +2094,7 @@ Cliquez sur "Aide" → "Explorateur de fonctionnalités" pour découvrir toutes 
 ═══════════════════════════════════════════════════════════════════════════════
 
 📋 DESCRIPTION
-Cette fonctionnalité fait partie d'CESA v0.0beta2.0 et contribue à l'analyse complète des signaux EEG.
+Cette fonctionnalité fait partie d'CESA v0.0beta2.1 et contribue à l'analyse complète des signaux EEG.
 
 🔬 RÉFÉRENCES SCIENTIFIQUES GÉNÉRALES
 • MNE-Python : https://mne.tools/stable/
@@ -2400,7 +2395,7 @@ Consultez le guide de référence complet pour les références scientifiques d�
     def show_help_menu(self):
         """Affiche le menu d'aide contextuel."""
         help_window = tk.Toplevel(self.parent_app.root)
-        help_window.title("❓ Aide CESA v0.0beta2.0")
+        help_window.title("❓ Aide CESA v0.0beta2.1")
         help_window.geometry("600x500")
         help_window.transient(self.parent_app.root)
         help_window.grab_set()
@@ -2416,7 +2411,7 @@ Consultez le guide de référence complet pour les références scientifiques d�
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # Titre
-        title_label = ttk.Label(main_frame, text="❓ Aide CESA v0.0beta2.0", 
+        title_label = ttk.Label(main_frame, text="❓ Aide CESA v0.0beta2.1", 
                                font=('Segoe UI', 16, 'bold'))
         title_label.pack(pady=(0, 20))
         
@@ -2471,7 +2466,7 @@ Consultez le guide de référence complet pour les références scientifiques d�
     def _open_support(self):
         """Ouvre les informations de support."""
         support_info = """
-📞 SUPPORT CESA v0.0beta2.0
+📞 SUPPORT CESA v0.0beta2.1
 
 🆘 EN CAS DE PROBLÈME :
 
@@ -2497,18 +2492,18 @@ Consultez le guide de référence complet pour les références scientifiques d�
 • Joignez des captures d'écran si utile
 
 🎯 DÉVELOPPEMENT :
-CESA v0.0beta2.0 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
+CESA v0.0beta2.1 est développé pour l'Unité Neuropsychologie du Stress (IRBA)
 Auteur : Côme Barmoy
-Version : 0.0beta2.0
+Version : 0.0beta2.1
 Licence : MIT
         """
         
-        messagebox.showinfo("Support CESA v0.0beta2.0", support_info)
+        messagebox.showinfo("Support CESA v0.0beta2.1", support_info)
     
     def _open_reference_guide(self):
         """Ouvre le guide de référence complet."""
         reference_window = tk.Toplevel(self.parent_app.root)
-        reference_window.title("📚 Guide de Référence CESA v0.0beta2.0")
+        reference_window.title("📚 Guide de Référence CESA v0.0beta2.1")
         reference_window.geometry("1000x800")
         reference_window.transient(self.parent_app.root)
         reference_window.grab_set()
@@ -2541,7 +2536,7 @@ Licence : MIT
         scrollbar.pack(side="right", fill="y")
         
         # Titre
-        title_label = ttk.Label(scrollable_frame, text="📚 Guide de Référence CESA v0.0beta2.0", 
+        title_label = ttk.Label(scrollable_frame, text="📚 Guide de Référence CESA v0.0beta2.1", 
                                font=('Segoe UI', 18, 'bold'))
         title_label.pack(pady=(0, 10))
         
@@ -2558,7 +2553,7 @@ Licence : MIT
 📋 FICHIERS DE DOCUMENTATION :
 
 1️⃣ README.md - Guide Principal :
-   • Installation et configuration d'CESA v0.0beta2.0
+   • Installation et configuration d'CESA v0.0beta2.1
    • Guide d'utilisation général
    • Résolution des problèmes courants
    • Informations sur les nouvelles fonctionnalités
@@ -2676,7 +2671,7 @@ Licence : MIT
 • Auteur : Côme Barmoy
 • Unité Neuropsychologie du Stress (IRBA)
 • Email : come1.barmoy@supbiotech.fr
-• Version : CESA v0.0beta2.0.0
+• Version : CESA v0.0beta2.1
 • Licence : MIT
 
 🔧 DIAGNOSTIC AUTOMATIQUE :
@@ -2737,7 +2732,7 @@ Licence : MIT
     def _run_diagnostic(self):
         """Lance un diagnostic automatique du système."""
         diagnostic_window = tk.Toplevel(self.parent_app.root)
-        diagnostic_window.title("🔧 Diagnostic Système CESA v0.0beta2.0")
+        diagnostic_window.title("🔧 Diagnostic Système CESA v0.0beta2.1")
         diagnostic_window.geometry("600x500")
         diagnostic_window.transient(self.parent_app.root)
         diagnostic_window.grab_set()

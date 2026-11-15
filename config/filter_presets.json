@@ -285,6 +285,246 @@
           }
         ]
       }
+    },
+    {
+      "name": "Comparaison · Delta / SO (0.5-4 Hz)",
+      "description": "Ondes lentes / slow oscillations (N3). A dupliquer a cote d'un EEG standard pour scorer les SO et le N3.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.5,
+            "high_hz": 4.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Delta AASM (0.5-2 Hz)",
+      "description": "Bande delta etroite type AASM (SWA). Utile pour isoler les ondes lentes profondes vs le reste du spectre.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.5,
+            "high_hz": 2.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · K-complexe (0.5-5 Hz)",
+      "description": "Met en avant les K-complexes (N2). A comparer avec la bande spindles sur le meme canal.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.5,
+            "high_hz": 5.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Theta (4-8 Hz)",
+      "description": "Bande theta (N1, transition, activite REM corticale). Utile en double vue avec un EEG large bande.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 4.0,
+            "high_hz": 8.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Alpha (8-12 Hz)",
+      "description": "Bande alpha (eveil relaxe, intrusion alpha en N1/N2). Aide a distinguer eveil vs sommeil leger.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 8.0,
+            "high_hz": 12.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Spindles (11-16 Hz)",
+      "description": "Bande sigma classique pour spindles N2. Ideal en clone a cote d'un EEG 0.3-35 Hz pour le scoring manuel.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 11.0,
+            "high_hz": 16.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Spindles lents (10-13 Hz)",
+      "description": "Spindles lents (plutot frontaux). A croiser avec « Spindles rapides » sur le meme canal.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 10.0,
+            "high_hz": 13.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Spindles rapides (13-16 Hz)",
+      "description": "Spindles rapides (plutot centro-parietaux). Complement de « Spindles lents ».",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 13.0,
+            "high_hz": 16.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Beta / eveil (15-30 Hz)",
+      "description": "Bande beta (arousals, tension musculaire corticale). Utile pour confirmer un micro-eveil vs un artefact.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 15.0,
+            "high_hz": 30.0,
+            "order": 4,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · Infra-lent (0.1-1 Hz)",
+      "description": "Composante infra-lente / derive lente. A croiser avec Delta/SO pour les oscillations lentes.",
+      "channel_type": "eeg",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 1.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · EOG REM (0.5-5 Hz)",
+      "description": "EOG centre sur les mouvements oculaires rapides / bursts REM. Dupliquer un EOG: un en Standard, un en REM.",
+      "channel_type": "eog",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.5,
+            "high_hz": 5.0,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "Comparaison · EOG lent (0.1-0.5 Hz)",
+      "description": "Mouvements oculaires lents (SEM, endormissement). Complement de « EOG REM » sur le meme canal.",
+      "channel_type": "eog",
+      "builtin": true,
+      "pipeline": {
+        "enabled": true,
+        "filters": [
+          {
+            "type": "BandpassFilter",
+            "enabled": true,
+            "low_hz": 0.1,
+            "high_hz": 0.5,
+            "order": 2,
+            "filter_type": "butterworth",
+            "causal": false
+          }
+        ]
+      }
     }
   ]
 }

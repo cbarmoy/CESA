@@ -373,3 +373,202 @@ class TestFeatureSearch:
         ]
         assert matches
 
+
+# -----------------------------------------------------------------------
+# Display traces (channel clones) + annotation density
+# -----------------------------------------------------------------------
+
+class TestDisplayTraceModel:
+
+    def test_next_clone_id_and_label(self):
+        from CESA.qt_viewer.display_trace import next_clone_id, next_clone_label
+        assert next_clone_id("C3", ["C3"]) == "C3::2"
+        assert next_clone_id("C3", ["C3", "C3::2"]) == "C3::3"
+        assert next_clone_label("C3", ["C3"]) == "C3 (2)"
+
+    def test_profile_roundtrip_display_traces(self):
+        from CESA.profile_schema import DisplayProcessingProfile, build_default_profile
+        p = build_default_profile()
+        p.display_traces = [{
+            "trace_id": "C3::2",
+            "source_name": "C3",
+            "label": "C3 (2)",
+            "color": "#FF0000",
+            "visible": True,
+        }]
+        restored = DisplayProcessingProfile.from_dict(p.to_dict())
+        assert len(restored.display_traces) == 1
+        assert restored.display_traces[0]["trace_id"] == "C3::2"
+
+
+@qt_required
+class TestDisplayTraceViewer:
+
+    def test_duplicate_shares_source_array(self):
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        w = EEGViewerWidget()
+        data = np.random.randn(2560)
+        w.set_signals({"C3": (data, 256.0)})
+        new_id = w.duplicate_trace("C3")
+        assert new_id == "C3::2"
+        assert set(w.channel_names) == {"C3", "C3::2"}
+        assert w.source_name_for("C3::2") == "C3"
+        # Same numpy buffer (no RAM duplication)
+        assert w._strips["C3"]._full_data is w._strips["C3::2"]._full_data
+        assert len(w._signals) == 1
+
+    def test_independent_color_and_pipeline_keys(self):
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        w = EEGViewerWidget()
+        w.set_signals({"C3": (np.random.randn(512), 256.0)})
+        w.duplicate_trace("C3")
+        w.set_trace_color("C3::2", "#AABBCC")
+        assert w._traces["C3::2"].color == "#AABBCC"
+        # Pipelines keyed by trace id independently
+        w.set_filter_pipelines({"C3": object(), "C3::2": object()})
+        assert "C3" in w._pipelines and "C3::2" in w._pipelines
+
+    def test_cannot_remove_primary(self):
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        w = EEGViewerWidget()
+        w.set_signals({"C3": (np.random.randn(100), 100.0)})
+        assert w.remove_trace("C3") is False
+        w.duplicate_trace("C3")
+        assert w.remove_trace("C3::2") is True
+        assert "C3::2" not in w.channel_names
+
+    def test_clone_keeps_pipeline_when_primaries_synced(self):
+        """Primary-only sync must not wipe a clone's independent filter."""
+        from CESA.filter_engine import BandpassFilter, FilterPipeline
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+
+        w = EEGViewerWidget()
+        data = np.random.randn(2560).astype(np.float64)
+        w.set_signals({"C3": (data, 256.0)})
+        w.duplicate_trace("C3")
+        pipe_bp = FilterPipeline(
+            filters=[BandpassFilter(low_hz=11.0, high_hz=16.0)], enabled=True,
+        )
+        pipe_off = FilterPipeline(filters=[], enabled=False)
+        w.set_filter_pipelines(
+            {"C3": pipe_off, "C3::2": pipe_bp}, replace=True,
+        )
+        # Simulate Tk / profile sync that only knows primary channels
+        w.set_filter_pipelines({"C3": pipe_off})
+        assert "C3::2" in w._pipelines
+        assert w._pipelines["C3::2"] is pipe_bp
+        assert w._strips["C3::2"]._pipeline is pipe_bp
+
+        w.set_global_filter_enabled(True)
+        w.set_time_window(0.0, 10.0)
+        _x1, y1 = w._strips["C3"]._filtered_curve.getData()
+        _x2, y2 = w._strips["C3::2"]._filtered_curve.getData()
+        d1 = np.asarray(y1) - w._strips["C3"]._y_offset
+        d2 = np.asarray(y2) - w._strips["C3::2"]._y_offset
+        n = min(len(d1), len(d2))
+        assert np.max(np.abs(d1[:n] - d2[:n])) > 0.5
+
+    def test_multi_view_recipe_n2(self):
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        from CESA.qt_viewer.multi_view_recipes import get_recipe
+
+        w = EEGViewerWidget()
+        w.set_signals({"C3-M2": (np.random.randn(2560), 256.0)})
+        recipe = get_recipe("n2_scoring")
+        assert recipe is not None
+        ids = w.apply_multi_view_recipe("C3-M2", recipe)
+        assert len(ids) == 3
+        assert ids[0] == "C3-M2"
+        labels = {t.trace_id: t.label for t in w.get_traces()}
+        assert labels["C3-M2"] == "C3-M2 · Standard"
+        assert any("Spindles" in lab for lab in labels.values())
+        assert any("K-complexe" in lab for lab in labels.values())
+        colors = {t.trace_id: t.color for t in w.get_traces() if t.source_name == "C3-M2"}
+        assert len(set(colors.values())) == 3
+        # One physical source only
+        assert list(w._signals.keys()) == ["C3-M2"]
+
+
+@qt_required
+class TestHypnogramAnnotationDensity:
+
+    def test_many_annotations_bounded_items_and_yrange(self):
+        from CESA.qt_viewer.hypnogram_bar import HypnogramBar
+        bar = HypnogramBar()
+        bar.set_hypnogram(["N2"] * 100, 30.0, 3000.0)
+        events = [
+            {
+                "onset": float(i) * 0.5,
+                "duration": 0.4,
+                "type": "spindle",
+                "color": "#89B4FA",
+                "label": "spindle",
+            }
+            for i in range(3000)
+        ]
+        bar.set_annotations(events)
+        # Density mode: far fewer items than events
+        assert bar.annotation_item_count < 50
+        assert bar.annotation_item_count < len(events)
+        y_range = bar._plot.viewRange()[1]
+        assert y_range[0] == pytest.approx(-0.8, abs=0.15)
+        assert y_range[1] == pytest.approx(6.8, abs=0.15)
+
+    def test_sparse_annotations_no_vertical_lines(self):
+        from CESA.qt_viewer.hypnogram_bar import HypnogramBar
+        import pyqtgraph as pg
+        bar = HypnogramBar()
+        bar.set_hypnogram(["W"] * 10, 30.0, 300.0)
+        bar.set_annotations([
+            {"onset": 10.0, "duration": 2.0, "type": "arousal", "color": "#F9E2AF"},
+            {"onset": 40.0, "duration": 1.0, "type": "spindle", "color": "#89B4FA"},
+        ])
+        assert bar.annotation_item_count == 2
+        for item in bar._annotation_items:
+            assert not isinstance(item, pg.InfiniteLine)
+
+
+@qt_required
+class TestAnnotationOverlayDensity:
+
+    def test_dense_window_uses_batch_not_per_event(self):
+        from CESA.qt_viewer.annotations import (
+            Annotation, AnnotationOverlay, AnnotationStore,
+        )
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        w = EEGViewerWidget()
+        w.set_signals({"C3": (np.random.randn(256 * 60), 256.0)})
+        store = AnnotationStore()
+        for i in range(200):
+            store.add(Annotation(
+                onset_s=float(i) * 0.2,
+                duration_s=0.15,
+                ann_type="spindle",
+                text=f"sp{i}",
+            ))
+        overlay = AnnotationOverlay(w.plot_item, store)
+        overlay.update_visible(0.0, 60.0)
+        assert overlay._last_mode == "batch"
+        # Batched: a handful of curves, not 200 regions
+        assert overlay.graphics_item_count < 30
+        assert len(overlay._items) == 0
+
+    def test_sparse_uses_ignore_bounds_regions(self):
+        from CESA.qt_viewer.annotations import (
+            Annotation, AnnotationOverlay, AnnotationStore,
+        )
+        from CESA.qt_viewer.eeg_viewer_widget import EEGViewerWidget
+        w = EEGViewerWidget()
+        w.set_signals({"C3": (np.random.randn(2560), 256.0)})
+        y_before = w._plot.viewRange()[1]
+        store = AnnotationStore()
+        store.add(Annotation(onset_s=1.0, duration_s=1.0, ann_type="note", text="x"))
+        overlay = AnnotationOverlay(w.plot_item, store)
+        overlay.update_visible(0.0, 30.0)
+        assert overlay._last_mode == "sparse"
+        assert len(overlay._items) == 1
+        y_after = w._plot.viewRange()[1]
+        # ignoreBounds should keep channel Y range stable
+        assert y_after[0] == pytest.approx(y_before[0], abs=1.0)
+        assert y_after[1] == pytest.approx(y_before[1], abs=1.0)
+

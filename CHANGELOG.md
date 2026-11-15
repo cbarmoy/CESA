@@ -2,6 +2,44 @@
 
 All notable changes to CESA are documented in this file.
 
+## [0.0beta2.1] - 2026-11-13
+
+### Added
+- **Couplage SO–fuseau** (`CESA/sleep_pipeline/so_spindle_coupling.py`) :
+  Butterworth ordre 4, Hilbert, phase au pic du fuseau, statistiques
+  circulaires (`pycircstat2` / Zar 1999), V-test vs 0°, permutation de R.
+  Accès : **Événements → Détecter micro-architecture…** et lot multi-sujets.
+- **Figures de couplage** : rose des phases, phases de groupe, décalage
+  AVANT−APRÈS, moyenne fuseau-verrouillée, PETH, TFR alignée sur le creux SO
+  (`CESA/coupling_plots.py`, `CESA/coupling_event_plots.py`).
+- **Micro-architecture YASA** (fuseaux, ondes lentes, bursts REM) canal par
+  canal, pour qu'un électrode analysé seul reproduise le même résultat qu'en
+  pile avec ses voisins.
+- **Lot couplage** : sidecar scoring dès le scan (`[scoring]` / `[sans scoring]`),
+  checkpoints dans le journal, CSV par canal, figures optionnelles.
+- **Nettoyage ICA** (`CESA/ica_cleaning.py` + dialogue Qt) et **QC de nuit**
+  (`prep_qc`, dialogue QC).
+- **Outils de scoring** : choix des canaux, contrôle de signal, balayage
+  (sweep), comparaison de scorer, rapport HTML (`scoring_channels`,
+  `scoring_sweep`, `scoring_comparison`, `scoring_report`).
+- **Specparam** (1/f + pics oscillatoires) et **recherche de fonctionnalités**
+  dans le viewer Qt.
+- Recettes **multi-vues** (delta / fuseaux / alpha) et presets de filtres
+  supplémentaires.
+- Documentation : section 8 de `docs/Methodes_Statistiques.md`,
+  `docs/Choix_Modele_Scoring.md`.
+
+### Changed
+- Version unifiée **0.0beta2.1** (voir `docs/VERSION_INDEX.md`).
+- Viewer Qt : hypnogramme, annotations, spectrogrammes, dialogue filtres.
+- Dialogue lot : infobulles courtes, paramètres FFT masqués hors mode spectral,
+  checkpoints de progression restaurés.
+
+### Fixed
+- Indépendance inter-canaux du couplage : C3 seul = C3 calculé à côté de C4
+  (YASA ne reçoit plus la pile 2D ; les figures ignorent les événements YASA
+  d'un voisin).
+
 ## [0.0beta2.0] - 2026-07-20
 
 ### Added

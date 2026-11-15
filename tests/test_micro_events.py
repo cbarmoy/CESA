@@ -98,6 +98,27 @@ class TestYasaConversion:
         assert events[0].event_type == EventType.SPINDLE
         assert events[0].onset_s == 10.0
         yasa.spindles_detect.assert_called_once()
+        args, kwargs = yasa.spindles_detect.call_args
+        stacked = args[0] if args else kwargs.get("data")
+        assert np.asarray(stacked).ndim == 1 or np.asarray(stacked).shape[0] == 1
+
+    def test_each_channel_is_detected_separately(self):
+        summary = pd.DataFrame([
+            {"Start": 10.0, "Duration": 1.0, "Channel": "C3", "Frequency": 12.5},
+        ])
+        fake_res = MagicMock()
+        fake_res.summary.return_value = summary
+        data = np.random.randn(2, 800)
+        with patch.object(me, "_require_yasa") as req:
+            yasa = MagicMock()
+            yasa.spindles_detect.return_value = fake_res
+            req.return_value = yasa
+            me.detect_spindles(data, 100.0, ["C3", "C4"])
+        assert yasa.spindles_detect.call_count == 2
+        first = yasa.spindles_detect.call_args_list[0]
+        second = yasa.spindles_detect.call_args_list[1]
+        assert first.kwargs["ch_names"] == ["C3"]
+        assert second.kwargs["ch_names"] == ["C4"]
 
     def test_detect_slow_waves_with_coupling_mocked(self):
         summary = pd.DataFrame([
