@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CESA"
+# PEP 440 form of the app version 0.0beta2.1 (packaging rejects "0.0beta2.1").
+version = "0.0b2.post1"
+description = "Complex EEG Studio Analysis — EEG/PSG workstation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Côme Barmoy", email = "come1.barmoy@supbiotech.fr" },
+]
+keywords = ["EEG", "PSG", "sleep", "SO-spindle"]
+
+[tool.setuptools.packages.find]
+include = ["CESA*"]
+
+[tool.setuptools.package-data]
+CESA = ["logo/**", "backgrounds/**"]

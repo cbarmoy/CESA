@@ -100,6 +100,7 @@ Toute mise à jour de version **doit commencer ici**.
 |---|---|---|
 | `requirements.txt` | 1 | Commentaire header |
 | `cesa.spec` | 1 | Spec PyInstaller |
+| `pyproject.toml` | 1 | Version PEP 440 du paquet (`0.0b2.post1` pour l'app `0.0beta2.1`) |
 
 ---
 
