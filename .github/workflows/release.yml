@@ -7,8 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v0.0beta2.1)'
-        required: true
+        description: 'Tag de release (lancer depuis la branche main, pas depuis le tag)'
+        required: false
+        default: 'v0.0beta2.1'
+        type: string
 
 jobs:
   build:
